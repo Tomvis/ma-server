@@ -368,6 +368,31 @@ class MusicProvider(Provider):
         ):
             raise NotImplementedError
 
+    async def set_rating(
+        self, prov_item_id: str, media_type: MediaType, rating: int | None
+    ) -> None:
+        """
+        Set the user rating (1-5 stars, or None to clear) for an item in the provider's library.
+
+        Only called if provider supports ProviderFeature.RATING_*_EDIT.
+        Must raise on failure so the caller can surface the error to the user.
+        """
+        if (
+            media_type == MediaType.ARTIST
+            and ProviderFeature.RATING_ARTISTS_EDIT in self.supported_features
+        ):
+            raise NotImplementedError
+        if (
+            media_type == MediaType.ALBUM
+            and ProviderFeature.RATING_ALBUMS_EDIT in self.supported_features
+        ):
+            raise NotImplementedError
+        if (
+            media_type == MediaType.TRACK
+            and ProviderFeature.RATING_TRACKS_EDIT in self.supported_features
+        ):
+            raise NotImplementedError
+
     async def add_playlist_tracks(self, prov_playlist_id: str, prov_track_ids: list[str]) -> None:
         """Add track(s) to playlist.
 
@@ -1373,6 +1398,16 @@ class MusicProvider(Provider):
             return ProviderFeature.FAVORITE_AUDIOBOOKS_EDIT in self.supported_features
         if media_type == MediaType.PODCAST:
             return ProviderFeature.FAVORITE_PODCASTS_EDIT in self.supported_features
+        return False
+
+    def library_rating_edit_supported(self, media_type: MediaType) -> bool:
+        """Return if rating edit is supported for given MediaType on this provider."""
+        if media_type == MediaType.ARTIST:
+            return ProviderFeature.RATING_ARTISTS_EDIT in self.supported_features
+        if media_type == MediaType.ALBUM:
+            return ProviderFeature.RATING_ALBUMS_EDIT in self.supported_features
+        if media_type == MediaType.TRACK:
+            return ProviderFeature.RATING_TRACKS_EDIT in self.supported_features
         return False
 
     async def iter_playlist_tracks(

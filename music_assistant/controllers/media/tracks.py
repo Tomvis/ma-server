@@ -175,6 +175,7 @@ class TracksController(MediaControllerBase[Track]):
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        ratings: list[int | None] | None = None,
         **kwargs: Any,
     ) -> list[Track]:
         """Get in-database tracks.
@@ -186,6 +187,7 @@ class TracksController(MediaControllerBase[Track]):
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
         :param genre: Filter by genre id(s).
+        :param ratings: Filter by user rating (list of 1-5 and/or None for unrated).
         """
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
@@ -217,6 +219,7 @@ class TracksController(MediaControllerBase[Track]):
             extra_query_params=extra_query_params,
             extra_join_parts=extra_join_parts,
             in_library_only=True,
+            ratings=ratings,
         )
         if search and len(result) < 25 and not offset:
             # append artist items to result
@@ -239,6 +242,7 @@ class TracksController(MediaControllerBase[Track]):
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
                 in_library_only=True,
+                ratings=ratings,
             ):
                 # prevent duplicates (when artist is also in the title)
                 if _track.uri not in existing_uris:
@@ -535,6 +539,7 @@ class TracksController(MediaControllerBase[Track]):
                 "version": item.version,
                 "duration": item.duration,
                 "favorite": item.favorite,
+                "rating": item.rating,
                 "external_ids": serialize_to_json(item.external_ids),
                 "metadata": serialize_to_json(item.metadata),
                 "search_name": create_safe_string(item.name, True, True),
@@ -567,6 +572,10 @@ class TracksController(MediaControllerBase[Track]):
         cur_item.external_ids.update(update.external_ids)
         name = update.name if overwrite else cur_item.name
         sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
+        # prefer incoming rating if provided, otherwise keep current rating.
+        # This lets provider syncs (e.g. Navidrome) bring in new ratings
+        # without clobbering existing ratings when a provider has no rating info.
+        rating = update.rating if update.rating is not None else cur_item.rating
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
@@ -575,6 +584,7 @@ class TracksController(MediaControllerBase[Track]):
                 "sort_name": sort_name,
                 "version": update.version if overwrite else cur_item.version or update.version,
                 "duration": update.duration if overwrite else cur_item.duration or update.duration,
+                "rating": rating,
                 "metadata": serialize_to_json(metadata),
                 "external_ids": serialize_to_json(
                     update.external_ids if overwrite else cur_item.external_ids

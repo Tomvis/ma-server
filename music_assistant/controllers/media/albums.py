@@ -116,6 +116,7 @@ class AlbumsController(MediaControllerBase[Album]):
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
         album_types: list[AlbumType] | None = None,
+        ratings: list[int | None] | None = None,
         **kwargs: Any,
     ) -> list[Album]:
         """Get in-database albums.
@@ -128,6 +129,7 @@ class AlbumsController(MediaControllerBase[Album]):
         :param provider: Filter by provider instance ID (single string or list).
         :param album_types: Filter by album types.
         :param genre: Filter by genre id(s).
+        :param ratings: Filter by user rating (list of 1-5 and/or None for unrated).
         """
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
@@ -174,6 +176,7 @@ class AlbumsController(MediaControllerBase[Album]):
             extra_query_params=extra_query_params,
             extra_join_parts=extra_join_parts,
             in_library_only=True,
+            ratings=ratings,
         )
 
         # Calculate how many more items we need to reach the original limit
@@ -202,6 +205,7 @@ class AlbumsController(MediaControllerBase[Album]):
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
                 in_library_only=True,
+                ratings=ratings,
             ):
                 # prevent duplicates (when artist is also in the title)
                 if album.uri not in existing_uris:
@@ -392,6 +396,7 @@ class AlbumsController(MediaControllerBase[Album]):
                 "sort_name": item.sort_name,
                 "version": item.version,
                 "favorite": item.favorite,
+                "rating": item.rating,
                 "album_type": item.album_type,
                 "year": item.year,
                 "metadata": serialize_to_json(item.metadata),
@@ -422,6 +427,8 @@ class AlbumsController(MediaControllerBase[Album]):
         cur_item.external_ids.update(update.external_ids)
         name = update.name if overwrite else cur_item.name
         sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
+        # prefer incoming rating if provided, otherwise keep current rating.
+        rating = update.rating if update.rating is not None else cur_item.rating
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
@@ -431,6 +438,7 @@ class AlbumsController(MediaControllerBase[Album]):
                 "version": update.version if overwrite else cur_item.version or update.version,
                 "year": update.year if overwrite else cur_item.year or update.year,
                 "album_type": album_type.value,
+                "rating": rating,
                 "metadata": serialize_to_json(metadata),
                 "external_ids": serialize_to_json(
                     update.external_ids if overwrite else cur_item.external_ids

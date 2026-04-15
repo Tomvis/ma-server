@@ -113,7 +113,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 36
+DB_SCHEMA_VERSION: Final[int] = 37
 
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
@@ -912,6 +912,42 @@ class MusicController(CoreController):
             if not provider or not provider.library_favorites_edit_supported(full_item.media_type):
                 continue
             self.mass.create_task(provider.set_favorite(prov_mapping.item_id, media_type, False))
+
+    @api_command("music/library/set_rating")
+    async def set_library_item_rating(
+        self,
+        item: str | MediaItemType | ItemMapping,
+        rating: int | None,
+    ) -> None:
+        """
+        Set the user rating (1-5 stars, or None to clear) on a library item.
+
+        Pushes the rating to any provider that supports rating edit (e.g. Subsonic).
+        The provider sync is awaited so errors surface to the caller and the local
+        database is only updated once all provider sync calls have succeeded.
+        """
+        if rating is not None and not 1 <= rating <= 5:
+            raise InvalidDataError(f"rating must be between 1 and 5 or None (got {rating})")
+        if isinstance(item, str):
+            item = await self.get_item_by_uri(item)
+        # make sure we have a full library item; a rating must always be in the library
+        full_item = await self.get_item(
+            item.media_type,
+            item.item_id,
+            item.provider,
+        )
+        if full_item.provider != "library":
+            full_item = await self.add_item_to_library(full_item)
+        # push to provider(s) FIRST and await — any failure should surface to the caller
+        # and leave the local DB unchanged so the UI can revert.
+        for prov_mapping in full_item.provider_mappings:
+            provider = self.mass.get_provider(prov_mapping.provider_instance)
+            if not provider or not provider.library_rating_edit_supported(full_item.media_type):
+                continue
+            await provider.set_rating(prov_mapping.item_id, full_item.media_type, rating)
+        # only once provider sync succeeded, persist to the local library
+        ctrl = self.get_controller(full_item.media_type)
+        await ctrl.set_rating(full_item.item_id, rating)
 
     @api_command("music/library/remove_item")
     async def remove_item_from_library(
@@ -2749,6 +2785,15 @@ class MusicController(CoreController):
                 f")"
             )
 
+        if prev_version <= 36:
+            # add user rating column (1-5, NULL = unrated) to tracks/albums/artists
+            for table in (DB_TABLE_TRACKS, DB_TABLE_ALBUMS, DB_TABLE_ARTISTS):
+                try:
+                    await self._database.execute(f"ALTER TABLE {table} ADD COLUMN [rating] INTEGER")
+                except Exception as err:
+                    if "duplicate column" not in str(err):
+                        raise
+
         # save changes
         await self._database.commit()
 
@@ -2798,6 +2843,7 @@ class MusicController(CoreController):
                     [album_type] TEXT NOT NULL,
                     [year] INTEGER,
                     [favorite] BOOLEAN NOT NULL DEFAULT 0,
+                    [rating] INTEGER,
                     [metadata] json NOT NULL,
                     [external_ids] json NOT NULL,
                     [play_count] INTEGER NOT NULL DEFAULT 0,
@@ -2815,6 +2861,7 @@ class MusicController(CoreController):
             [name] TEXT NOT NULL,
             [sort_name] TEXT NOT NULL,
             [favorite] BOOLEAN NOT NULL DEFAULT 0,
+            [rating] INTEGER,
             [metadata] json NOT NULL,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,
@@ -2834,6 +2881,7 @@ class MusicController(CoreController):
             [version] TEXT,
             [duration] INTEGER,
             [favorite] BOOLEAN NOT NULL DEFAULT 0,
+            [rating] INTEGER,
             [metadata] json NOT NULL,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,

@@ -1,6 +1,48 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 Music Assistant is an async Python music library manager that connects to streaming services and speakers, integrating with Home Assistant.
+
+## Architecture
+
+`MusicAssistant` (`mass.py`) is the central class. It owns and initializes all controllers, manages the lifecycle of providers, and exposes the event bus and task system.
+
+**Core Controllers** (accessible via `mass.<name>`):
+- `config` — JSON-based persistent config; drives provider UI generation
+- `cache` — SQLite-backed cache with auto-cleanup
+- `tasks` — Background task scheduling
+- `music` — Library search, browsing, sync with providers
+- `metadata` — Metadata enrichment (art, lyrics, etc.)
+- `players` — Player discovery and device control
+- `player_queues` — Queue management and playback state
+- `streams` — Audio streaming and transcoding (ffmpeg)
+- `webserver` — aiohttp REST + WebSocket API
+
+**Event System:**
+```python
+# Publish
+mass.signal_event(EventType.QUEUE_UPDATED, object_id=queue_id, data=queue_data)
+
+# Subscribe (returns a callable that removes the listener)
+unsub = mass.subscribe(callback, event_filter=(EventType.QUEUE_UPDATED,), id_filter="queue_1")
+```
+Callbacks can be sync or async.
+
+**Task Management:**
+```python
+mass.create_task(coro_or_func, *args, task_id="my_task", abort_existing=False)
+mass.call_later(delay_seconds, target, *args, task_id="debounce_key")  # cancels prior call with same task_id
+```
+
+**API Commands:**
+Register a handler with `@api_command("namespace/method")` in any controller. Type hints drive OpenAPI schema generation automatically.
+
+**Provider Interaction:**
+Providers receive the `mass` instance on load. They call `mass.signal_event()` to emit events, `mass.create_task()` for background work, and `mass.config.get_provider_config(self.instance_id)` for their config. Features a provider supports are declared via `self.supported_features` (a set of enum values) — this controls which library/search/browse capabilities are exposed.
+
+**Tests:**
+Use the `mass` fixture (full instance with temp storage) for integration tests, or `mass_minimal` (config + cache only) for unit tests. Both are defined in `tests/conftest.py`.
 
 ## Development Commands
 

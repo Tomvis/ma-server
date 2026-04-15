@@ -78,6 +78,12 @@ music_assistant/providers/itunes_podcasts/itunes_country_codes.json,\
 music_assistant/helpers/resources/genres/genre_mapping.json,\
 """
 
+[tool.uv.sources]
+# Local dev override: use the in-progress music-assistant-models clone for the rating feature.
+# Remove this entry once a release of music_assistant_models with the `rating` field is published
+# and the pin in [project].dependencies is bumped to match.
+music-assistant-models = { path = "../models", editable = true }
+
 [tool.setuptools]
 include-package-data = true
 packages = ["music_assistant"]

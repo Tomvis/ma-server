@@ -74,6 +74,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
         album_artists_only: bool = False,
+        ratings: list[int | None] | None = None,
         **kwargs: Any,
     ) -> list[Artist]:
         """Get in-database (album) artists.
@@ -86,6 +87,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         :param provider: Filter by provider instance ID (single string or list).
         :param album_artists_only: Only return artists that have albums.
         :param genre: Filter by genre id(s).
+        :param ratings: Filter by user rating (list of 1-5 and/or None for unrated).
         """
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
@@ -105,6 +107,7 @@ class ArtistsController(MediaControllerBase[Artist]):
             extra_query_parts=extra_query_parts,
             extra_query_params=extra_query_params,
             in_library_only=True,
+            ratings=ratings,
         )
 
     async def tracks(
@@ -326,6 +329,7 @@ class ArtistsController(MediaControllerBase[Artist]):
                 "name": item.name,
                 "sort_name": item.sort_name,
                 "favorite": item.favorite,
+                "rating": item.rating,
                 "external_ids": serialize_to_json(item.external_ids),
                 "metadata": serialize_to_json(item.metadata),
                 "search_name": create_safe_string(item.name, True, True),
@@ -362,12 +366,17 @@ class ArtistsController(MediaControllerBase[Artist]):
 
         name = update.name if overwrite else cur_item.name
         sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
+        # prefer incoming rating if provided, otherwise keep current rating.
+        # This lets provider syncs (e.g. Navidrome) bring in new ratings
+        # without clobbering existing ratings when a provider has no rating info.
+        rating = update.rating if update.rating is not None else cur_item.rating
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
             {
                 "name": name,
                 "sort_name": sort_name,
+                "rating": rating,
                 "external_ids": serialize_to_json(
                     update.external_ids if overwrite else cur_item.external_ids
                 ),
