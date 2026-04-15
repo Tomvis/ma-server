@@ -4,6 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Music Assistant is an async Python music library manager that connects to streaming services and speakers, integrating with Home Assistant.
 
+## Behaviour
+
+- NEVER automatically reply on Github (PR's or Discussions) without explicit consent from the developer.
+
 ## Architecture
 
 `MusicAssistant` (`mass.py`) is the central class. It owns and initializes all controllers, manages the lifecycle of providers, and exposes the event bus and task system.

@@ -45,6 +45,7 @@ from music_assistant.constants import (
     CONF_USERNAME,
     UNKNOWN_ARTIST,
 )
+from music_assistant.controllers.cache import use_cache
 from music_assistant.models.music_provider import MusicProvider
 
 from .parsers import (
@@ -205,6 +206,7 @@ class OpenSonicProvider(MusicProvider):
             self.logger.warning("Unable to locate a cover image for %s", path)
             return None
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def search(
         self, search_query: str, media_types: list[MediaType], limit: int = 20
     ) -> SearchResults:
@@ -370,6 +372,7 @@ class OpenSonicProvider(MusicProvider):
                 song_count=count,
             )
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_album(self, prov_album_id: str) -> Album:
         """Return the requested Album."""
         try:
@@ -381,6 +384,7 @@ class OpenSonicProvider(MusicProvider):
 
         return parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Return a list of tracks on the specified Album."""
         try:
@@ -396,6 +400,7 @@ class OpenSonicProvider(MusicProvider):
                 tracks.append(parse_track(self.logger, self.instance_id, sonic_song, lyrics=lyrics))
         return tracks
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Return the requested Artist."""
         if prov_artist_id == UNKNOWN_ARTIST_ID:
@@ -434,6 +439,7 @@ class OpenSonicProvider(MusicProvider):
             raise MediaNotFoundError(msg) from e
         return parse_artist(self.instance_id, sonic_artist, sonic_info)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_track(self, prov_track_id: str) -> Track:
         """Return the specified track."""
         try:
@@ -451,6 +457,7 @@ class OpenSonicProvider(MusicProvider):
         lyrics: tuple[str, bool] | None = await self.get_track_lyrics(sonic_song)
         return parse_track(self.logger, self.instance_id, sonic_song, album=album, lyrics=lyrics)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Return a list of all Albums by specified Artist."""
         if prov_artist_id == UNKNOWN_ARTIST_ID or prov_artist_id.startswith(NAVI_VARIOUS_PREFIX):
@@ -467,6 +474,7 @@ class OpenSonicProvider(MusicProvider):
                 albums.append(parse_album(self.logger, self.instance_id, entry))
         return albums
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Return the specified Playlist."""
         try:
@@ -476,6 +484,7 @@ class OpenSonicProvider(MusicProvider):
             raise MediaNotFoundError(msg) from e
         return parse_playlist(self.instance_id, sonic_playlist)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get (full) podcast episode details by id."""
         podcast_id, _ = prov_episode_id.split(EP_CHAN_SEP)
@@ -501,6 +510,7 @@ class OpenSonicProvider(MusicProvider):
             self._set_loudness(episode)
             yield parse_epsiode(self.instance_id, episode, channel)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get full Podcast details by id."""
         if not self._enable_podcasts:
@@ -519,6 +529,7 @@ class OpenSonicProvider(MusicProvider):
             for channel in channels:
                 yield parse_podcast(self.instance_id, channel)
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
         result: list[Track] = []
@@ -550,6 +561,7 @@ class OpenSonicProvider(MusicProvider):
             result.append(track)
         return result
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
         """Get the top listed tracks for a specified artist."""
         # We have seen top tracks requested for the UNKNOWN_ARTIST ID, protect against that
@@ -569,6 +581,7 @@ class OpenSonicProvider(MusicProvider):
             tracks.append(parse_track(self.logger, self.instance_id, entry, lyrics=lyrics))
         return tracks
 
+    @use_cache(3600 * 3)  # cache for 3 hours
     async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
         """Get tracks similar to selected track."""
         try:
@@ -868,6 +881,7 @@ class OpenSonicProvider(MusicProvider):
             recent.items.append(parse_album(self.logger, self.instance_id, sonic_album))
         return recent
 
+    @use_cache(3600 * 3, cache_checksum="v2")  # cache for 3 hours
     async def recommendations(self) -> list[RecommendationFolder]:
         """Provide recommendations.
 
