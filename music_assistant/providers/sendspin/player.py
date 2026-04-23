@@ -834,14 +834,48 @@ class SendspinPlayer(SendspinBasePlayer):
             elapsed_time = self.corrected_elapsed_time if is_playing else self.elapsed_time
         track_progress = max(0, int(elapsed_time * 1000)) if elapsed_time is not None else 0
 
+        # Resolve album_artist / year / album_track from the queue item's media_item.
+        # Use getattr to tolerate non-Track media types (Radio, PodcastEpisode, ...)
+        # and ItemMapping albums, which don't carry these fields.
+        album_artist: str | None = None
+        year: int | None = None
+        album_track: int | None = None
+        media_item = queue_item.media_item if queue_item else None
+        if media_item is not None:
+            track_number = getattr(media_item, "track_number", 0)
+            if track_number:
+                album_track = track_number
+            album = getattr(media_item, "album", None)
+            if album is not None:
+                album_year = getattr(album, "year", None)
+                if album_year:
+                    year = album_year
+                album_artists = getattr(album, "artists", None)
+                if album_artists:
+                    album_artist = album_artists[0].name
+            if year is None:
+                item_year = getattr(media_item, "year", None)
+                if item_year:
+                    year = item_year
+
+        queue_track: int | None = None
+        total_tracks: int | None = None
+        if queue is not None:
+            if queue.current_index is not None:
+                queue_track = queue.current_index + 1
+            if queue.items > 0:
+                total_tracks = queue.items
+
         metadata = Metadata(
             title=current_media.title,
             artist=current_media.artist,
-            album_artist=None,
+            album_artist=album_artist,
             album=current_media.album,
             artwork_url=current_media.image_url,
-            year=None,
-            track=None,
+            year=year,
+            album_track=album_track,
+            queue_track=queue_track,
+            total_tracks=total_tracks,
             track_duration=track_duration * 1000 if track_duration is not None else None,
             track_progress=track_progress,
             playback_speed=1000 if is_playing else 0,
