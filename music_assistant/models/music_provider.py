@@ -863,6 +863,10 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.artists.set_favorite(library_item.item_id, True)
+                if prov_item.rating is not None and library_item.rating != prov_item.rating:
+                    await self.mass.music.artists.set_rating(
+                        library_item.item_id, prov_item.rating
+                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres
@@ -920,6 +924,10 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.albums.set_favorite(library_item.item_id, True)
+                if prov_item.rating is not None and library_item.rating != prov_item.rating:
+                    await self.mass.music.albums.set_rating(
+                        library_item.item_id, prov_item.rating
+                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres
@@ -1200,6 +1208,10 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.tracks.set_favorite(library_item.item_id, True)
+                if prov_item.rating is not None and library_item.rating != prov_item.rating:
+                    await self.mass.music.tracks.set_rating(
+                        library_item.item_id, prov_item.rating
+                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres

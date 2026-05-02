@@ -285,6 +285,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
+aiosendspin = { path = "../../aiosendspin", editable = true }
 
 [build-system]
 requires = ["setuptools>=61"]
