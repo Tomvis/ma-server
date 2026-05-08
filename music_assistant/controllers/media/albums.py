@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import AlbumType, MediaType, ProviderFeature
+from music_assistant_models.enums import AlbumType, EventType, MediaType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError, MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
     Album,
@@ -34,6 +35,194 @@ from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
+
+
+def _critical_reception_is_richer(new: object, existing: object) -> bool:
+    """True if `new` carries strictly more critical_reception data than `existing`.
+
+    Coarse "more fields filled" heuristic: a forward improvement (DR landing,
+    additional sources) wins; a regression (transient probe failure that drops
+    sources) is rejected.
+    """
+    if new is None:
+        return False
+    if existing is None:
+        return True
+    new_dr = getattr(new, "dr", None)
+    cur_dr = getattr(existing, "dr", None)
+    if new_dr is not None and cur_dr is None:
+        return True
+    new_sources = getattr(new, "sources", None) or []
+    cur_sources = getattr(existing, "sources", None) or []
+    return len(new_sources) > len(cur_sources)
+
+
+# DR quality thresholds (mirrors src/helpers/album_tags.ts on the frontend).
+_DR_BUCKET_RANGES: dict[str, tuple[float, float | None]] = {
+    "excellent": (14, None),
+    "good": (10, 14),
+    "fair": (7, 10),
+    "poor": (0, 7),
+}
+
+# Map normalized label kind -> SQL pattern matched against each label string in the
+# JSON labels[] array. Year/month suffixes on AOTY/AOTM/HONORABLE_MENTION are matched
+# with LIKE so the same kind covers every annual variant.
+_LABEL_KIND_PATTERNS: dict[str, str] = {
+    "aoty": "AOTY-%",
+    "aotm": "AOTM-%",
+    "honorable_mention": "HONORABLE_MENTION-%",
+    "record_of_the_month": "RECORD_OF_THE_MONTH",
+}
+
+
+def _amg_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
+    """Build the WHERE fragment for AMG rating buckets (1..5; floor(rating) == N)."""
+    int_values = sorted({int(v) for v in values if 1 <= int(v) <= 5})
+    if not int_values:
+        return "", {}
+    params = {f"{param_prefix}_{i}": v for i, v in enumerate(int_values)}
+    bind_list = ", ".join(f":{k}" for k in params)
+    sub = (
+        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        "WHERE json_extract(value, '$.source') = 'AMG' "
+        f"AND CAST(json_extract(value, '$.rating') AS INTEGER) IN ({bind_list}))"
+    )
+    return sub, params
+
+
+def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
+    """Build WHERE fragment for TPS rating buckets (selectors 1,3,5,7,9 → [N, N+2))."""
+    valid = sorted({int(v) for v in values if int(v) in (1, 3, 5, 7, 9)})
+    if not valid:
+        return "", {}
+    bucket_clauses: list[str] = []
+    params: dict[str, Any] = {}
+    for i, lo in enumerate(valid):
+        lo_key, hi_key = f"{param_prefix}_lo_{i}", f"{param_prefix}_hi_{i}"
+        params[lo_key] = lo
+        params[hi_key] = lo + 2
+        bucket_clauses.append(
+            f"(json_extract(value, '$.rating') >= :{lo_key} "
+            f"AND json_extract(value, '$.rating') < :{hi_key})"
+        )
+    inner = " OR ".join(bucket_clauses)
+    sub = (
+        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        f"WHERE json_extract(value, '$.source') = 'TPS' AND ({inner}))"
+    )
+    return sub, params
+
+
+def _source_favorite_clause(source: str) -> str:
+    """Match albums where the given source has favorite=true."""
+    return (
+        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        f"WHERE json_extract(value, '$.source') = '{source}' "
+        "AND json_extract(value, '$.favorite') = 1)"
+    )
+
+
+def _source_labels_clause(
+    source: str, kinds: list[str], param_prefix: str
+) -> tuple[str, dict[str, Any]]:
+    """Match albums where the given source carries one of the requested label kinds."""
+    patterns = [_LABEL_KIND_PATTERNS[k] for k in kinds if k in _LABEL_KIND_PATTERNS]
+    if not patterns:
+        return "", {}
+    params = {f"{param_prefix}_{i}": p for i, p in enumerate(patterns)}
+    label_or = " OR ".join(f"label_each.value LIKE :{k}" for k in params)
+    sub = (
+        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') src "
+        f"WHERE json_extract(src.value, '$.source') = '{source}' "
+        "AND EXISTS(SELECT 1 FROM json_each(json_extract(src.value, '$.labels')) label_each "
+        f"WHERE {label_or}))"
+    )
+    return sub, params
+
+
+def _source_untagged_clause(source: str) -> str:
+    """Match albums that do not carry an entry for the given source."""
+    return (
+        "NOT EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        f"WHERE json_extract(value, '$.source') = '{source}')"
+    )
+
+
+def _apply_critical_reception_filters(
+    *,
+    query_parts: list[str],
+    query_params: dict[str, Any],
+    dr_buckets: list[str] | None,
+    amg_ratings: list[int] | None,
+    amg_favorite: bool | None,
+    amg_labels: list[str] | None,
+    amg_untagged: bool | None,
+    tps_ratings: list[int] | None,
+    tps_favorite: bool | None,
+    tps_labels: list[str] | None,
+    tps_untagged: bool | None,
+) -> None:
+    """Append SQL clauses for critical_reception filters into the supplied lists.
+
+    All filters are independent; multiple filters AND together. Each list-shaped filter
+    OR-combines its values internally (a DR bucket selector matches if the album falls
+    in any of the chosen buckets).
+    """
+    # DR buckets — combine into a single OR clause referencing one extracted value.
+    if dr_buckets:
+        kinds = [b for b in dr_buckets if b in _DR_BUCKET_RANGES or b == "untagged"]
+        if kinds:
+            dr_path = "json_extract(albums.metadata, '$.critical_reception.dr')"
+            or_parts: list[str] = []
+            for i, kind in enumerate(kinds):
+                if kind == "untagged":
+                    or_parts.append(f"{dr_path} IS NULL")
+                    continue
+                lo, hi = _DR_BUCKET_RANGES[kind]
+                lo_key, hi_key = f"dr_{kind}_lo_{i}", f"dr_{kind}_hi_{i}"
+                query_params[lo_key] = lo
+                if hi is None:
+                    or_parts.append(f"{dr_path} >= :{lo_key}")
+                else:
+                    query_params[hi_key] = hi
+                    or_parts.append(f"({dr_path} >= :{lo_key} AND {dr_path} < :{hi_key})")
+            query_parts.append("(" + " OR ".join(or_parts) + ")")
+
+    # AMG / TPS rating buckets
+    if amg_ratings:
+        clause, params = _amg_rating_bucket_clause(list(amg_ratings), "amg_rb")
+        if clause:
+            query_parts.append(clause)
+            query_params.update(params)
+    if tps_ratings:
+        clause, params = _tps_rating_bucket_clause(list(tps_ratings), "tps_rb")
+        if clause:
+            query_parts.append(clause)
+            query_params.update(params)
+
+    # AMG / TPS favorite flag
+    if amg_favorite:
+        query_parts.append(_source_favorite_clause("AMG"))
+    if tps_favorite:
+        query_parts.append(_source_favorite_clause("TPS"))
+
+    # AMG / TPS label-kind filters
+    for source, labels_list, prefix in (
+        ("AMG", amg_labels, "amg_lbl"),
+        ("TPS", tps_labels, "tps_lbl"),
+    ):
+        if labels_list:
+            clause, params = _source_labels_clause(source, list(labels_list), prefix)
+            if clause:
+                query_parts.append(clause)
+                query_params.update(params)
+
+    # untagged-source flags
+    if amg_untagged:
+        query_parts.append(_source_untagged_clause("AMG"))
+    if tps_untagged:
+        query_parts.append(_source_untagged_clause("TPS"))
 
 
 class AlbumsController(MediaControllerBase[Album]):
@@ -117,6 +306,16 @@ class AlbumsController(MediaControllerBase[Album]):
         genre: int | list[int] | None = None,
         album_types: list[AlbumType] | None = None,
         ratings: list[int | None] | None = None,
+        listen_later: bool | None = None,
+        dr_buckets: list[str] | None = None,
+        amg_ratings: list[int] | None = None,
+        amg_favorite: bool | None = None,
+        amg_labels: list[str] | None = None,
+        amg_untagged: bool | None = None,
+        tps_ratings: list[int] | None = None,
+        tps_favorite: bool | None = None,
+        tps_labels: list[str] | None = None,
+        tps_untagged: bool | None = None,
         **kwargs: Any,
     ) -> list[Album]:
         """Get in-database albums.
@@ -130,6 +329,11 @@ class AlbumsController(MediaControllerBase[Album]):
         :param album_types: Filter by album types.
         :param genre: Filter by genre id(s).
         :param ratings: Filter by user rating (list of 1-5 and/or None for unrated).
+        :param dr_buckets: Filter by DR quality bucket (excellent/good/fair/poor/untagged).
+        :param amg_ratings / tps_ratings: Filter by review-source rating buckets.
+        :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
+        :param amg_labels / tps_labels: Filter by accolade label kind.
+        :param amg_untagged / tps_untagged: Keep only albums missing that source.
         """
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
@@ -139,6 +343,24 @@ class AlbumsController(MediaControllerBase[Album]):
         if album_types:
             extra_query_parts.append("albums.album_type IN :album_types")
             extra_query_params["album_types"] = [x.value for x in album_types]
+        # listen_later filter — bool, applies to albums.listen_later directly
+        if listen_later is not None:
+            extra_query_parts.append("albums.listen_later = :listen_later_flag")
+            extra_query_params["listen_later_flag"] = listen_later
+        # optional critical_reception filters (DR + AMG/TPS source entries)
+        _apply_critical_reception_filters(
+            query_parts=extra_query_parts,
+            query_params=extra_query_params,
+            dr_buckets=dr_buckets,
+            amg_ratings=amg_ratings,
+            amg_favorite=amg_favorite,
+            amg_labels=amg_labels,
+            amg_untagged=amg_untagged,
+            tps_ratings=tps_ratings,
+            tps_favorite=tps_favorite,
+            tps_labels=tps_labels,
+            tps_untagged=tps_untagged,
+        )
         if order_by and "artist_name" in order_by:
             # join artist table to allow sorting on artist name
             extra_join_parts.append(
@@ -216,7 +438,20 @@ class AlbumsController(MediaControllerBase[Album]):
         return result
 
     async def library_count(
-        self, favorite_only: bool = False, album_types: list[AlbumType] | None = None
+        self,
+        favorite_only: bool = False,
+        album_types: list[AlbumType] | None = None,
+        listen_later_only: bool = False,
+        dr_buckets: list[str] | None = None,
+        amg_ratings: list[int] | None = None,
+        amg_favorite: bool | None = None,
+        amg_labels: list[str] | None = None,
+        amg_untagged: bool | None = None,
+        tps_ratings: list[int] | None = None,
+        tps_favorite: bool | None = None,
+        tps_labels: list[str] | None = None,
+        tps_untagged: bool | None = None,
+        **kwargs: Any,
     ) -> int:
         """Return the total number of items in the library."""
         sql_query = f"SELECT item_id FROM {self.db_table}"
@@ -224,9 +459,24 @@ class AlbumsController(MediaControllerBase[Album]):
         query_params: dict[str, Any] = {}
         if favorite_only:
             query_parts.append("favorite = 1")
+        if listen_later_only:
+            query_parts.append("listen_later = 1")
         if album_types:
             query_parts.append("albums.album_type IN :album_types")
             query_params["album_types"] = [x.value for x in album_types]
+        _apply_critical_reception_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            dr_buckets=dr_buckets,
+            amg_ratings=amg_ratings,
+            amg_favorite=amg_favorite,
+            amg_labels=amg_labels,
+            amg_untagged=amg_untagged,
+            tps_ratings=tps_ratings,
+            tps_favorite=tps_favorite,
+            tps_labels=tps_labels,
+            tps_untagged=tps_untagged,
+        )
         if query_parts:
             sql_query += f" WHERE {' AND '.join(query_parts)}"
         return await self.mass.music.database.get_count_from_query(sql_query, query_params)
@@ -247,6 +497,26 @@ class AlbumsController(MediaControllerBase[Album]):
         # delete the album itself from db
         # this will raise if the item still has references and recursive is false
         await super().remove_item_from_library(item_id)
+
+    async def set_listen_later(self, item_id: str | int, listen_later: bool) -> None:
+        """Set the listen_later flag on a library album.
+
+        Independent of `favorite` — this is the Roon-style "save for later" pile,
+        not a library/favorites add. Stamps `listen_later_added_at` with the
+        current epoch on flip-to-true so the dedicated view can sort newest-first.
+        """
+        db_id = int(item_id)
+        library_item = await self.get_library_item(db_id)
+        if library_item.listen_later == listen_later:
+            return
+        update: dict[str, Any] = {"listen_later": listen_later}
+        if listen_later:
+            update["listen_later_added_at"] = int(time.time())
+        else:
+            update["listen_later_added_at"] = None
+        await self.mass.music.database.update(self.db_table, {"item_id": db_id}, update)
+        library_item = await self.get_library_item(db_id)
+        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
 
     async def tracks(
         self,
@@ -420,6 +690,19 @@ class AlbumsController(MediaControllerBase[Album]):
         db_id = int(item_id)  # ensure integer
         cur_item = await self.get_library_item(db_id)
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
+        # MediaItemMetadata.update() only fills None-valued fields and does not
+        # deep-merge structured sub-shapes like critical_reception — so a fresher
+        # CR (e.g. one that now carries a DR value) gets dropped on the floor when
+        # the existing field is already non-None. Apply a targeted replacement
+        # whenever the incoming CR strictly extends what's already stored.
+        if (
+            not overwrite
+            and update.metadata is not None
+            and _critical_reception_is_richer(
+                update.metadata.critical_reception, metadata.critical_reception
+            )
+        ):
+            metadata.critical_reception = update.metadata.critical_reception
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:

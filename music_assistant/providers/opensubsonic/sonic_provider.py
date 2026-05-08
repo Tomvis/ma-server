@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import tempfile
 from asyncio import TaskGroup
+from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
@@ -36,6 +40,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     Track,
 )
+from music_assistant_models.media_items.metadata import CriticalReception
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import (
@@ -46,6 +51,7 @@ from music_assistant.constants import (
     UNKNOWN_ARTIST,
 )
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.models.music_provider import MusicProvider
 
 from .parsers import (
@@ -87,6 +93,13 @@ CONF_RAW_FILE = "request_raw_file"
 
 CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
+
+# How many bytes to download from a track when extracting custom AMG/TPS/DR tags.
+# Tag headers (ID3v2 / Vorbis comments / FLAC METADATA_BLOCK / MP4 'moov') live near
+# the start of the file; 512 KiB is enough for every common audio container.
+CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
+# How long ffprobe is allowed to run on the temp file. Bounds total sync cost.
+CRITICAL_RECEPTION_PROBE_TIMEOUT = 12.0
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
@@ -316,13 +329,98 @@ class OpenSonicProvider(MusicProvider):
         )
         while albums:
             for album in albums:
-                yield parse_album(self.logger, self.instance_id, album)
+                parsed = parse_album(self.logger, self.instance_id, album)
+                # Pull AMG/TPS/DR custom tags out of one track per album.
+                # These don't ride on the OpenSubsonic schema, so we ffprobe a
+                # short prefix of the audio. Failures are non-fatal — the album
+                # still syncs, just without critical_reception.
+                await self._enrich_album_with_critical_reception(parsed, album.id)
+                yield parsed
             offset += size
             albums = await self.conn.get_album_list2(
                 ltype="alphabeticalByArtist",
                 size=size,
                 offset=offset,
             )
+
+    async def _enrich_album_with_critical_reception(
+        self, album: Album, prov_album_id: str
+    ) -> None:
+        """Populate album.metadata.critical_reception by ffprobing one track of the album."""
+        try:
+            cr = await self._get_album_critical_reception(prov_album_id)
+        except Exception as err:  # noqa: BLE001
+            self.logger.debug(
+                "critical_reception extraction failed for album %s: %s", prov_album_id, err
+            )
+            return
+        if cr is not None:
+            album.metadata.critical_reception = cr
+
+    async def _get_album_critical_reception(self, prov_album_id: str) -> CriticalReception | None:
+        """Fetch one track of an album, ffprobe it, return CriticalReception or None.
+
+        Intentionally NOT cached: when tag-extraction logic changes (e.g. new tag-key
+        aliases land), a stale per-album cache would mask the new behavior on resync.
+        The enclosing `get_album` is itself cached for 3h, and library-sync calls this
+        once per album per run, so the absence of a per-album cache costs at most one
+        extra `/stream` partial fetch per sync. That's the right trade.
+        """
+        try:
+            sonic_album = await self.conn.get_album(prov_album_id)
+        except (ParameterError, DataNotFoundError):
+            return None
+        if not sonic_album.song:
+            return None
+        sample_song_id = sonic_album.song[0].id
+        return await self._extract_critical_reception_from_song(sample_song_id)
+
+    async def _extract_critical_reception_from_song(
+        self, song_id: str
+    ) -> CriticalReception | None:
+        """Stream a small prefix of the song and ffprobe it for AMG/TPS/DR tags."""
+        # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
+        # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
+        # for some containers (M4A 'moov' atom can sit before mdat but ffprobe still
+        # wants the file size to validate offsets); a temp file sidesteps all of it.
+        try:
+            resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
+        except (ParameterError, DataNotFoundError):
+            return None
+        bytes_read = 0
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="ma-cr-", suffix=".bin", delete=False
+            ) as tmp:
+                tmp_path = tmp.name
+                async with resp:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            break
+                        remaining = CRITICAL_RECEPTION_PROBE_BYTES - bytes_read
+                        if remaining <= 0:
+                            break
+                        if len(chunk) > remaining:
+                            chunk = chunk[:remaining]
+                        tmp.write(chunk)
+                        bytes_read += len(chunk)
+                        if bytes_read >= CRITICAL_RECEPTION_PROBE_BYTES:
+                            break
+            if bytes_read == 0:
+                return None
+            try:
+                tags = await asyncio.wait_for(
+                    async_parse_tags(tmp_path),
+                    timeout=CRITICAL_RECEPTION_PROBE_TIMEOUT,
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                return None
+            return tags.critical_reception
+        finally:
+            if tmp_path:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """Provide a generator for library playlists."""
@@ -385,7 +483,20 @@ class OpenSonicProvider(MusicProvider):
             msg = f"Album {prov_album_id} not found"
             raise MediaNotFoundError(msg) from e
 
-        return parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
+        album = parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
+        # We already have the song list — extract straight from the first track
+        # rather than re-fetching the album in _get_album_critical_reception.
+        if sonic_album.song:
+            try:
+                cr = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug(
+                    "critical_reception extraction failed for album %s: %s", prov_album_id, err
+                )
+            else:
+                if cr is not None:
+                    album.metadata.critical_reception = cr
+        return album
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:

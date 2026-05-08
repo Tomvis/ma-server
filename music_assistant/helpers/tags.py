@@ -16,6 +16,10 @@ from typing import Any
 import mutagen
 from music_assistant_models.enums import AlbumType
 from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.media_items.metadata import (
+    CriticalReception,
+    ReviewSourceEntry,
+)
 from mutagen._vorbis import VCommentDict
 from mutagen.apev2 import APEv2
 from mutagen.id3 import ID3, TXXX  # type: ignore[attr-defined]
@@ -39,6 +43,72 @@ TAG_SPLITTER = ";"
 def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
     """Return a tuple with all empty values removed."""
     return tuple(x.strip() for x in values if x not in (None, "", " "))
+
+
+_TRUTHY_TAG_VALUES = frozenset({"1", "true", "yes", "y", "t"})
+_FALSY_TAG_VALUES = frozenset({"0", "false", "no", "n", "f"})
+
+
+def _parse_float_tag(raw: str | list[str] | tuple[str, ...] | None) -> float | None:
+    """Parse a single numeric tag value to float; return None for missing/invalid input."""
+    if raw is None:
+        return None
+    if isinstance(raw, list | tuple):
+        raw = raw[0] if raw else None
+        if raw is None:
+            return None
+    text = str(raw).strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    # Reject NaN/inf so they don't poison downstream comparisons / JSON.
+    if value != value or value in (float("inf"), float("-inf")):  # noqa: PLR0124
+        return None
+    return value
+
+
+def _parse_bool_tag(raw: str | list[str] | tuple[str, ...] | None) -> bool | None:
+    """Parse a boolean tag (1/0, true/false). Return None for missing/unrecognized input."""
+    if raw is None:
+        return None
+    if isinstance(raw, list | tuple):
+        raw = raw[0] if raw else None
+        if raw is None:
+            return None
+    text = str(raw).strip().lower()
+    if text in _TRUTHY_TAG_VALUES:
+        return True
+    if text in _FALSY_TAG_VALUES:
+        return False
+    return None
+
+
+def _build_review_source_entry(
+    tags: dict[str, Any], source_id: str, key_prefix: str
+) -> ReviewSourceEntry | None:
+    """Build a single ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_TYPE/_LABELS/_AUTHOR.
+
+    Returns None when the source has no usable fields, so empty entries don't
+    pollute the album metadata.
+    """
+    rating = _parse_float_tag(tags.get(f"{key_prefix}rating"))
+    favorite = _parse_bool_tag(tags.get(f"{key_prefix}favorite"))
+    types = list(split_items(tags.get(f"{key_prefix}type")))
+    labels = list(split_items(tags.get(f"{key_prefix}labels")))
+    authors = list(split_items(tags.get(f"{key_prefix}author")))
+    if rating is None and not favorite and not types and not labels and not authors:
+        return None
+    return ReviewSourceEntry(
+        source=source_id,
+        rating=rating,
+        favorite=favorite if favorite else None,
+        types=types or None,
+        labels=labels or None,
+        authors=authors or None,
+    )
 
 
 def split_items(
@@ -545,6 +615,41 @@ class AudioTags:
                         return f"0{item}"
                     return item
         return None
+
+    @property
+    def critical_reception(self) -> CriticalReception | None:
+        """Build CriticalReception from custom AMG/TPS/DR tags, if any are present.
+
+        Tag schema (case-insensitive; underscores/spaces/hyphens stripped during parse):
+          DR / DYNAMIC RANGE / Album Dynamic Range / DR_Album  -> album-level DR numeric
+          AMG_RATING      -> /5 numeric review score
+          AMG_FAVORITE    -> truthy when the album is an AMG list-pick without a score
+          AMG_TYPE        -> ;-separated review kind labels (Review, TYMHM, …)
+          AMG_LABELS      -> ;-separated accolade labels (AOTY-2024, RECORD_OF_THE_MONTH, …)
+          AMG_AUTHOR      -> ;-separated author names (canonical, secondary, list-pick)
+          TPS_RATING / TPS_FAVORITE / TPS_TYPE / TPS_LABELS / TPS_AUTHOR  (mirror of AMG, /10)
+        """
+        # DR can show up under several common conventions. Tag-key transform
+        # already lowercased and stripped spaces/underscores/hyphens, so e.g.
+        # AMG_DR -> amgdr, "Album Dynamic Range" -> albumdynamicrange.
+        dr: float | None = None
+        for dr_key in (
+            "amgdr",              # AMG-prefixed (user's schema; per-source DR)
+            "tpsdr",              # TPS-prefixed mirror
+            "albumdynamicrange",  # foobar2000 DR Meter (album)
+            "dralbum",            # alt foobar convention
+            "dynamicrange",       # TT DR Meter / foobar (default)
+            "dr",                 # bare DR
+        ):
+            dr = _parse_float_tag(self.tags.get(dr_key))
+            if dr is not None:
+                break
+        amg = _build_review_source_entry(self.tags, "AMG", "amg")
+        tps = _build_review_source_entry(self.tags, "TPS", "tps")
+        sources: list[ReviewSourceEntry] = [s for s in (amg, tps) if s is not None]
+        if dr is None and not sources:
+            return None
+        return CriticalReception(dr=dr, sources=sources or None)
 
     @property
     def chapters(self) -> list[AudioTagsChapter]:

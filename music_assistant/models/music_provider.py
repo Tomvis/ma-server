@@ -52,6 +52,28 @@ if TYPE_CHECKING:
 CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
 
 
+def _critical_reception_is_richer(new: object, existing: object) -> bool:
+    """Return True if `new` carries more critical_reception data than `existing`.
+
+    Uses a coarse "more fields filled" heuristic so any forward improvement (DR
+    landing, more sources, etc.) wins, but a regression (e.g. a transient probe
+    failure that drops sources) does not overwrite known-good data.
+    """
+    if new is None:
+        return False
+    if existing is None:
+        return True
+    new_dr = getattr(new, "dr", None)
+    cur_dr = getattr(existing, "dr", None)
+    if new_dr is not None and cur_dr is None:
+        return True
+    new_sources = getattr(new, "sources", None) or []
+    cur_sources = getattr(existing, "sources", None) or []
+    if len(new_sources) > len(cur_sources):
+        return True
+    return False
+
+
 class MusicProvider(Provider):
     """Base representation of a Music Provider (controller).
 
@@ -928,6 +950,29 @@ class MusicProvider(Provider):
                     # update date_added if it changed
                     library_item = await self.mass.music.albums.update_item_in_library(
                         library_item.item_id, prov_item
+                    )
+                elif (
+                    prov_item.metadata
+                    and prov_item.metadata.critical_reception is not None
+                    and _critical_reception_is_richer(
+                        prov_item.metadata.critical_reception,
+                        library_item.metadata.critical_reception
+                        if library_item.metadata
+                        else None,
+                    )
+                ):
+                    # Provider has surfaced fresher / more complete critical_reception
+                    # metadata (DR / AMG / TPS). MediaItemMetadata.update() only fills
+                    # None-valued fields and won't deep-merge CriticalReception, so we
+                    # overwrite the field directly on the library item and persist via
+                    # update_item_in_library — guarding the rest of the metadata by only
+                    # mutating critical_reception on the in-memory prov_item.
+                    if library_item.metadata is not None:
+                        library_item.metadata.critical_reception = (
+                            prov_item.metadata.critical_reception
+                        )
+                    library_item = await self.mass.music.albums.update_item_in_library(
+                        library_item.item_id, library_item
                     )
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be

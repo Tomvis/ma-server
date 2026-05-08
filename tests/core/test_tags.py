@@ -782,3 +782,117 @@ async def test_write_replaygain_track_gain_read_only(tmp_path: pathlib.Path) -> 
     finally:
         # restore permissions so tmp_path cleanup can remove the file
         dest.chmod(0o644)
+
+
+def _make_audio_tags(custom_tags: dict[str, str]) -> tags.AudioTags:
+    """Build a minimal AudioTags instance for unit-testing tag-derived properties."""
+    return tags.AudioTags(
+        raw={},
+        sample_rate=44100,
+        channels=2,
+        bits_per_sample=16,
+        format="flac",
+        bit_rate=None,
+        duration=None,
+        tags=custom_tags,
+        has_cover_image=False,
+        filename="/tmp/test.flac",
+    )
+
+
+def test_critical_reception_returns_none_when_no_tags() -> None:
+    """No DR/AMG/TPS tags → critical_reception is None (no empty payload)."""
+    assert _make_audio_tags({}).critical_reception is None
+    assert _make_audio_tags({"album": "Foo"}).critical_reception is None
+
+
+def test_critical_reception_extracts_dr_only() -> None:
+    """A DR tag alone produces a CriticalReception with no source entries."""
+    cr = _make_audio_tags({"dr": "12.5"}).critical_reception
+    assert cr is not None
+    assert cr.dr == 12.5
+    assert cr.sources is None
+
+
+def test_critical_reception_extracts_amg_full_entry() -> None:
+    """All AMG_* tags map cleanly into a single ReviewSourceEntry."""
+    cr = _make_audio_tags(
+        {
+            "amgrating": "4.5",
+            "amgtype": "Review;TYMHM",
+            "amglabels": "AOTY-2024;RECORD_OF_THE_MONTH",
+            "amgauthor": "Steel Druhm;Dr. A.N. Grier",
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    assert len(cr.sources) == 1
+    amg = cr.sources[0]
+    assert amg.source == "AMG"
+    assert amg.rating == 4.5
+    assert amg.types == ["Review", "TYMHM"]
+    assert amg.labels == ["AOTY-2024", "RECORD_OF_THE_MONTH"]
+    assert amg.authors == ["Steel Druhm", "Dr. A.N. Grier"]
+    assert amg.favorite is None
+
+
+def test_critical_reception_favorite_only_entry() -> None:
+    """A list-pick (favorite without rating) is a valid TPS entry."""
+    cr = _make_audio_tags(
+        {"tpsfavorite": "true", "tpslabels": "AOTM-2024-03", "tpsauthor": "Dolphin Whisperer"}
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    tps = next(s for s in cr.sources if s.source == "TPS")
+    assert tps.rating is None
+    assert tps.favorite is True
+    assert tps.labels == ["AOTM-2024-03"]
+
+
+def test_critical_reception_amg_and_tps_coexist() -> None:
+    """AMG + TPS tags on the same album yield both entries plus DR."""
+    cr = _make_audio_tags(
+        {"dr": "12", "amgrating": "4", "tpsrating": "8.5"}
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    assert cr.dr == 12.0
+    assert {s.source for s in cr.sources} == {"AMG", "TPS"}
+    assert next(s for s in cr.sources if s.source == "TPS").rating == 8.5
+
+
+def test_critical_reception_drops_empty_source_entries() -> None:
+    """A source with all-empty fields is omitted, not added as a hollow entry."""
+    cr = _make_audio_tags(
+        {"dr": "10", "amgtype": "", "amgrating": "  "}
+    ).critical_reception
+    assert cr is not None
+    assert cr.sources is None
+
+
+def test_critical_reception_invalid_numerics_dropped() -> None:
+    """NaN/inf/garbage in rating tags do not surface as values."""
+    cr = _make_audio_tags(
+        {"amgrating": "nan", "tpsrating": "inf", "dr": "not-a-number"}
+    ).critical_reception
+    # all fields invalid → nothing left, CR is None
+    assert cr is None
+
+
+def test_critical_reception_european_decimal_separator() -> None:
+    """Tags written with comma decimals (12,5) parse like 12.5."""
+    cr = _make_audio_tags({"dr": "12,5"}).critical_reception
+    assert cr is not None
+    assert cr.dr == 12.5
+
+
+def test_critical_reception_amg_dr_tag_recognized() -> None:
+    """AMG_DR / TPS_DR / common DR tag aliases all surface as the album DR."""
+    # AudioTags lowercases and strips _-/space, so AMG_DR -> amgdr
+    cr = _make_audio_tags({"amgdr": "11"}).critical_reception
+    assert cr is not None
+    assert cr.dr == 11.0
+    cr = _make_audio_tags({"dynamicrange": "9.5"}).critical_reception
+    assert cr is not None
+    assert cr.dr == 9.5
+    # First match wins (priority: amgdr > tpsdr > albumdynamicrange > … > dr)
+    cr = _make_audio_tags({"amgdr": "12", "dr": "20"}).critical_reception
+    assert cr is not None
+    assert cr.dr == 12.0

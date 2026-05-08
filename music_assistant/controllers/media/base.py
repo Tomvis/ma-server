@@ -83,10 +83,39 @@ SORT_KEYS = {
     "year_desc": "year DESC",
     "rating": "rating ASC",
     "rating_desc": "rating DESC",
+    # listen_later sorts — only valid for the albums table (only table with the
+    # column today). Use COALESCE so unsaved rows sort last on DESC.
+    "listen_later_added_at": "listen_later_added_at ASC",
+    "listen_later_added_at_desc": "COALESCE(listen_later_added_at, 0) DESC",
     "position": "position ASC",
     "position_desc": "position DESC",
     "artist_name": "artists.search_name ASC, year DESC",
     "artist_name_desc": "artists.search_name DESC, year DESC",
+    # critical_reception sorts — only valid for the albums table since they
+    # reference albums.metadata directly. Non-album controllers should not pass
+    # these keys (no SQL fallback is provided).
+    "dr": "json_extract(albums.metadata, '$.critical_reception.dr') ASC",
+    "dr_desc": "json_extract(albums.metadata, '$.critical_reception.dr') DESC",
+    "amg_rating": (
+        "(SELECT json_extract(value, '$.rating') "
+        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC"
+    ),
+    "amg_rating_desc": (
+        "(SELECT json_extract(value, '$.rating') "
+        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC"
+    ),
+    "tps_rating": (
+        "(SELECT json_extract(value, '$.rating') "
+        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC"
+    ),
+    "tps_rating_desc": (
+        "(SELECT json_extract(value, '$.rating') "
+        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC"
+    ),
     "random": "RANDOM()",
     "random_play_count": "RANDOM(), play_count ASC",
 }
@@ -1154,6 +1183,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         db_row_dict = dict(db_row)
         db_row_dict["provider"] = "library"
         db_row_dict["favorite"] = bool(db_row_dict["favorite"])
+        if "listen_later" in db_row_dict:
+            db_row_dict["listen_later"] = bool(db_row_dict["listen_later"])
         db_row_dict["item_id"] = str(db_row_dict["item_id"])
         db_row_dict["date_added"] = datetime.fromtimestamp(
             db_row_dict["timestamp_added"]

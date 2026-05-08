@@ -1633,6 +1633,8 @@ class LocalFileSystemProvider(MusicProvider):
         if track_tags.year:
             album.year = track_tags.year
         album.album_type = track_tags.album_type
+        if critical_reception := track_tags.critical_reception:
+            album.metadata.critical_reception = critical_reception
 
         # hunt for additional metadata and images in the folder structure
         if not album_dir:

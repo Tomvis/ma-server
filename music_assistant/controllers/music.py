@@ -109,7 +109,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 42
+DB_SCHEMA_VERSION: Final[int] = 43
 
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
@@ -910,6 +910,31 @@ class MusicController(CoreController):
             if not provider or not provider.library_favorites_edit_supported(full_item.media_type):
                 continue
             self.mass.create_task(provider.set_favorite(prov_mapping.item_id, media_type, False))
+
+    @api_command("music/albums/listen_later_add")
+    async def add_album_to_listen_later(
+        self,
+        item: str | MediaItemType | ItemMapping,
+    ) -> None:
+        """Mark an album as listen-later (Roon-style 'save for later')."""
+        if isinstance(item, str):
+            item = await self.get_item_by_uri(item)
+        # always operate on the library copy — listen_later lives on the
+        # library row, identical to favorites/rating.
+        full_item = await self.get_item(item.media_type, item.item_id, item.provider)
+        if full_item.media_type != MediaType.ALBUM:
+            raise InvalidDataError("listen_later is only supported for albums")
+        if full_item.provider != "library":
+            full_item = await self.add_item_to_library(full_item)
+        await self.albums.set_listen_later(full_item.item_id, True)
+
+    @api_command("music/albums/listen_later_remove")
+    async def remove_album_from_listen_later(
+        self,
+        library_item_id: str | int,
+    ) -> None:
+        """Clear the listen-later flag on a library album."""
+        await self.albums.set_listen_later(library_item_id, False)
 
     @api_command("music/library/set_rating")
     async def set_library_item_rating(
@@ -2735,6 +2760,20 @@ class MusicController(CoreController):
                 if "duplicate column" not in str(err):
                     raise
 
+        if prev_version <= 42:
+            # add listen_later flag + timestamp to albums (Roon-style "save for later")
+            for column_sql in (
+                f"ALTER TABLE {DB_TABLE_ALBUMS} "
+                "ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",
+                f"ALTER TABLE {DB_TABLE_ALBUMS} "
+                "ADD COLUMN [listen_later_added_at] INTEGER;",
+            ):
+                try:
+                    await self._database.execute(column_sql)
+                except Exception as err:
+                    if "duplicate column" not in str(err):
+                        raise
+
         # save changes
         await self._database.commit()
 
@@ -2785,6 +2824,8 @@ class MusicController(CoreController):
                     [year] INTEGER,
                     [favorite] BOOLEAN NOT NULL DEFAULT 0,
                     [rating] INTEGER,
+                    [listen_later] BOOLEAN NOT NULL DEFAULT 0,
+                    [listen_later_added_at] INTEGER,
                     [metadata] json NOT NULL,
                     [external_ids] json NOT NULL,
                     [play_count] INTEGER NOT NULL DEFAULT 0,
