@@ -329,13 +329,11 @@ class OpenSonicProvider(MusicProvider):
                 offset=offset,
             )
 
-    async def _enrich_album_with_critical_reception(
-        self, album: Album, prov_album_id: str
-    ) -> None:
+    async def _enrich_album_with_critical_reception(self, album: Album, prov_album_id: str) -> None:
         """Populate album.metadata.critical_reception by ffprobing one track of the album."""
         try:
             cr = await self._get_album_critical_reception(prov_album_id)
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             self.logger.debug(
                 "critical_reception extraction failed for album %s: %s", prov_album_id, err
             )
@@ -361,9 +359,7 @@ class OpenSonicProvider(MusicProvider):
         sample_song_id = sonic_album.song[0].id
         return await self._extract_critical_reception_from_song(sample_song_id)
 
-    async def _extract_critical_reception_from_song(
-        self, song_id: str
-    ) -> CriticalReception | None:
+    async def _extract_critical_reception_from_song(self, song_id: str) -> CriticalReception | None:
         """Stream a small prefix of the song and ffprobe it for AMG/TPS/DR tags."""
         # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
         # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
@@ -376,9 +372,7 @@ class OpenSonicProvider(MusicProvider):
         bytes_read = 0
         tmp_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                prefix="ma-cr-", suffix=".bin", delete=False
-            ) as tmp:
+            with tempfile.NamedTemporaryFile(prefix="ma-cr-", suffix=".bin", delete=False) as tmp:
                 tmp_path = tmp.name
                 async with resp:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -400,7 +394,7 @@ class OpenSonicProvider(MusicProvider):
                     async_parse_tags(tmp_path),
                     timeout=CRITICAL_RECEPTION_PROBE_TIMEOUT,
                 )
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            except (TimeoutError, Exception):
                 return None
             return tags.critical_reception
         finally:
@@ -475,7 +469,7 @@ class OpenSonicProvider(MusicProvider):
         if sonic_album.song:
             try:
                 cr = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
                 self.logger.debug(
                     "critical_reception extraction failed for album %s: %s", prov_album_id, err
                 )
