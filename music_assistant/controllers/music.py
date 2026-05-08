@@ -74,7 +74,12 @@ from music_assistant.constants import (
 from music_assistant.controllers.tasks.context import update_current_task_progress_text
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.api import api_command
-from music_assistant.helpers.compare import compare_strings, compare_version, create_safe_string
+from music_assistant.helpers.compare import (
+    compare_strings,
+    compare_version,
+    create_safe_string,
+    loose_compare_strings,
+)
 from music_assistant.helpers.database import UNSET, DatabaseConnection
 from music_assistant.helpers.datetime import (
     from_utc_timestamp,
@@ -101,6 +106,7 @@ if TYPE_CHECKING:
     from music_assistant_models.auth import User
     from music_assistant_models.config_entries import CoreConfig
     from music_assistant_models.media_items import Audiobook, PodcastEpisode
+    from music_assistant_models.media_items.metadata import CriticalReception
 
     from music_assistant import MusicAssistant
 
@@ -914,8 +920,11 @@ class MusicController(CoreController):
     @api_command("music/albums/listen_later_add")
     async def add_album_to_listen_later(
         self,
-        item: str | MediaItemType | ItemMapping,
-    ) -> None:
+        item: str | MediaItemType | ItemMapping | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        critical_reception: CriticalReception | None = None,
+    ) -> Album:
         """Mark an album as listen-later (Roon-style 'save for later').
 
         Distinct from `music/library/add_item`: a listen-later album gets a
@@ -923,20 +932,139 @@ class MusicController(CoreController):
         provider mappings are NOT flipped to `in_library=True` and the change
         is NOT synced back to the streaming provider. As a result the album
         does not appear in the regular Albums library view, only in
-        /listen-later. The user can still favorite or library-add it
-        explicitly via separate actions.
+        /listen-later.
+
+        Two input modes are supported:
+
+        1. ``item`` — an MA URI / Album / ItemMapping (in-app UX). Resolves
+           the album through its known provider.
+        2. ``artist`` + ``album`` — free-text identifiers (external clients).
+           Searches every loaded music provider and picks the best match.
+           A streaming-provider hit is preferred so the listen-later entry
+           remains playable.
+
+        ``critical_reception`` is optional and accepts the same shape produced
+        by the file-tag parser (DR + per-source AMG/TPS ratings/labels). When
+        supplied, it lands on the album's metadata before the library insert
+        — i.e. the same way file-scan results carry it.
+
+        Refuses to flip the flag if the resolved album already has a
+        provider_mapping with ``in_library=True``: a real library album is
+        played from the regular Albums view, not from listen-later.
+
+        :param item: MA URI / Album / ItemMapping; pass instead of artist/album.
+        :param artist: Album artist name (external mode).
+        :param album: Album title (external mode).
+        :param critical_reception: Optional CR data attached to the album.
         """
-        if isinstance(item, str):
-            item = await self.get_item_by_uri(item)
-        full_item = await self.get_item(item.media_type, item.item_id, item.provider)
-        if full_item.media_type != MediaType.ALBUM:
-            raise InvalidDataError("listen_later is only supported for albums")
-        if full_item.provider != "library":
+        if item is None and not (artist and album):
+            raise InvalidDataError("Either 'item' or both 'artist' and 'album' must be supplied")
+
+        if item is not None:
+            if isinstance(item, str):
+                item = await self.get_item_by_uri(item)
+            candidate = await self.get_item(item.media_type, item.item_id, item.provider)
+            if candidate.media_type != MediaType.ALBUM:
+                raise InvalidDataError("listen_later is only supported for albums")
+            assert isinstance(candidate, Album)
+        else:
+            assert artist
+            assert album
+            candidate = await self._resolve_album_by_artist_title(artist, album)
+
+        # Reject if the album already lives in the library proper. Listen-later
+        # rows have no in_library mapping by design; a hit with in_library=True
+        # means the user already has it from a sync/library-add and wouldn't see
+        # the listen-later entry anyway.
+        existing_id = await self.albums._get_library_item_by_match(candidate)
+        if existing_id is not None:
+            existing = await self.albums.get_library_item(existing_id)
+            if any(pm.in_library for pm in existing.provider_mappings):
+                raise InvalidDataError(f"Album {existing.name!r} is already in your library")
+
+        if critical_reception is not None:
+            # Land CR on the in-memory album so _add_library_item persists it on
+            # the initial insert. For an existing listen-later row the merge
+            # path in _update_library_item replaces CR when the new payload is
+            # strictly richer (see _critical_reception_is_richer).
+            candidate.metadata.critical_reception = critical_reception
+
+        if candidate.provider != "library":
             # Controller-level add: creates the row + provider_mappings with
             # in_library left as None (NULL/0), without invoking the music.py
             # api_command that flips in_library=True and triggers provider sync.
-            full_item = await self.albums.add_item_to_library(full_item)
-        await self.albums.set_listen_later(full_item.item_id, True)
+            candidate = await self.albums.add_item_to_library(candidate)
+        await self.albums.set_listen_later(candidate.item_id, True)
+        return await self.albums.get_library_item(candidate.item_id)
+
+    async def _resolve_album_by_artist_title(self, artist: str, album: str) -> Album:
+        """Find the best provider album match for free-text artist + album.
+
+        Searches every loaded music provider that supports search, keeping
+        only candidates whose name and artist loosely match the inputs (so
+        "The Beatles - Abbey Road" still matches a "Beatles - Abbey Road
+        (Remastered)" hit). Streaming-provider hits sort first so the
+        resulting listen-later entry stays playable.
+
+        :param artist: Artist name to match against album.artists[*].name.
+        :param album: Album title to match against album.name.
+        """
+        search_query = f"{artist} - {album}"
+        candidates: list[Album] = []
+        seen: set[tuple[str, str]] = set()
+        for provider in self.providers:
+            if not isinstance(provider, MusicProvider):
+                continue
+            if ProviderFeature.SEARCH not in provider.supported_features:
+                continue
+            if not provider.library_supported(MediaType.ALBUM):
+                continue
+            try:
+                results = await self._search_provider(
+                    search_query, provider.instance_id, [MediaType.ALBUM], limit=10
+                )
+            except Exception as err:
+                self.logger.debug("Album search failed on %s: %s", provider.instance_id, err)
+                continue
+            for result_album in results.albums:
+                key = (result_album.provider, result_album.item_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not result_album.artists:
+                    continue
+                if not loose_compare_strings(album, result_album.name):
+                    continue
+                if not any(loose_compare_strings(artist, a.name) for a in result_album.artists):
+                    continue
+                candidates.append(result_album)
+
+        if not candidates:
+            raise MediaNotFoundError(
+                f"No matching album found for {artist!r} - {album!r} on any loaded music provider"
+            )
+
+        # Prefer Tidal first (best lossless catalog), then any other streaming
+        # provider (so the entry stays playable), then non-streaming hits.
+        # Sort is stable, so within a tier we keep the discovery order.
+        def _tier(a: Album) -> int:
+            prov = self.mass.get_provider(a.provider)
+            if prov is None:
+                return 2
+            if prov.domain == "tidal":
+                return 0
+            if getattr(prov, "is_streaming_provider", False):
+                return 1
+            return 2
+
+        candidates.sort(key=_tier)
+        chosen = candidates[0]
+        # Re-fetch the full record so we get artists/external_ids/metadata that
+        # search results commonly omit.
+        return cast(
+            "Album",
+            await self.get_item(MediaType.ALBUM, chosen.item_id, chosen.provider),
+        )
 
     @api_command("music/albums/listen_later_remove")
     async def remove_album_from_listen_later(
@@ -2730,8 +2858,7 @@ class MusicController(CoreController):
             for column_sql in (
                 f"ALTER TABLE {DB_TABLE_ALBUMS} "
                 "ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",
-                f"ALTER TABLE {DB_TABLE_ALBUMS} "
-                "ADD COLUMN [listen_later_added_at] INTEGER;",
+                f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later_added_at] INTEGER;",
             ):
                 try:
                     await self._database.execute(column_sql)
