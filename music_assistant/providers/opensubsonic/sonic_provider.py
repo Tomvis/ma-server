@@ -285,20 +285,6 @@ class OpenSonicProvider(MusicProvider):
         else:
             await self.conn.unstar(sids=track_ids, album_ids=album_ids, artist_ids=artist_ids)
 
-    async def set_rating(
-        self, prov_item_id: str, media_type: MediaType, rating: int | None
-    ) -> None:
-        """Push user rating (1-5 stars, or None to clear) to the subsonic server."""
-        # The subsonic spec's setRating only supports artists, albums, and tracks
-        if media_type not in (MediaType.ARTIST, MediaType.ALBUM, MediaType.TRACK):
-            raise UnsupportedFeaturedException(
-                f"Subsonic set_rating is not supported for {media_type}"
-            )
-        # libopensonic.set_rating expects 0 to clear, 1-5 to set.
-        # It raises SonicError on failure so we don't need to check the return value.
-        value = 0 if rating is None else rating
-        await self.conn.set_rating(prov_item_id, value)
-
     async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
         """Provide a generator for reading all artists."""
         artists = await self.conn.get_artists()

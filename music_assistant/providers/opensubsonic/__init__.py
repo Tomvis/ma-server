@@ -48,9 +48,6 @@ SUPPORTED_FEATURES = {
     ProviderFeature.FAVORITE_ALBUMS_EDIT,
     ProviderFeature.FAVORITE_ARTISTS_EDIT,
     ProviderFeature.FAVORITE_TRACKS_EDIT,
-    ProviderFeature.RATING_ALBUMS_EDIT,
-    ProviderFeature.RATING_ARTISTS_EDIT,
-    ProviderFeature.RATING_TRACKS_EDIT,
     ProviderFeature.LYRICS,
 }
 

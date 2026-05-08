@@ -916,16 +916,26 @@ class MusicController(CoreController):
         self,
         item: str | MediaItemType | ItemMapping,
     ) -> None:
-        """Mark an album as listen-later (Roon-style 'save for later')."""
+        """Mark an album as listen-later (Roon-style 'save for later').
+
+        Distinct from `music/library/add_item`: a listen-later album gets a
+        local DB row so the per-user flag has somewhere to live, but its
+        provider mappings are NOT flipped to `in_library=True` and the change
+        is NOT synced back to the streaming provider. As a result the album
+        does not appear in the regular Albums library view, only in
+        /listen-later. The user can still favorite or library-add it
+        explicitly via separate actions.
+        """
         if isinstance(item, str):
             item = await self.get_item_by_uri(item)
-        # always operate on the library copy — listen_later lives on the
-        # library row, identical to favorites/rating.
         full_item = await self.get_item(item.media_type, item.item_id, item.provider)
         if full_item.media_type != MediaType.ALBUM:
             raise InvalidDataError("listen_later is only supported for albums")
         if full_item.provider != "library":
-            full_item = await self.add_item_to_library(full_item)
+            # Controller-level add: creates the row + provider_mappings with
+            # in_library left as None (NULL/0), without invoking the music.py
+            # api_command that flips in_library=True and triggers provider sync.
+            full_item = await self.albums.add_item_to_library(full_item)
         await self.albums.set_listen_later(full_item.item_id, True)
 
     @api_command("music/albums/listen_later_remove")
@@ -935,42 +945,6 @@ class MusicController(CoreController):
     ) -> None:
         """Clear the listen-later flag on a library album."""
         await self.albums.set_listen_later(library_item_id, False)
-
-    @api_command("music/library/set_rating")
-    async def set_library_item_rating(
-        self,
-        item: str | MediaItemType | ItemMapping,
-        rating: int | None,
-    ) -> None:
-        """
-        Set the user rating (1-5 stars, or None to clear) on a library item.
-
-        Pushes the rating to any provider that supports rating edit (e.g. Subsonic).
-        The provider sync is awaited so errors surface to the caller and the local
-        database is only updated once all provider sync calls have succeeded.
-        """
-        if rating is not None and not 1 <= rating <= 5:
-            raise InvalidDataError(f"rating must be between 1 and 5 or None (got {rating})")
-        if isinstance(item, str):
-            item = await self.get_item_by_uri(item)
-        # make sure we have a full library item; a rating must always be in the library
-        full_item = await self.get_item(
-            item.media_type,
-            item.item_id,
-            item.provider,
-        )
-        if full_item.provider != "library":
-            full_item = await self.add_item_to_library(full_item)
-        # push to provider(s) FIRST and await — any failure should surface to the caller
-        # and leave the local DB unchanged so the UI can revert.
-        for prov_mapping in full_item.provider_mappings:
-            provider = self.mass.get_provider(prov_mapping.provider_instance)
-            if not provider or not provider.library_rating_edit_supported(full_item.media_type):
-                continue
-            await provider.set_rating(prov_mapping.item_id, full_item.media_type, rating)
-        # only once provider sync succeeded, persist to the local library
-        ctrl = self.get_controller(full_item.media_type)
-        await ctrl.set_rating(full_item.item_id, rating)
 
     @api_command("music/library/remove_item")
     async def remove_item_from_library(
@@ -2738,15 +2712,6 @@ class MusicController(CoreController):
                 if "duplicate column" not in str(err):
                     raise
 
-        if prev_version <= 40:
-            # add user rating column (1-5, NULL = unrated) to tracks/albums/artists
-            for table in (DB_TABLE_TRACKS, DB_TABLE_ALBUMS, DB_TABLE_ARTISTS):
-                try:
-                    await self._database.execute(f"ALTER TABLE {table} ADD COLUMN [rating] INTEGER")
-                except Exception as err:
-                    if "duplicate column" not in str(err):
-                        raise
-
         if prev_version <= 41:
             # Recovery: an earlier rating-branch build bumped the schema version
             # past 39 without running the is_manual migration, leaving DBs at
@@ -2823,7 +2788,6 @@ class MusicController(CoreController):
                     [album_type] TEXT NOT NULL,
                     [year] INTEGER,
                     [favorite] BOOLEAN NOT NULL DEFAULT 0,
-                    [rating] INTEGER,
                     [listen_later] BOOLEAN NOT NULL DEFAULT 0,
                     [listen_later_added_at] INTEGER,
                     [metadata] json NOT NULL,
@@ -2843,7 +2807,6 @@ class MusicController(CoreController):
             [name] TEXT NOT NULL,
             [sort_name] TEXT NOT NULL,
             [favorite] BOOLEAN NOT NULL DEFAULT 0,
-            [rating] INTEGER,
             [metadata] json NOT NULL,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,
@@ -2863,7 +2826,6 @@ class MusicController(CoreController):
             [version] TEXT,
             [duration] INTEGER,
             [favorite] BOOLEAN NOT NULL DEFAULT 0,
-            [rating] INTEGER,
             [metadata] json NOT NULL,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,

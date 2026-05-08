@@ -390,31 +390,6 @@ class MusicProvider(Provider):
         ):
             raise NotImplementedError
 
-    async def set_rating(
-        self, prov_item_id: str, media_type: MediaType, rating: int | None
-    ) -> None:
-        """
-        Set the user rating (1-5 stars, or None to clear) for an item in the provider's library.
-
-        Only called if provider supports ProviderFeature.RATING_*_EDIT.
-        Must raise on failure so the caller can surface the error to the user.
-        """
-        if (
-            media_type == MediaType.ARTIST
-            and ProviderFeature.RATING_ARTISTS_EDIT in self.supported_features
-        ):
-            raise NotImplementedError
-        if (
-            media_type == MediaType.ALBUM
-            and ProviderFeature.RATING_ALBUMS_EDIT in self.supported_features
-        ):
-            raise NotImplementedError
-        if (
-            media_type == MediaType.TRACK
-            and ProviderFeature.RATING_TRACKS_EDIT in self.supported_features
-        ):
-            raise NotImplementedError
-
     async def add_playlist_tracks(self, prov_playlist_id: str, prov_track_ids: list[str]) -> None:
         """Add track(s) to playlist.
 
@@ -893,10 +868,6 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.artists.set_favorite(library_item.item_id, True)
-                if prov_item.rating is not None and library_item.rating != prov_item.rating:
-                    await self.mass.music.artists.set_rating(
-                        library_item.item_id, prov_item.rating
-                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres
@@ -977,10 +948,6 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.albums.set_favorite(library_item.item_id, True)
-                if prov_item.rating is not None and library_item.rating != prov_item.rating:
-                    await self.mass.music.albums.set_rating(
-                        library_item.item_id, prov_item.rating
-                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres
@@ -1261,10 +1228,6 @@ class MusicProvider(Provider):
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.tracks.set_favorite(library_item.item_id, True)
-                if prov_item.rating is not None and library_item.rating != prov_item.rating:
-                    await self.mass.music.tracks.set_rating(
-                        library_item.item_id, prov_item.rating
-                    )
                 fallback_genres = (
                     set(prov_item.metadata.genres)
                     if prov_item.metadata and prov_item.metadata.genres
@@ -1463,16 +1426,6 @@ class MusicProvider(Provider):
             return ProviderFeature.FAVORITE_AUDIOBOOKS_EDIT in self.supported_features
         if media_type == MediaType.PODCAST:
             return ProviderFeature.FAVORITE_PODCASTS_EDIT in self.supported_features
-        return False
-
-    def library_rating_edit_supported(self, media_type: MediaType) -> bool:
-        """Return if rating edit is supported for given MediaType on this provider."""
-        if media_type == MediaType.ARTIST:
-            return ProviderFeature.RATING_ARTISTS_EDIT in self.supported_features
-        if media_type == MediaType.ALBUM:
-            return ProviderFeature.RATING_ALBUMS_EDIT in self.supported_features
-        if media_type == MediaType.TRACK:
-            return ProviderFeature.RATING_TRACKS_EDIT in self.supported_features
         return False
 
     async def iter_playlist_tracks(

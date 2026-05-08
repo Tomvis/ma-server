@@ -305,7 +305,6 @@ class AlbumsController(MediaControllerBase[Album]):
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
         album_types: list[AlbumType] | None = None,
-        ratings: list[int | None] | None = None,
         listen_later: bool | None = None,
         dr_buckets: list[str] | None = None,
         amg_ratings: list[int] | None = None,
@@ -328,7 +327,6 @@ class AlbumsController(MediaControllerBase[Album]):
         :param provider: Filter by provider instance ID (single string or list).
         :param album_types: Filter by album types.
         :param genre: Filter by genre id(s).
-        :param ratings: Filter by user rating (list of 1-5 and/or None for unrated).
         :param dr_buckets: Filter by DR quality bucket (excellent/good/fair/poor/untagged).
         :param amg_ratings / tps_ratings: Filter by review-source rating buckets.
         :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
@@ -397,8 +395,10 @@ class AlbumsController(MediaControllerBase[Album]):
             extra_query_parts=extra_query_parts,
             extra_query_params=extra_query_params,
             extra_join_parts=extra_join_parts,
-            in_library_only=True,
-            ratings=ratings,
+            # listen-later items intentionally don't flip in_library, so they'd
+            # be filtered out by the standard library JOIN. Relax the filter
+            # when this query is scoped to the listen-later list.
+            in_library_only=listen_later is not True,
         )
 
         # Calculate how many more items we need to reach the original limit
@@ -426,8 +426,7 @@ class AlbumsController(MediaControllerBase[Album]):
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
-                in_library_only=True,
-                ratings=ratings,
+                in_library_only=listen_later is not True,
             ):
                 # prevent duplicates (when artist is also in the title)
                 if album.uri not in existing_uris:
@@ -666,7 +665,6 @@ class AlbumsController(MediaControllerBase[Album]):
                 "sort_name": item.sort_name,
                 "version": item.version,
                 "favorite": item.favorite,
-                "rating": item.rating,
                 "album_type": item.album_type,
                 "year": item.year,
                 "metadata": serialize_to_json(item.metadata),
@@ -710,8 +708,6 @@ class AlbumsController(MediaControllerBase[Album]):
         cur_item.external_ids.update(update.external_ids)
         name = update.name if overwrite else cur_item.name
         sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
-        # prefer incoming rating if provided, otherwise keep current rating.
-        rating = update.rating if update.rating is not None else cur_item.rating
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
@@ -721,7 +717,6 @@ class AlbumsController(MediaControllerBase[Album]):
                 "version": update.version if overwrite else cur_item.version or update.version,
                 "year": update.year if overwrite else cur_item.year or update.year,
                 "album_type": album_type.value,
-                "rating": rating,
                 "metadata": serialize_to_json(metadata),
                 "external_ids": serialize_to_json(
                     update.external_ids if overwrite else cur_item.external_ids

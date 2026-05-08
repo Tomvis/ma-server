@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast, final
 from music_assistant_models.enums import EventType, ExternalID, MediaType, ProviderFeature
 from music_assistant_models.errors import (
     InsufficientPermissions,
-    InvalidDataError,
     MediaNotFoundError,
     ProviderUnavailableError,
 )
@@ -81,8 +80,6 @@ SORT_KEYS = {
     "play_count_desc": "play_count DESC",
     "year": "year ASC",
     "year_desc": "year DESC",
-    "rating": "rating ASC",
-    "rating_desc": "rating DESC",
     # listen_later sorts — only valid for the albums table (only table with the
     # column today). Use COALESCE so unsaved rows sort last on DESC.
     "listen_later_added_at": "listen_later_added_at ASC",
@@ -600,20 +597,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         library_item = await self.get_library_item(db_id)
         self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
 
-    @final
-    async def set_rating(self, item_id: str | int, rating: int | None) -> None:
-        """Set the user rating (1-5, or None to clear) on a database item."""
-        if rating is not None and not 1 <= rating <= 5:
-            raise InvalidDataError(f"rating must be between 1 and 5 or None (got {rating})")
-        db_id = int(item_id)  # ensure integer
-        library_item = await self.get_library_item(db_id)
-        if library_item.rating == rating:
-            return
-        match = {"item_id": db_id}
-        await self.mass.music.database.update(self.db_table, match, {"rating": rating})
-        library_item = await self.get_library_item(db_id)
-        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
-
     @guard_single_request  # type: ignore[type-var]  # TODO: fix typing for MediaControllerBase
     @final
     async def get_provider_item(
@@ -958,7 +941,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         extra_join_parts: list[str] | None = None,
         genre_ids: int | list[int] | None = None,
         in_library_only: bool = False,
-        ratings: list[int | None] | None = None,
     ) -> list[ItemCls]:
         """Fetch MediaItem records from database by building the query."""
         query_params = dict(extra_query_params) if extra_query_params else {}
@@ -978,7 +960,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 provider_filter=provider_filter,
                 limit=limit,
                 in_library_only=in_library_only,
-                ratings=ratings,
             )
         else:
             # apply filters
@@ -991,7 +972,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 genre_ids=genre_ids,
                 provider_filter=provider_filter,
                 in_library_only=in_library_only,
-                ratings=ratings,
             )
         # build and execute final query
         sql_query = self._build_final_query(query_parts, join_parts, order_by)
@@ -1045,7 +1025,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         provider_filter: list[str] | None,
         limit: int,
         in_library_only: bool = False,
-        ratings: list[int | None] | None = None,
     ) -> None:
         """Build a fast random subquery with all filters applied."""
         sub_query_parts = query_parts.copy()
@@ -1061,7 +1040,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             genre_ids=genre_ids,
             provider_filter=provider_filter,
             in_library_only=in_library_only,
-            ratings=ratings,
         )
 
         # Build the subquery
@@ -1092,7 +1070,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         genre_ids: list[int] | None,
         provider_filter: list[str] | None,
         in_library_only: bool = False,
-        ratings: list[int | None] | None = None,
     ) -> None:
         """Apply search, favorite, and provider filters."""
         # handle search
@@ -1102,18 +1079,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         if favorite is not None:
             query_parts.append(f"{self.db_table}.favorite = :favorite")
             query_params["favorite"] = favorite
-        # handle rating filter (multi-select, None in list means "unrated")
-        if ratings:
-            int_values = sorted({int(r) for r in ratings if r is not None})
-            include_null = None in ratings
-            rating_clauses: list[str] = []
-            if int_values:
-                query_params["rating_values"] = int_values
-                rating_clauses.append(f"{self.db_table}.rating IN :rating_values")
-            if include_null:
-                rating_clauses.append(f"{self.db_table}.rating IS NULL")
-            if rating_clauses:
-                query_parts.append("(" + " OR ".join(rating_clauses) + ")")
         # handle genre filter
         if genre_ids:
             query_params["genre_ids"] = genre_ids

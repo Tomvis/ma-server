@@ -286,6 +286,8 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 aiosendspin = { path = "../../aiosendspin", editable = true }
+music-assistant-frontend = { path = "../frontend", editable = true }
+music-assistant-models = { path = "../models", editable = true }
 
 [build-system]
 requires = ["setuptools>=61"]
