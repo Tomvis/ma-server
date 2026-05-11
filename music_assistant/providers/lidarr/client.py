@@ -1,51 +1,58 @@
-"""Thin async client for the Lidarr v1 REST API.
+"""Thin async client for the music-rater album API.
 
-Auth is X-Api-Key header. Endpoints used:
-- GET /api/v1/rootfolder
-- GET /api/v1/qualityprofile
-- GET /api/v1/metadataprofile
-- GET /api/v1/system/status     (cheap connectivity probe)
-- GET /api/v1/artist            (list existing artists)
-- GET /api/v1/artist/lookup     (search MB or by name)
-- POST /api/v1/artist           (add artist, optionally with addOptions)
-- GET /api/v1/album?artistId=N  (list albums for an artist)
-- PUT /api/v1/album/monitor     (set monitored flag for a list of album ids)
-- POST /api/v1/command          (queue a command — RefreshArtist, AlbumSearch, …)
-- GET /api/v1/command/{id}      (poll command status)
+We talk to music-rater (operator-run companion service), not Lidarr directly.
+music-rater stamps the Music Assistant URI on every album it has synced to MA,
+so resolving an album_id is normally an exact-match lookup. Falling back to a
+text search covers the case where the user invokes the action on something
+they added to MA by hand before music-rater could pick it up.
+
+Endpoints used:
+- GET /api/v1/albums?music_assistant_uri=<uri>   exact resolve
+- GET /api/v1/albums?search=<artist+album>       best-effort fallback
+- POST /api/v1/albums/{album_id}/lidarr/queue    set lidarr_manual_add + sync
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.errors import LoginFailed, ProviderUnavailableError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    MediaNotFoundError,
+    ProviderUnavailableError,
+)
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
 
-class LidarrError(Exception):
-    """Raised for unexpected Lidarr API responses."""
+class MusicRaterError(Exception):
+    """Raised for unexpected music-rater API responses."""
 
 
-class LidarrClient:
-    """Minimal async wrapper for the bits of Lidarr we need."""
+class MusicRaterClient:
+    """Minimal async wrapper for the music-rater album endpoints we need."""
 
     def __init__(
         self,
         url: str,
-        api_key: str,
         session: ClientSession,
         *,
         verify_ssl: bool = True,
     ) -> None:
-        """Build a client bound to one Lidarr instance."""
+        """Build a client bound to one music-rater instance."""
         self._base = url.rstrip("/")
-        self._headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+        self._headers = {"Accept": "application/json"}
         self._session = session
         self._verify_ssl = verify_ssl
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> tuple[int, Any]:
+        """Issue a request and return (status, parsed-body-or-text)."""
         url = f"{self._base}/api/v1/{path.lstrip('/')}"
         async with self._session.request(
             method,
@@ -54,101 +61,76 @@ class LidarrClient:
             ssl=self._verify_ssl,
             **kwargs,
         ) as resp:
-            if resp.status == 401:
-                raise LoginFailed("Lidarr rejected the API key")
-            if resp.status >= 500:
-                raise ProviderUnavailableError(f"Lidarr returned {resp.status} for {method} {path}")
-            if resp.status >= 400:
-                body = await resp.text()
-                raise LidarrError(f"{method} {path} -> {resp.status}: {body[:200]}")
-            if resp.status == 204 or resp.content_length == 0:
-                return None
-            return await resp.json()
+            status = resp.status
+            if status == 204 or resp.content_length == 0:
+                return status, None
+            ctype = resp.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                return status, await resp.json()
+            return status, await resp.text()
 
-    async def system_status(self) -> dict[str, Any]:
-        """Return system status — used as a connectivity / auth probe."""
-        return cast("dict[str, Any]", await self._request("GET", "system/status"))
+    async def ping(self) -> None:
+        """Cheap connectivity probe: list one album and check the response shape."""
+        status, body = await self._request("GET", "albums", params={"limit": "1"})
+        if status >= 500:
+            raise ProviderUnavailableError(f"music-rater returned {status} on connectivity probe")
+        if status >= 400 or not isinstance(body, dict) or "items" not in body:
+            snippet = body if isinstance(body, str) else str(body)[:200]
+            raise MusicRaterError(
+                f"Unexpected response from music-rater /albums?limit=1 "
+                f"(status={status}): {snippet[:200]}"
+            )
 
-    async def list_root_folders(self) -> list[dict[str, Any]]:
-        """List configured Lidarr root folders."""
-        return cast("list[dict[str, Any]]", await self._request("GET", "rootfolder"))
-
-    async def list_quality_profiles(self) -> list[dict[str, Any]]:
-        """List configured Lidarr quality profiles."""
-        return cast("list[dict[str, Any]]", await self._request("GET", "qualityprofile"))
-
-    async def list_metadata_profiles(self) -> list[dict[str, Any]]:
-        """List configured Lidarr metadata profiles."""
-        return cast("list[dict[str, Any]]", await self._request("GET", "metadataprofile"))
-
-    async def list_artists(self) -> list[dict[str, Any]]:
-        """List artists currently in the Lidarr library."""
-        return cast("list[dict[str, Any]]", await self._request("GET", "artist"))
-
-    async def lookup_artist(self, term: str) -> list[dict[str, Any]]:
-        """Lookup artists by name or `lidarr:<MBID>` shorthand. Returns raw remote results."""
-        return cast(
-            "list[dict[str, Any]]",
-            await self._request("GET", "artist/lookup", params={"term": term}),
+    async def resolve_by_uri(self, music_assistant_uri: str) -> int | None:
+        """Look up an album_id by its MA URI. Returns None if no match."""
+        return await self._first_album_id(
+            params={"music_assistant_uri": music_assistant_uri, "limit": "1"}
         )
 
-    async def add_artist(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST /artist — body is a Lidarr ArtistResource with addOptions."""
-        return cast("dict[str, Any]", await self._request("POST", "artist", json=body))
+    async def resolve_by_search(self, query: str) -> int | None:
+        """Free-text album search (artist + album). Returns the top hit's id."""
+        return await self._first_album_id(params={"search": query, "limit": "1"})
 
-    async def update_artist(self, body: dict[str, Any]) -> dict[str, Any]:
-        """PUT /artist/{id} — re-save an existing ArtistResource."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("PUT", f"artist/{int(body['id'])}", json=body),
-        )
+    async def _first_album_id(self, *, params: dict[str, str]) -> int | None:
+        status, body = await self._request("GET", "albums", params=params)
+        if status >= 500:
+            raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
+        if status >= 400 or not isinstance(body, dict):
+            snippet = body if isinstance(body, str) else str(body)[:200]
+            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
+        items = body.get("items") or []
+        if not items:
+            return None
+        first = items[0]
+        if not isinstance(first, dict) or "id" not in first:
+            raise MusicRaterError(f"music-rater returned malformed album item: {first!r}")
+        return int(first["id"])
 
-    async def get_artist(self, artist_id: int) -> dict[str, Any]:
-        """GET /artist/{id} — fetch a fresh artist record by Lidarr id."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("GET", f"artist/{int(artist_id)}"),
-        )
+    async def queue_lidarr(self, album_id: int) -> dict[str, Any]:
+        """POST /albums/{id}/lidarr/queue — flips lidarr_manual_add + inline sync.
 
-    async def list_albums(self, artist_id: int) -> list[dict[str, Any]]:
-        """List albums for an artist already known to Lidarr."""
-        return cast(
-            "list[dict[str, Any]]",
-            await self._request("GET", "album", params={"artistId": str(artist_id)}),
-        )
-
-    async def set_albums_monitored(self, album_ids: list[int], monitored: bool = True) -> None:
-        """Bulk-toggle the monitored flag via /album/monitor."""
-        await self._request(
-            "PUT",
-            "album/monitor",
-            json={"albumIds": album_ids, "monitored": monitored},
-        )
-
-    async def update_album(self, body: dict[str, Any]) -> dict[str, Any]:
-        """PUT /album/{id} — re-save a full AlbumResource."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("PUT", f"album/{int(body['id'])}", json=body),
-        )
-
-    async def get_album(self, album_id: int) -> dict[str, Any]:
-        """GET /album/{id} — fresh fetch of a single album."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("GET", f"album/{int(album_id)}"),
-        )
-
-    async def queue_command(self, name: str, **fields: Any) -> dict[str, Any]:
-        """POST /command — queue a Lidarr command (RefreshArtist, AlbumSearch, …)."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("POST", "command", json={"name": name, **fields}),
-        )
-
-    async def get_command(self, command_id: int) -> dict[str, Any]:
-        """GET /command/{id} — used to poll a queued command's status."""
-        return cast(
-            "dict[str, Any]",
-            await self._request("GET", f"command/{command_id}"),
+        Maps documented status codes to MA error types so the global error
+        toast carries a useful message.
+        """
+        status, body = await self._request("POST", f"albums/{int(album_id)}/lidarr/queue")
+        if status == 200 and isinstance(body, dict):
+            return body
+        # Per music-rater's documented error surface.
+        snippet = body if isinstance(body, str) else str(body)[:200]
+        if status == 404:
+            raise MediaNotFoundError(f"music-rater no longer has album_id={album_id} (deleted?)")
+        if status == 409:
+            raise InvalidDataError(
+                "music-rater has lidarr_manual_skip=True on this album — operator "
+                "permanently excluded it from Lidarr"
+            )
+        if status == 502:
+            raise ProviderUnavailableError("Lidarr is unreachable from music-rater (502)")
+        if status == 503:
+            raise ProviderUnavailableError(
+                "music-rater's Lidarr config is incomplete (URL / API key / "
+                "profile / root folder missing)"
+            )
+        raise MusicRaterError(
+            f"POST /albums/{album_id}/lidarr/queue failed (status={status}): {snippet[:200]}"
         )

@@ -3,10 +3,10 @@
   "domain": "lidarr",
   "stage": "experimental",
   "name": "Lidarr",
-  "description": "Send streaming-provider albums to Lidarr to monitor and download them.",
+  "description": "Hand streaming-provider albums to music-rater, which syncs them to Lidarr.",
   "codeowners": ["@stereotom"],
   "credits": ["[Lidarr](https://lidarr.audio/)"],
   "requirements": [],
   "documentation": "https://lidarr.audio/docs/api/",
-  "multi_instance": true
+  "multi_instance": false
 }
