@@ -2847,6 +2847,12 @@ class MusicController(CoreController):
             # Recovery: an earlier rating-branch build bumped the schema version
             # past 39 without running the is_manual migration, leaving DBs at
             # version 40/41 without the column. Re-run the idempotent ADD COLUMN.
+            # Those same builds also stamped a `rating INTEGER` column onto
+            # tracks/albums/artists that the current schema no longer models;
+            # the orphan column is harmless (mashumaro ignores unknown keys,
+            # writes never reference it) and intentionally not dropped here —
+            # SQLite DROP COLUMN is recent and the cost of carrying a NULL
+            # column outweighs the migration risk.
             try:
                 await self._database.execute(
                     f"ALTER TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "

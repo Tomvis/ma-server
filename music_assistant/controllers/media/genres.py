@@ -382,6 +382,44 @@ class GenreController(MediaControllerBase[Genre]):
             extra_query_parts=extra_parts,
         )
 
+    async def library_count(
+        self,
+        favorite: bool | None = None,
+        search: str | None = None,
+        provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
+        favorite_only: bool = False,
+        **kwargs: Any,
+    ) -> int:
+        """Return the count of genres in the library matching the filters.
+
+        Overridden to skip the in_library_only provider_mappings JOIN that the
+        base applies — genres are library-only items and never carry an
+        in_library=1 provider mapping, so the base JOIN would return 0.
+        """
+        if favorite_only and favorite is None:
+            favorite = True
+        query_params: dict[str, Any] = {}
+        query_parts: list[str] = []
+        join_parts: list[str] = []
+        self._apply_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            join_parts=join_parts,
+            favorite=favorite,
+            search=self._preprocess_search(search, query_params),
+            genre_ids=None,
+            provider_filter=None,
+            in_library_only=False,
+        )
+        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
+        if join_parts:
+            sql_query += f" {' '.join(join_parts)}"
+        if query_parts:
+            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
+        sql_query += f" GROUP BY {self.db_table}.item_id"
+        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
+
     async def radio_mode_base_tracks(
         self,
         item: Genre,

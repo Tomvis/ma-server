@@ -755,23 +755,22 @@ class AlbumsController(MediaControllerBase[Album]):
         """Update existing record in the database."""
         db_id = int(item_id)  # ensure integer
         cur_item = await self.get_library_item(db_id)
-        # Capture the stored CR before metadata.update() so the server-side rule
-        # below compares against the pre-update value. update() runs the model's
-        # is_richer_than rule (source-count + amg_dr presence), which can swap the
-        # stored CR for a less-rich-by-our-rule one; without the pre-update copy
-        # we'd lose the ability to recover.
+        # Snapshot the stored CR before metadata.update() so the strict rule below
+        # decides authoritatively: model.update() also has a CR-replacement path
+        # (CriticalReception.is_richer_than), but its rule accepts "more sources"
+        # without rejecting an amg_dr regression — so it can swap stored_cr for a
+        # less-rich-by-our-rule payload. We re-decide afterwards using the strict
+        # check and either keep the incoming CR or restore stored_cr.
         stored_cr = cur_item.metadata.critical_reception if cur_item.metadata else None
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
-        # MediaItemMetadata.update() only fills None-valued fields and does not
-        # deep-merge structured sub-shapes like critical_reception. Apply our own
-        # per-source richness check against the pre-update CR and replace when the
-        # incoming payload strictly extends what was stored.
-        if (
-            not overwrite
-            and update.metadata is not None
-            and _critical_reception_is_richer(update.metadata.critical_reception, stored_cr)
-        ):
-            metadata.critical_reception = update.metadata.critical_reception
+        if not overwrite and update.metadata is not None:
+            incoming_cr = update.metadata.critical_reception
+            if _critical_reception_is_richer(incoming_cr, stored_cr):
+                metadata.critical_reception = incoming_cr
+            else:
+                # Strict rule rejects — undo any (lenient) replacement model.update()
+                # may have done. Safe no-op when CR was untouched.
+                metadata.critical_reception = stored_cr
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:
