@@ -103,8 +103,7 @@ class LidarrProvider(PluginProvider):
         album = cast("Album", media_item)
         if not album.artists:
             raise InvalidDataError(f"Album {album.name!r} has no artist information")
-        primary_artist = album.artists[0]
-        artist_name = getattr(primary_artist, "name", None) if primary_artist else None
+        artist_name = getattr(album.artists[0], "name", None)
         if not artist_name:
             raise InvalidDataError(f"Album {album.name!r} has no usable artist name")
 

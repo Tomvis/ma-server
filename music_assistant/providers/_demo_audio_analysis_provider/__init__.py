@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.models.audio_analysis import AudioAnalysisData
 
 
 async def setup(
@@ -161,7 +162,7 @@ class DemoAudioAnalysisProvider(AudioAnalysisProvider):
             len(pcm_chunk),
         )
 
-    async def _finalize(self, session_id: str) -> None:
+    async def _finalize(self, session_id: str) -> AudioAnalysisData | None:
         """Finalize analysis and return the result.
 
         Called when the track has finished buffering and all chunks have been
@@ -182,6 +183,7 @@ class DemoAudioAnalysisProvider(AudioAnalysisProvider):
         :param session_id: The analysis session ID.
         """
         self.logger.debug("Finalizing analysis session %s", session_id)
+        return None
 
     async def cancel(self, session_id: str) -> None:
         """Cancel an in-progress analysis session.

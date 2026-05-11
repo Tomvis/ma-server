@@ -978,7 +978,7 @@ class MusicController(CoreController):
         # rows have no in_library mapping by design; a hit with in_library=True
         # means the user already has it from a sync/library-add and wouldn't see
         # the listen-later entry anyway.
-        existing_id = await self.albums._get_library_item_by_match(candidate)
+        existing_id = await self.albums.find_existing_library_id(candidate)
         if existing_id is not None:
             existing = await self.albums.get_library_item(existing_id)
             if any(pm.in_library for pm in existing.provider_mappings):

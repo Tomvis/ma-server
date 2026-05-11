@@ -149,7 +149,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         """Add item to library and return the new (or updated) database item."""
         new_item = False
         # check for existing item first
-        if library_id := await self._get_library_item_by_match(item):
+        if library_id := await self.find_existing_library_id(item):
             # update existing item
             await self._update_library_item(library_id, item, overwrite=overwrite_existing)
         else:
@@ -168,7 +168,14 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         return library_item
 
     @final
-    async def _get_library_item_by_match(self, item: ItemCls | ItemMapping) -> int | None:
+    async def find_existing_library_id(self, item: ItemCls | ItemMapping) -> int | None:
+        """Return the library item_id that matches the given item, if any.
+
+        Used by `add_item_to_library` to dedupe and by callers that need a
+        pre-flight check (e.g. listen-later refuses to flip the flag if the
+        candidate is already in the library proper). Matches in this order:
+        provider mappings → external ids → name/sort_name.
+        """
         if item.provider == "library":
             return int(item.item_id)
         # search by provider mappings if item is ItemMapping
