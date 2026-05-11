@@ -957,20 +957,16 @@ class MusicController(CoreController):
         :param album: Album title (external mode).
         :param critical_reception: Optional CR data attached to the album.
         """
-        if item is None and not (artist and album):
-            raise InvalidDataError("Either 'item' or both 'artist' and 'album' must be supplied")
-
         if item is not None:
             if isinstance(item, str):
                 item = await self.get_item_by_uri(item)
             candidate = await self.get_item(item.media_type, item.item_id, item.provider)
-            if candidate.media_type != MediaType.ALBUM:
+            if not isinstance(candidate, Album):
                 raise InvalidDataError("listen_later is only supported for albums")
-            assert isinstance(candidate, Album)
-        else:
-            assert artist
-            assert album
+        elif artist and album:
             candidate = await self._resolve_album_by_artist_title(artist, album)
+        else:
+            raise InvalidDataError("Either 'item' or both 'artist' and 'album' must be supplied")
 
         # Reject if the album already lives in the library proper. Listen-later
         # rows have no in_library mapping by design; a hit with in_library=True

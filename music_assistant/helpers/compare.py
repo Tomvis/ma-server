@@ -345,11 +345,11 @@ def compare_audiobook(
         if base_narrators.isdisjoint(compare_narrators):
             return False
     # compare author(s)
+    compare_authors_safe = {
+        create_safe_string(_audiobook_artist_name(x)) for x in compare_item.authors
+    }
     for author in base_item.authors:
-        author_safe = create_safe_string(_audiobook_artist_name(author))
-        if author_safe in [
-            create_safe_string(_audiobook_artist_name(x)) for x in compare_item.authors
-        ]:
+        if create_safe_string(_audiobook_artist_name(author)) in compare_authors_safe:
             return True
     return False
 

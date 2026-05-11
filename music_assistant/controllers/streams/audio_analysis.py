@@ -57,6 +57,10 @@ class AudioAnalysisController:
         self.logger = self.mass.logger.getChild("audio_analysis")
         self._active_sessions: dict[str, set[str]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
+        # Marker for sessions whose start_analysis is in flight; prevents a
+        # concurrent live + background start from both reserving the same URI
+        # and double-firing chunk callbacks at every provider.
+        self._starting_sessions: set[str] = set()
 
     def setup(self) -> None:
         """Register the nightly background scan task and apply CPU caps."""
@@ -123,22 +127,27 @@ class AudioAnalysisController:
 
         session_key = streamdetails.uri
 
-        # Skip if another queue already has an analysis running for the same item
-        if session_key in self._active_sessions:
+        # Skip if another queue already has an analysis running for the same item,
+        # or one is mid-startup (closes the TOCTOU window across the await below).
+        if session_key in self._active_sessions or session_key in self._starting_sessions:
             self.logger.debug(
                 "Analysis session already active for %s, ignoring start request",
                 session_key,
             )
             return
 
-        provider_ids = await self._start_analysis_on_providers(
-            session_key, streamdetails, audio_buffer.pcm_format, providers
-        )
-        if not provider_ids:
-            self.logger.debug("No providers accepted analysis for %s", session_key)
-            return
+        self._starting_sessions.add(session_key)
+        try:
+            provider_ids = await self._start_analysis_on_providers(
+                session_key, streamdetails, audio_buffer.pcm_format, providers
+            )
+            if not provider_ids:
+                self.logger.debug("No providers accepted analysis for %s", session_key)
+                return
+            self._active_sessions[session_key] = provider_ids
+        finally:
+            self._starting_sessions.discard(session_key)
 
-        self._active_sessions[session_key] = provider_ids
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
         self._workers[session_key] = self.mass.create_task(self._chunk_worker(session_key, queue))
 
@@ -156,6 +165,12 @@ class AudioAnalysisController:
             try:
                 await asyncio.wait_for(queue.put(pcm_data), timeout=CHUNK_PROCESS_TIMEOUT_SECONDS)
             except (TimeoutError, asyncio.QueueFull):
+                self.logger.warning(
+                    "Audio analysis chunk dropped for %s (worker behind by >%ss); "
+                    "analysis result for this track may be incomplete",
+                    session_key,
+                    CHUNK_PROCESS_TIMEOUT_SECONDS,
+                )
                 return
 
         async def _finalize_session() -> None:
@@ -432,7 +447,9 @@ class AudioAnalysisController:
     ) -> None:
         """Run a single track through the streaming pipeline using ffmpeg as the source."""
         session_key = streamdetails.uri
-        if session_key in self._active_sessions:
+        # Also exclude sessions whose live-playback start is mid-await; otherwise the
+        # background scan can shadow a live analysis and double-fire chunk callbacks.
+        if session_key in self._active_sessions or session_key in self._starting_sessions:
             self.logger.debug(
                 "Background streaming: session already active for %s, skipping", session_key
             )
@@ -484,13 +501,17 @@ class AudioAnalysisController:
             content_type=ContentType.from_bit_depth(streamdetails.audio_format.bit_depth),
         )
 
-        accepted = await self._start_analysis_on_providers(
-            session_key, streamdetails, pcm_format, providers
-        )
-        if not accepted:
-            self.logger.debug("No providers accepted background analysis for %s", session_key)
-            return
-        self._active_sessions[session_key] = accepted
+        self._starting_sessions.add(session_key)
+        try:
+            accepted = await self._start_analysis_on_providers(
+                session_key, streamdetails, pcm_format, providers
+            )
+            if not accepted:
+                self.logger.debug("No providers accepted background analysis for %s", session_key)
+                return
+            self._active_sessions[session_key] = accepted
+        finally:
+            self._starting_sessions.discard(session_key)
 
         audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
         async for chunk in audio_source:

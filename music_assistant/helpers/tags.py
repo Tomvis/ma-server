@@ -99,7 +99,7 @@ def _build_review_source_entry(
     types = list(split_items(tags.get(f"{key_prefix}type")))
     labels = list(split_items(tags.get(f"{key_prefix}labels")))
     authors = list(split_items(tags.get(f"{key_prefix}author")))
-    if rating is None and not favorite and not types and not labels and not authors:
+    if rating is None and favorite is None and not types and not labels and not authors:
         return None
     return ReviewSourceEntry(
         source=source_id,
@@ -641,8 +641,8 @@ class AudioTags:
         """
         for key in (
             "dynamicrange",  # DYNAMIC_RANGE (per-track, ffmpeg+numpy DR14)
-            "dralbum",       # legacy foobar alt (track-only files sometimes use this)
-            "dr",            # legacy bare DR
+            "dralbum",  # legacy foobar alt (track-only files sometimes use this)
+            "dr",  # legacy bare DR
         ):
             if (val := _parse_float_tag(self.tags.get(key))) is not None:
                 return val

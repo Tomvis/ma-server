@@ -57,7 +57,7 @@ class LidarrProvider(PluginProvider):
         self._client = MusicRaterClient(
             url=cast("str", config.get_value(CONF_URL)),
             session=mass.http_session,
-            verify_ssl=bool(config.get_value(CONF_VERIFY_SSL) or False),
+            verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
 
     async def loaded_in_mass(self) -> None:

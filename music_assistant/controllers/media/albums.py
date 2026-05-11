@@ -31,31 +31,10 @@ from music_assistant.helpers.compare import (
 )
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.json import serialize_to_json
-from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.music_provider import MusicProvider, _critical_reception_is_richer
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
-
-
-def _critical_reception_is_richer(new: object, existing: object) -> bool:
-    """True if `new` carries strictly more critical_reception data than `existing`.
-
-    Coarse "more fields filled" heuristic: a forward improvement (AMG DR landing,
-    additional sources) wins; a regression (transient probe failure that drops
-    sources) is rejected. The canonical (measured) DR has moved off CriticalReception
-    onto MediaItemMetadata.dynamic_range, so it isn't part of this comparison.
-    """
-    if new is None:
-        return False
-    if existing is None:
-        return True
-    new_amg_dr = getattr(new, "amg_dr", None)
-    cur_amg_dr = getattr(existing, "amg_dr", None)
-    if new_amg_dr is not None and cur_amg_dr is None:
-        return True
-    new_sources = getattr(new, "sources", None) or []
-    cur_sources = getattr(existing, "sources", None) or []
-    return len(new_sources) > len(cur_sources)
 
 
 # DR quality thresholds (mirrors src/helpers/album_tags.ts on the frontend).

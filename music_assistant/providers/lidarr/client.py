@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from aiohttp import ClientTimeout
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
@@ -24,6 +25,11 @@ from music_assistant_models.errors import (
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
+
+
+# Cap each music-rater call. The /lidarr/queue endpoint runs an inline single-album
+# sync against Lidarr, so allow a bit of headroom; everything else is a quick list.
+_REQUEST_TIMEOUT = ClientTimeout(total=30)
 
 
 class MusicRaterError(Exception):
@@ -59,6 +65,7 @@ class MusicRaterClient:
             url,
             headers=self._headers,
             ssl=self._verify_ssl,
+            timeout=_REQUEST_TIMEOUT,
             **kwargs,
         ) as resp:
             status = resp.status
