@@ -469,7 +469,7 @@ class AlbumsController(MediaControllerBase[Album]):
                         break
         return result
 
-    async def library_count(  # type: ignore[override]  # noqa: PLR0913
+    async def library_count(  # noqa: PLR0913
         self,
         favorite: bool | None = None,
         search: str | None = None,

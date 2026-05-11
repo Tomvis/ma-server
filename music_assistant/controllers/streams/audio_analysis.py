@@ -176,12 +176,16 @@ class AudioAnalysisController:
             try:
                 await asyncio.wait_for(queue.put(pcm_data), timeout=CHUNK_PROCESS_TIMEOUT_SECONDS)
             except (TimeoutError, asyncio.QueueFull):
-                self.logger.warning(
-                    "Audio analysis chunk dropped for %s (worker behind by >%ss); "
-                    "analysis result for this track may be incomplete",
-                    session_key,
-                    CHUNK_PROCESS_TIMEOUT_SECONDS,
-                )
+                # If the session was evicted while we were waiting (all providers
+                # cancelled or worker exited), the drop is expected — don't spam
+                # the log. Otherwise it really does indicate a slow analyzer.
+                if session_key in self._active_sessions:
+                    self.logger.warning(
+                        "Audio analysis chunk dropped for %s (worker behind by >%ss); "
+                        "analysis result for this track may be incomplete",
+                        session_key,
+                        CHUNK_PROCESS_TIMEOUT_SECONDS,
+                    )
                 return
 
         async def _finalize_session() -> None:
@@ -387,53 +391,82 @@ class AudioAnalysisController:
         )
 
         concurrency = self._get_scan_concurrency()
-        semaphore = asyncio.Semaphore(concurrency)
         provider_by_domain = {p.domain: p for p in providers}
+        # Bounded queue so we don't materialize one coroutine per candidate up
+        # front. A few-thousand-track scan otherwise holds thousands of pending
+        # tasks (and their closures) the whole time the semaphore is throttling.
+        work_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=concurrency * 4)
 
         processed = 0
         deferred = 0
 
-        async def _run_one(candidate: dict[str, Any]) -> None:
+        async def _worker() -> None:
             nonlocal processed, deferred
-            async with semaphore:
-                if time.monotonic() >= run_deadline:
-                    deferred += 1
-                    return
-
-                item_id = candidate["item_id"]
-                provider_instance = candidate["provider_instance"]
-                missing = candidate["missing_domains"]
-
-                music_prov = self.mass.get_provider(provider_instance, provider_type=MusicProvider)
-                if music_prov is None or not music_prov.available:
-                    self.logger.debug(
-                        "Skipping %s: music provider %s unavailable", item_id, provider_instance
-                    )
-                    return
-
+            while True:
+                candidate = await work_queue.get()
                 try:
-                    streamdetails = await music_prov.get_stream_details(item_id, MediaType.TRACK)
-                except Exception as err:
-                    self.logger.debug("Skipping %s: stream details failed: %s", item_id, err)
-                    return
+                    if time.monotonic() >= run_deadline:
+                        deferred += 1
+                        continue
 
-                if streamdetails.stream_type != StreamType.LOCAL_FILE:
-                    return
-                if not isinstance(streamdetails.path, str) or not streamdetails.path:
-                    return
+                    item_id = candidate["item_id"]
+                    provider_instance = candidate["provider_instance"]
+                    missing = candidate["missing_domains"]
 
-                providers_for_track = [
-                    p
-                    for p in (provider_by_domain.get(d) for d in missing)
-                    if p is not None and p.available
-                ]
-                if not providers_for_track:
-                    return
+                    music_prov = self.mass.get_provider(
+                        provider_instance, provider_type=MusicProvider
+                    )
+                    if music_prov is None or not music_prov.available:
+                        self.logger.debug(
+                            "Skipping %s: music provider %s unavailable",
+                            item_id,
+                            provider_instance,
+                        )
+                        continue
 
-                await self._run_background_streaming_for_track(streamdetails, providers_for_track)
-                processed += 1
+                    try:
+                        streamdetails = await music_prov.get_stream_details(
+                            item_id, MediaType.TRACK
+                        )
+                    except Exception as err:
+                        self.logger.debug(
+                            "Skipping %s: stream details failed: %s", item_id, err
+                        )
+                        continue
 
-        await asyncio.gather(*(_run_one(c) for c in candidates))
+                    if streamdetails.stream_type != StreamType.LOCAL_FILE:
+                        continue
+                    if not isinstance(streamdetails.path, str) or not streamdetails.path:
+                        continue
+
+                    providers_for_track = [
+                        p
+                        for p in (provider_by_domain.get(d) for d in missing)
+                        if p is not None and p.available
+                    ]
+                    if not providers_for_track:
+                        continue
+
+                    await self._run_background_streaming_for_track(
+                        streamdetails, providers_for_track
+                    )
+                    processed += 1
+                finally:
+                    work_queue.task_done()
+
+        workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
+        try:
+            for idx, candidate in enumerate(candidates):
+                if time.monotonic() >= run_deadline:
+                    # Remaining candidates are deferred — count them and stop feeding.
+                    deferred += len(candidates) - idx
+                    break
+                await work_queue.put(candidate)
+            await work_queue.join()
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
         elapsed = time.monotonic() - scan_started
         if deferred:
@@ -529,16 +562,27 @@ class AudioAnalysisController:
         # otherwise cleanup defers to the async-generator GC hook and can leak
         # subprocesses under sustained timeout pressure.
         audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
+        completed = False
         try:
             async for chunk in audio_source:
                 if session_key not in self._active_sessions:
                     # all providers evicted — bail early
                     break
                 await self._distribute_chunk(session_key, chunk)
+            else:
+                # async-for `else` runs only on natural exhaustion of the source,
+                # so it gates "the track was fully streamed" cleanly. Any break /
+                # exception path leaves `completed` False and we cancel below.
+                completed = True
         finally:
             await audio_source.aclose()
-        if session_key in self._active_sessions:
+        if session_key not in self._active_sessions:
+            return
+        if completed:
             self._finalize_providers(session_key)
+        else:
+            # Partial / aborted stream — don't persist a bogus measurement.
+            self._cancel_providers(session_key)
 
     async def _find_candidates_missing_analysis(
         self,
@@ -647,9 +691,13 @@ class AudioAnalysisController:
 
     async def _distribute_chunk(self, session_key: str, pcm_data: bytes) -> None:
         """Fan a single PCM chunk to every provider in the session."""
-        provider_ids = self._active_sessions.get(session_key)
-        if not provider_ids:
+        # Snapshot the set so we can fan out and then reconcile in one targeted
+        # write; mutating the live _active_sessions entry in place is fragile
+        # when other tasks may have captured the same reference.
+        snapshot = self._active_sessions.get(session_key)
+        if not snapshot:
             return
+        provider_ids = set(snapshot)
 
         async def _process(prov_id: str) -> str | None:
             try:
@@ -676,13 +724,19 @@ class AudioAnalysisController:
 
         results = await asyncio.gather(*[_process(prov_id) for prov_id in provider_ids])
         evicted = {prov_id for prov_id in results if prov_id is not None}
-        if evicted:
-            for prov_id in evicted:
-                provider = self.mass.get_provider(prov_id)
-                if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
-                    self.mass.create_task(provider.cancel(session_key))
-            provider_ids -= evicted
-            if not provider_ids:
+        if not evicted:
+            return
+        for prov_id in evicted:
+            provider = self.mass.get_provider(prov_id)
+            if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+                self.mass.create_task(provider.cancel(session_key))
+        # Apply eviction against whatever the live entry holds *now*: another
+        # concurrent task may have already added/removed providers since we
+        # snapshotted, and we don't want to clobber that state.
+        live = self._active_sessions.get(session_key)
+        if live is not None:
+            live.difference_update(evicted)
+            if not live:
                 self._active_sessions.pop(session_key, None)
 
     async def _chunk_worker(self, session_key: str, queue: asyncio.Queue[bytes | None]) -> None:

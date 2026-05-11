@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABCMeta, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar, cast, final
 
 from music_assistant_models.enums import EventType, ExternalID, MediaType, ProviderFeature
@@ -97,7 +98,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     db_table: str
     # Extra sort keys scoped to this controller (extend in subclasses with table-
     # specific clauses such as JSON extracts from a column that only this table has).
-    extra_sort_keys: dict[str, str] = {}
+    # Read-only at the base level: subclasses override with a regular dict literal,
+    # so the empty default can never be mutated through self.extra_sort_keys[...].
+    extra_sort_keys: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize class."""
@@ -270,22 +273,49 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     async def library_count(
         self,
         favorite: bool | None = None,
+        search: str | None = None,
+        provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
         favorite_only: bool = False,
         **kwargs: Any,
     ) -> int:
-        """Return the total number of items in the library.
+        """Return the total number of items in the library matching the filters.
 
-        :param favorite: Filter by favorite status (preferred).
-        :param favorite_only: Legacy alias for ``favorite=True``; kept for client
-            compatibility. Subclasses may accept additional media-type-specific
-            filters via ``**kwargs`` to mirror their ``library_items`` signature.
+        Mirrors :meth:`library_items` so count and list track each other 1-1 on
+        any filtered view. Unknown kwargs are ignored so subclasses can add their
+        own filter args without breaking compatibility.
+
+        :param favorite: Filter by favorite status (True / False / None).
+        :param search: Free-text search query.
+        :param provider: Filter by provider instance ID (single string or list).
+        :param genre: Filter by genre id(s).
+        :param favorite_only: Legacy alias for ``favorite=True``; kept for older
+            clients.
         """
         if favorite_only and favorite is None:
             favorite = True
-        if favorite:
-            sql_query = f"SELECT item_id FROM {self.db_table} WHERE favorite = 1"
-            return await self.mass.music.database.get_count_from_query(sql_query)
-        return await self.mass.music.database.get_count(self.db_table)
+        query_params: dict[str, Any] = {}
+        query_parts: list[str] = []
+        join_parts: list[str] = []
+        self._apply_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            join_parts=join_parts,
+            favorite=favorite,
+            search=self._preprocess_search(search, query_params),
+            genre_ids=self._preprocess_genre_ids(genre),
+            provider_filter=self._ensure_provider_filter(provider),
+            in_library_only=True,
+        )
+        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
+        if join_parts:
+            sql_query += f" {' '.join(join_parts)}"
+        if query_parts:
+            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
+        # A provider_mappings JOIN can fan a row out per-mapping — dedupe so the
+        # count stays media-item-level.
+        sql_query += f" GROUP BY {self.db_table}.item_id"
+        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
 
     async def library_items(
         self,

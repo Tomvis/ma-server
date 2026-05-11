@@ -960,9 +960,15 @@ class MusicController(CoreController):
         if item is not None:
             if isinstance(item, str):
                 item = await self.get_item_by_uri(item)
-            candidate = await self.get_item(item.media_type, item.item_id, item.provider)
-            if not isinstance(candidate, Album):
-                raise InvalidDataError("listen_later is only supported for albums")
+            # If the caller already handed us a hydrated Album (in-app UX has it from
+            # the current view), avoid the provider round-trip; only re-fetch when we
+            # got an ItemMapping or have to look the album up from scratch.
+            if isinstance(item, Album):
+                candidate = item
+            else:
+                candidate = await self.get_item(item.media_type, item.item_id, item.provider)
+                if not isinstance(candidate, Album):
+                    raise InvalidDataError("listen_later is only supported for albums")
         elif artist and album:
             candidate = await self._resolve_album_by_artist_title(artist, album)
         else:

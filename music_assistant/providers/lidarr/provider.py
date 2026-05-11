@@ -183,6 +183,14 @@ class LidarrProvider(PluginProvider):
         # lidarr_synced=True with albums_monitored == 0 → idempotent re-call,
         # i.e. the album was already monitored before this request.
         already_monitored = lidarr_synced and albums_monitored == 0
+        # No counters and no sync flag means music-rater accepted the POST but
+        # neither monitored nor reported activity — treat that as an unexpected
+        # backend response rather than a silent success.
+        if not (albums_monitored > 0 or already_monitored or artists_added > 0):
+            raise ProviderUnavailableError(
+                f"music-rater returned no-op for {artist_name!r} - {album_name!r} "
+                "(no errors, no monitors, no sync). Check music-rater logs."
+            )
         return {
             "artist_name": artist_name,
             "album_name": album_name,

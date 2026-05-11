@@ -380,7 +380,9 @@ class OpenSonicProvider(MusicProvider):
             album.metadata.dynamic_range = album_dr
 
     async def _get_album_critical_reception(
-        self, prov_album_id: str
+        self,
+        prov_album_id: str,
+        sonic_album: SonicAlbum | None = None,
     ) -> tuple[CriticalReception | None, float | None] | None:
         """Fetch one track of an album, ffprobe it, return (CR, album_dr) or None.
 
@@ -388,6 +390,9 @@ class OpenSonicProvider(MusicProvider):
         doesn't re-ffprobe every album on each run. Both positive and negative outcomes
         (album with no songs, failed probe, no tags) are cached to avoid redoing the
         ``conn.get_album`` round-trip.
+
+        :param sonic_album: Pre-fetched album record; lets callers that already paid
+            for ``conn.get_album`` skip the round-trip on cache miss.
         """
         cached = await self.mass.cache.get(
             key=prov_album_id,
@@ -398,13 +403,13 @@ class OpenSonicProvider(MusicProvider):
         if cached is not None:
             return _deserialize_cr_cache_entry(cached)
         extracted: tuple[CriticalReception | None, float | None] | None = None
-        try:
-            sonic_album = await self.conn.get_album(prov_album_id)
-        except (ParameterError, DataNotFoundError):
-            pass
-        else:
-            if sonic_album.song:
-                extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
+        if sonic_album is None:
+            try:
+                sonic_album = await self.conn.get_album(prov_album_id)
+            except (ParameterError, DataNotFoundError):
+                sonic_album = None
+        if sonic_album is not None and sonic_album.song:
+            extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
         await self.mass.cache.set(
             key=prov_album_id,
             data=_serialize_cr_cache_entry(extracted),
@@ -524,22 +529,24 @@ class OpenSonicProvider(MusicProvider):
             raise MediaNotFoundError(msg) from e
 
         album = parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
-        # We already have the song list — extract straight from the first track
-        # rather than re-fetching the album in _get_album_critical_reception.
-        if sonic_album.song:
-            try:
-                extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
-            except Exception as err:
-                self.logger.debug(
-                    "critical_reception extraction failed for album %s: %s", prov_album_id, err
-                )
-            else:
-                if extracted is not None:
-                    cr, album_dr = extracted
-                    if cr is not None:
-                        album.metadata.critical_reception = cr
-                    if album_dr is not None:
-                        album.metadata.dynamic_range = album_dr
+        # Route through the shared CR cache so library sync and direct get_album
+        # don't both pay for ffprobe; the pre-fetched sonic_album skips a redundant
+        # conn.get_album on cache miss.
+        try:
+            extracted = await self._get_album_critical_reception(
+                prov_album_id, sonic_album=sonic_album
+            )
+        except Exception as err:
+            self.logger.debug(
+                "critical_reception extraction failed for album %s: %s", prov_album_id, err
+            )
+        else:
+            if extracted is not None:
+                cr, album_dr = extracted
+                if cr is not None:
+                    album.metadata.critical_reception = cr
+                if album_dr is not None:
+                    album.metadata.dynamic_range = album_dr
         return album
 
     @use_cache(3600 * 3)  # cache for 3 hours

@@ -80,15 +80,66 @@ def _total_source_field_count(sources: Any) -> int:
     return sum(_source_filled_field_count(s) for s in sources)
 
 
-def _critical_reception_is_richer(new: object, existing: object) -> bool:
-    """Return True if `new` carries more critical_reception data than `existing`.
+_REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
+    "rating",
+    "favorite",
+    "types",
+    "labels",
+    "authors",
+)
 
-    "Richer" means strictly more populated fields — an extra source, an AMG DR
-    landing where there was none, or a same-source refresh that filled in
-    fields that were previously blank. The replace step on the caller side is
-    wholesale (`metadata.critical_reception = new`), so we must reject any
-    regression on either dimension — a lost amg_dr or a dropped source — or
-    that field would silently disappear from the stored copy.
+
+def _field_is_populated(value: Any) -> bool:
+    """A ReviewSourceEntry field counts as populated when it's not None / empty."""
+    if value is None:
+        return False
+    if isinstance(value, list | tuple | set):
+        return bool(value)
+    return True
+
+
+def _sources_by_name(sources: Any) -> dict[str, Any]:
+    """Map source identifier -> ReviewSourceEntry for a sources iterable."""
+    return {getattr(s, "source", ""): s for s in (sources or []) if s is not None}
+
+
+def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
+    """True when `new_source` keeps every populated field from `cur_source`.
+
+    A field that's populated on the stored copy must still be populated on the
+    incoming one — losing a rating, an accolade label, etc. would erase data on
+    the caller's wholesale `metadata.critical_reception = new` assignment.
+    """
+    if cur_source is None:
+        return True
+    if new_source is None:
+        return False
+    for field in _REVIEW_SOURCE_FIELDS:
+        if _field_is_populated(getattr(cur_source, field, None)) and not _field_is_populated(
+            getattr(new_source, field, None)
+        ):
+            return False
+    return True
+
+
+def _sources_preserve_data(new_sources: Any, cur_sources: Any) -> bool:
+    """True when every existing source's populated fields survive on the new side."""
+    new_by_name = _sources_by_name(new_sources)
+    for cur in cur_sources or []:
+        name = getattr(cur, "source", "")
+        if not _source_preserves_data(new_by_name.get(name), cur):
+            return False
+    return True
+
+
+def _critical_reception_is_richer(new: object, existing: object) -> bool:
+    """Return True if `new` carries more or fresher critical_reception data than `existing`.
+
+    "Richer" means either strictly more populated fields, or the same shape with at
+    least one field value that actually changed (e.g. a refreshed rating). The replace
+    step on the caller side is wholesale (`metadata.critical_reception = new`), so any
+    regression — a lost amg_dr, a dropped source, or a per-source field that goes from
+    populated to blank — has to be rejected; the stored copy stays in that case.
     """
     if new is None:
         return False
@@ -98,19 +149,45 @@ def _critical_reception_is_richer(new: object, existing: object) -> bool:
     cur_amg_dr = getattr(existing, "amg_dr", None)
     new_sources = getattr(new, "sources", None) or []
     cur_sources = getattr(existing, "sources", None) or []
-    # Either-direction regression: a signal present on `existing` and absent
-    # on `new` would be lost by the wholesale replacement, so keep the stored
-    # copy instead of "upgrading" to a shallower one.
+    # Regression on either dimension would erase data on wholesale replace.
     if cur_amg_dr is not None and new_amg_dr is None:
         return False
     if len(new_sources) < len(cur_sources):
         return False
-    # Compare total richness with amg_dr counted as a single field so an added
-    # amg_dr contributes to the score (and a same-shape CR can't claim to be
-    # richer when nothing actually changed).
+    # Per-source field-level regression check: same source name on both sides,
+    # populated field on `existing` must still be populated on `new`.
+    if not _sources_preserve_data(new_sources, cur_sources):
+        return False
     new_total = (1 if new_amg_dr is not None else 0) + _total_source_field_count(new_sources)
     cur_total = (1 if cur_amg_dr is not None else 0) + _total_source_field_count(cur_sources)
-    return new_total > cur_total
+    if new_total > cur_total:
+        return True
+    if new_total < cur_total:
+        return False
+    # Same field count and no field-level regression: accept when at least one
+    # value actually changed (refreshed rating, swapped label, new amg_dr) so
+    # meaningful updates don't get stuck behind an equal-shape stored copy.
+    if new_amg_dr != cur_amg_dr:
+        return True
+    new_by_name = _sources_by_name(new_sources)
+    return any(
+        _source_signature(new_by_name.get(getattr(s, "source", ""))) != _source_signature(s)
+        for s in cur_sources
+    )
+
+
+def _source_signature(source: Any) -> tuple[Any, ...]:
+    """Comparable snapshot of every value-bearing field on a ReviewSourceEntry."""
+    if source is None:
+        return ()
+    return (
+        getattr(source, "source", None),
+        getattr(source, "rating", None),
+        getattr(source, "favorite", None),
+        tuple(getattr(source, "types", None) or ()),
+        tuple(getattr(source, "labels", None) or ()),
+        tuple(getattr(source, "authors", None) or ()),
+    )
 
 
 class MusicProvider(Provider):

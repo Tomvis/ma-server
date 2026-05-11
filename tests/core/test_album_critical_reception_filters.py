@@ -7,7 +7,10 @@ behave correctly against a real (in-memory) SQLite engine using the JSON1 extens
 import json
 import sqlite3
 
-from music_assistant.controllers.media.albums import _apply_critical_reception_filters
+from music_assistant.controllers.media.albums import (
+    AlbumsController,
+    _apply_critical_reception_filters,
+)
 from music_assistant.controllers.media.base import SORT_KEYS
 
 
@@ -194,13 +197,19 @@ def test_unknown_label_kind_silently_dropped() -> None:
 
 
 def test_sort_keys_are_registered_for_albums() -> None:
-    """The new sort keys must be present in the global SORT_KEYS table."""
-    for key in (
+    """The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
+
+    They reference albums.metadata JSON paths that only exist on this table, so
+    they must not leak into the shared SORT_KEYS table.
+    """
+    album_keys = (
         "dr",
         "dr_desc",
         "amg_rating",
         "amg_rating_desc",
         "tps_rating",
         "tps_rating_desc",
-    ):
-        assert key in SORT_KEYS, f"sort key {key!r} missing"
+    )
+    for key in album_keys:
+        assert key in AlbumsController.extra_sort_keys, f"sort key {key!r} missing"
+        assert key not in SORT_KEYS, f"album-scoped sort key {key!r} leaked into base SORT_KEYS"

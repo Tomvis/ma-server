@@ -565,7 +565,7 @@ def loose_compare_strings(base: str, alt: str) -> bool:
     alt_comp = create_safe_string(alt)
     if base_comp in alt_comp:
         return True
-    return base_comp in alt_comp
+    return alt_comp in base_comp
 
 
 def compare_strings(str1: str, str2: str, strict: bool = True) -> bool:
