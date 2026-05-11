@@ -101,6 +101,11 @@ class LidarrProvider(PluginProvider):
                 f"lidarr/add_album only accepts albums, got {media_item.media_type.value}"
             )
         album = cast("Album", media_item)
+        if not album.name or not album.name.strip():
+            # Falling through to the resolver with a blank name would build a
+            # search query of just the artist and let music-rater hand back
+            # whatever happens to lead that artist's catalog.
+            raise InvalidDataError(f"Album {item!r} has no usable title")
         if not album.artists:
             raise InvalidDataError(f"Album {album.name!r} has no artist information")
         artist_name = getattr(album.artists[0], "name", None)

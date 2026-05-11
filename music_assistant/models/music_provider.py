@@ -890,12 +890,29 @@ class MusicProvider(Provider):
                             for x in library_item.provider_mappings
                             if x.provider_instance != self.instance_id and x.in_library
                         }
-                        if not remaining_providers_in_library and not self.is_streaming_provider:
+                        # User anchors that should survive a provider-side delete:
+                        # favorite, listen-later, and any play history. Without this
+                        # guard, un-starring an album in subsonic/jellyfin (or
+                        # renaming a local file) would cascade through
+                        # remove_item_from_library and wipe the playlog, killing
+                        # play_count/last_played for that user.
+                        has_user_anchor = (
+                            library_item.favorite
+                            or getattr(library_item, "listen_later", False)
+                            or bool(getattr(library_item, "play_count", 0))
+                            or bool(getattr(library_item, "last_played", 0))
+                        )
+                        if (
+                            not remaining_providers_in_library
+                            and not self.is_streaming_provider
+                            and not has_user_anchor
+                        ):
                             # for non-streaming providers (local files, library-middlemen
                             # like subsonic/jellyfin/plex) an item removed from the provider
                             # is actually gone; fully remove it to avoid dangling records
                             # that stay visible in artist/album views where in_library is
-                            # not filtered on
+                            # not filtered on. Only do this when the user has no stake in
+                            # the row (no favorite, no listen-later, no play history).
                             await controller.remove_item_from_library(db_id)
                         else:
                             if not remaining_providers_in_library and library_item.favorite:

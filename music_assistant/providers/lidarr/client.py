@@ -32,8 +32,12 @@ if TYPE_CHECKING:
 _REQUEST_TIMEOUT = ClientTimeout(total=30)
 
 
-class MusicRaterError(Exception):
-    """Raised for unexpected music-rater API responses."""
+class MusicRaterError(InvalidDataError):
+    """Raised for unexpected music-rater API responses.
+
+    Inherits from InvalidDataError so the global error toast on the frontend
+    renders the message (it filters on MusicAssistantError subclasses).
+    """
 
 
 class MusicRaterClient:

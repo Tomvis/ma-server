@@ -894,11 +894,29 @@ class AlbumsController(MediaControllerBase[Album]):
             },
         )
         # update/set provider_mappings table
-        provider_mappings = (
-            update.provider_mappings
-            if overwrite
-            else {*update.provider_mappings, *cur_item.provider_mappings}
-        )
+        if overwrite:
+            provider_mappings: Iterable[ProviderMapping] = update.provider_mappings
+        else:
+            # Merge by (provider_instance, item_id). ProviderMapping equality
+            # is keyed on that pair, so a plain set union keeps the first-
+            # inserted entry on collision — which means an `update` payload
+            # carrying in_library=False would silently downgrade an
+            # in_library=True written to `cur_item` by a concurrent sync
+            # (e.g. listen-later add running while library sync flips the
+            # same album to in_library=True). Promote in_library=True from
+            # either side on collision so the merge can only go True→True
+            # or False→True, never True→False.
+            merged: dict[tuple[str, str], ProviderMapping] = {
+                (pm.provider_instance, pm.item_id): pm for pm in cur_item.provider_mappings
+            }
+            for pm in update.provider_mappings:
+                key = (pm.provider_instance, pm.item_id)
+                existing_pm = merged.get(key)
+                if existing_pm is None:
+                    merged[key] = pm
+                elif pm.in_library:
+                    existing_pm.in_library = True
+            provider_mappings = list(merged.values())
         await self.set_provider_mappings(db_id, provider_mappings, overwrite)
         # set album artist(s)
         artists = update.artists if overwrite else cur_item.artists + update.artists

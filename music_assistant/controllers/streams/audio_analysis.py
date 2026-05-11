@@ -33,6 +33,13 @@ BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 BACKGROUND_PER_TRACK_TIMEOUT_SECONDS = 300
 # Per-run wall-clock cap; in-flight tracks finish, new ones defer to the next run.
 BACKGROUND_SCAN_RUN_BUDGET_SECONDS = 4 * 3600
+# Hard ceiling on candidates fetched per run. Without this the producer
+# materializes one dict per pending (track x analyzer) pair for the entire
+# library — a six-figure-track collection on a fresh install holds the whole
+# list in memory until the run finishes. The cap is several times what the
+# run budget can realistically chew through, so the leftover is just rolled
+# into the next nightly scan via the NOT EXISTS clause.
+BACKGROUND_SCAN_MAX_CANDIDATES_PER_RUN = 20_000
 FILESYSTEM_PROVIDER_DOMAINS: tuple[str, ...] = (
     "filesystem_local",
     "filesystem_smb",
@@ -376,7 +383,9 @@ class AudioAnalysisController:
             return
 
         domains = [p.domain for p in providers]
-        candidates = await self._find_candidates_missing_analysis(domains, limit=0)
+        candidates = await self._find_candidates_missing_analysis(
+            domains, limit=BACKGROUND_SCAN_MAX_CANDIDATES_PER_RUN
+        )
         if not candidates:
             return
 
@@ -609,13 +618,18 @@ class AudioAnalysisController:
 
         # CROSS JOIN (track x possible domain), keep pairs with no analysis row,
         # GROUP_CONCAT the missing domains per track.
-        fs_inline = ", ".join(f"'{d}'" for d in filesystem_domains)
+        # Filesystem domains are bound as :fs_N params (rather than spliced into
+        # the SQL) for defense in depth; the values today come from a trusted
+        # constant, but a future contributor adding a domain string with a
+        # quote in it would otherwise silently break the query.
+        fs_placeholders = ", ".join(f":fs_{i}" for i in range(len(filesystem_domains)))
         aa_select_terms = " UNION ALL ".join(
             f"SELECT :aa_{i} AS aa_provider_domain" for i in range(len(aa_provider_domains))
         )
         params: dict[str, Any] = {
             "media_type": MediaType.TRACK.value,
             **{f"aa_{i}": d for i, d in enumerate(aa_provider_domains)},
+            **{f"fs_{i}": d for i, d in enumerate(filesystem_domains)},
         }
         query = (
             f"SELECT pm.provider_item_id AS item_id, "
@@ -624,7 +638,7 @@ class AudioAnalysisController:
             f"FROM {DB_TABLE_PROVIDER_MAPPINGS} pm "
             f"CROSS JOIN ({aa_select_terms}) possible "
             f"WHERE pm.media_type = :media_type "
-            f"  AND pm.provider_domain IN ({fs_inline}) "
+            f"  AND pm.provider_domain IN ({fs_placeholders}) "
             f"  AND NOT EXISTS ("
             f"    SELECT 1 FROM {DB_TABLE_AUDIO_ANALYSIS} aa "
             f"    WHERE aa.item_id = pm.provider_item_id "

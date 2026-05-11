@@ -46,6 +46,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     Track,
 )
+from music_assistant_models.media_items.metadata import MediaItemMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
@@ -989,6 +990,8 @@ class MusicController(CoreController):
             # the initial insert. For an existing listen-later row the merge
             # path in _update_library_item replaces CR when the new payload is
             # strictly richer (see _critical_reception_is_richer).
+            if candidate.metadata is None:
+                candidate.metadata = MediaItemMetadata()
             candidate.metadata.critical_reception = critical_reception
 
         # Always go through add_item_to_library — it routes new items through
@@ -1032,8 +1035,6 @@ class MusicController(CoreController):
             if not isinstance(provider, MusicProvider):
                 continue
             if ProviderFeature.SEARCH not in provider.supported_features:
-                continue
-            if not provider.library_supported(MediaType.ALBUM):
                 continue
             try:
                 results = await self._search_provider(
@@ -1098,8 +1099,11 @@ class MusicController(CoreController):
         do have any other anchor (in_library, favorite, play history) keep their
         state and only lose the flag.
         """
-        library_item = await self.albums.get_library_item(library_item_id)
         await self.albums.set_listen_later(library_item_id, False)
+        # Re-fetch *after* the flag write so the anchor check sees any state
+        # changes that landed between our entry and now (a concurrent sync
+        # could have flipped in_library / favorite / playlog).
+        library_item = await self.albums.get_library_item(library_item_id)
         has_anchor = (
             library_item.favorite
             or any(pm.in_library for pm in library_item.provider_mappings)
