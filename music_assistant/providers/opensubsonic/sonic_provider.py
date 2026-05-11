@@ -8,6 +8,7 @@ import tempfile
 from asyncio import TaskGroup
 from contextlib import suppress
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from libopensonic import AsyncConnection as SonicConnection
@@ -93,6 +94,7 @@ CONF_RAW_FILE = "request_raw_file"
 
 CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
+CACHE_CATEGORY_CRITICAL_RECEPTION = 3
 
 # How many bytes to download from a track when extracting custom AMG/TPS/DR tags.
 # Tag headers (ID3v2 / Vorbis comments / FLAC METADATA_BLOCK / MP4 'moov') live near
@@ -100,9 +102,40 @@ CACHE_CATEGORY_PODCAST_EPISODES = 2
 CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
 # How long ffprobe is allowed to run on the temp file. Bounds total sync cost.
 CRITICAL_RECEPTION_PROBE_TIMEOUT = 12.0
+# CR/DR tags are written to the file once and rarely change; cache the extraction
+# result long enough to amortize across the next several syncs.
+CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
+
+
+def _serialize_cr_cache_entry(
+    extracted: tuple[CriticalReception | None, float | None] | None,
+) -> dict[str, Any]:
+    """Encode a CR-extraction result for cache storage."""
+    if extracted is None:
+        return {"ok": False}
+    cr, album_dr = extracted
+    return {"ok": True, "cr": cr.to_dict() if cr is not None else None, "dr": album_dr}
+
+
+def _deserialize_cr_cache_entry(
+    entry: Any,
+) -> tuple[CriticalReception | None, float | None] | None:
+    """Decode a cached CR-extraction entry; returns None if the prior probe failed."""
+    if not isinstance(entry, dict) or not entry.get("ok"):
+        return None
+    cr_data = entry.get("cr")
+    cr = CriticalReception.from_dict(cr_data) if cr_data is not None else None
+    dr = entry.get("dr")
+    return cr, (float(dr) if dr is not None else None)
+
+
+def _silent_unlink(path: str) -> None:
+    """Remove a temp file, swallowing OS errors."""
+    with suppress(OSError):
+        Path(path).unlink()
 
 
 class OpenSonicProvider(MusicProvider):
@@ -351,20 +384,35 @@ class OpenSonicProvider(MusicProvider):
     ) -> tuple[CriticalReception | None, float | None] | None:
         """Fetch one track of an album, ffprobe it, return (CR, album_dr) or None.
 
-        Intentionally NOT cached: when tag-extraction logic changes (e.g. new tag-key
-        aliases land), a stale per-album cache would mask the new behavior on resync.
-        The enclosing `get_album` is itself cached for 3h, and library-sync calls this
-        once per album per run, so the absence of a per-album cache costs at most one
-        extra `/stream` partial fetch per sync. That's the right trade.
+        Cached per album_id for ``CRITICAL_RECEPTION_CACHE_TTL`` so bulk library sync
+        doesn't re-ffprobe every album on each run. Both positive and negative outcomes
+        (album with no songs, failed probe, no tags) are cached to avoid redoing the
+        ``conn.get_album`` round-trip.
         """
+        cached = await self.mass.cache.get(
+            key=prov_album_id,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+            default=None,
+        )
+        if cached is not None:
+            return _deserialize_cr_cache_entry(cached)
+        extracted: tuple[CriticalReception | None, float | None] | None = None
         try:
             sonic_album = await self.conn.get_album(prov_album_id)
         except (ParameterError, DataNotFoundError):
-            return None
-        if not sonic_album.song:
-            return None
-        sample_song_id = sonic_album.song[0].id
-        return await self._extract_critical_reception_from_song(sample_song_id)
+            pass
+        else:
+            if sonic_album.song:
+                extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
+        await self.mass.cache.set(
+            key=prov_album_id,
+            data=_serialize_cr_cache_entry(extracted),
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+            expiration=CRITICAL_RECEPTION_CACHE_TTL,
+        )
+        return extracted
 
     async def _extract_critical_reception_from_song(
         self, song_id: str
@@ -382,11 +430,11 @@ class OpenSonicProvider(MusicProvider):
             resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
         except (ParameterError, DataNotFoundError):
             return None
+        # Create the temp file off-loop; tempfile.NamedTemporaryFile does sync I/O.
+        tmp_fd, tmp_path = await asyncio.to_thread(tempfile.mkstemp, prefix="ma-cr-", suffix=".bin")
         bytes_read = 0
-        tmp_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(prefix="ma-cr-", suffix=".bin", delete=False) as tmp:
-                tmp_path = tmp.name
+            try:
                 async with resp:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         if not chunk:
@@ -394,12 +442,13 @@ class OpenSonicProvider(MusicProvider):
                         remaining = CRITICAL_RECEPTION_PROBE_BYTES - bytes_read
                         if remaining <= 0:
                             break
-                        if len(chunk) > remaining:
-                            chunk = chunk[:remaining]
-                        tmp.write(chunk)
-                        bytes_read += len(chunk)
+                        write_chunk = chunk[:remaining] if len(chunk) > remaining else chunk
+                        await asyncio.to_thread(os.write, tmp_fd, write_chunk)
+                        bytes_read += len(write_chunk)
                         if bytes_read >= CRITICAL_RECEPTION_PROBE_BYTES:
                             break
+            finally:
+                await asyncio.to_thread(os.close, tmp_fd)
             if bytes_read == 0:
                 return None
             try:
@@ -411,9 +460,7 @@ class OpenSonicProvider(MusicProvider):
                 return None
             return tags.critical_reception, tags.album_dynamic_range
         finally:
-            if tmp_path:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
+            await asyncio.to_thread(_silent_unlink, tmp_path)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """Provide a generator for library playlists."""
@@ -481,9 +528,7 @@ class OpenSonicProvider(MusicProvider):
         # rather than re-fetching the album in _get_album_critical_reception.
         if sonic_album.song:
             try:
-                extracted = await self._extract_critical_reception_from_song(
-                    sonic_album.song[0].id
-                )
+                extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
             except Exception as err:
                 self.logger.debug(
                     "critical_reception extraction failed for album %s: %s", prov_album_id, err

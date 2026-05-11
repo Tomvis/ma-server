@@ -80,43 +80,10 @@ SORT_KEYS = {
     "play_count_desc": "play_count DESC",
     "year": "year ASC",
     "year_desc": "year DESC",
-    # listen_later sorts — only valid for the albums table (only table with the
-    # column today). `NULLS LAST` keeps unsaved rows out of the way in both
-    # directions; SQLite supports it since 3.30 and MA's pinned sqlite is
-    # well past that.
-    "listen_later_added_at": "listen_later_added_at ASC NULLS LAST",
-    "listen_later_added_at_desc": "listen_later_added_at DESC NULLS LAST",
     "position": "position ASC",
     "position_desc": "position DESC",
     "artist_name": "artists.search_name ASC, year DESC",
     "artist_name_desc": "artists.search_name DESC, year DESC",
-    # critical_reception / DR sorts — only valid for the albums table since they
-    # reference albums.metadata directly. Non-album controllers should not pass
-    # these keys (no SQL fallback is provided).
-    # `dr` sorts on the canonical (measured) album dynamic range — not the
-    # AMG-review-reported value, which lives at $.critical_reception.amg_dr.
-    "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC",
-    "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC",
-    "amg_rating": (
-        "(SELECT json_extract(value, '$.rating') "
-        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC"
-    ),
-    "amg_rating_desc": (
-        "(SELECT json_extract(value, '$.rating') "
-        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC"
-    ),
-    "tps_rating": (
-        "(SELECT json_extract(value, '$.rating') "
-        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC"
-    ),
-    "tps_rating_desc": (
-        "(SELECT json_extract(value, '$.rating') "
-        "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC"
-    ),
     "random": "RANDOM()",
     "random_play_count": "RANDOM(), play_count ASC",
 }
@@ -128,6 +95,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     media_type: MediaType
     item_cls: type[MediaItemType]
     db_table: str
+    # Extra sort keys scoped to this controller (extend in subclasses with table-
+    # specific clauses such as JSON extracts from a column that only this table has).
+    extra_sort_keys: dict[str, str] = {}
 
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize class."""
@@ -297,9 +267,22 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         self.mass.signal_event(EventType.MEDIA_ITEM_DELETED, library_item.uri, library_item)
         self.logger.debug("deleted item with id %s from database", db_id)
 
-    async def library_count(self, favorite_only: bool = False) -> int:
-        """Return the total number of items in the library."""
-        if favorite_only:
+    async def library_count(
+        self,
+        favorite: bool | None = None,
+        favorite_only: bool = False,
+        **kwargs: Any,
+    ) -> int:
+        """Return the total number of items in the library.
+
+        :param favorite: Filter by favorite status (preferred).
+        :param favorite_only: Legacy alias for ``favorite=True``; kept for client
+            compatibility. Subclasses may accept additional media-type-specific
+            filters via ``**kwargs`` to mirror their ``library_items`` signature.
+        """
+        if favorite_only and favorite is None:
+            favorite = True
+        if favorite:
             sql_query = f"SELECT item_id FROM {self.db_table} WHERE favorite = 1"
             return await self.mass.music.database.get_count_from_query(sql_query)
         return await self.mass.music.database.get_count(self.db_table)
@@ -1140,7 +1123,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         sql_query += f" GROUP BY {self.db_table}.item_id"
 
         if order_by:
-            if sort_key := SORT_KEYS.get(order_by):
+            sort_key = self.extra_sort_keys.get(order_by) or SORT_KEYS.get(order_by)
+            if sort_key:
                 sql_query += f" ORDER BY {sort_key}"
 
         return sql_query

@@ -148,8 +148,19 @@ class AudioAnalysisController:
         finally:
             self._starting_sessions.discard(session_key)
 
+        # Start the chunk worker. If create_task itself raises (e.g. shutdown race),
+        # we must roll back the active-session entry and cancel the providers we
+        # already started, otherwise the session key is stuck in _active_sessions
+        # forever and future retries get the "already active" early-return.
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
-        self._workers[session_key] = self.mass.create_task(self._chunk_worker(session_key, queue))
+        try:
+            self._workers[session_key] = self.mass.create_task(
+                self._chunk_worker(session_key, queue)
+            )
+        except Exception:
+            self._active_sessions.pop(session_key, None)
+            self._cancel_providers(session_key)
+            raise
 
         finalized = False
 

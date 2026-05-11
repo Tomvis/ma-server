@@ -47,12 +47,14 @@ _DR_BUCKET_RANGES: dict[str, tuple[float, float | None]] = {
 
 # Map normalized label kind -> SQL pattern matched against each label string in the
 # JSON labels[] array. Year/month suffixes on AOTY/AOTM/HONORABLE_MENTION are matched
-# with LIKE so the same kind covers every annual variant.
+# with LIKE so the same kind covers every annual variant. Literal underscores in the
+# label tokens are escaped (\\_) because SQLite LIKE treats `_` as a single-char
+# wildcard; the matching ESCAPE clause is added in `_source_labels_clause`.
 _LABEL_KIND_PATTERNS: dict[str, str] = {
     "aoty": "AOTY-%",
     "aotm": "AOTM-%",
-    "honorable_mention": "HONORABLE_MENTION-%",
-    "record_of_the_month": "RECORD_OF_THE_MONTH",
+    "honorable_mention": r"HONORABLE\_MENTION-%",
+    "record_of_the_month": r"RECORD\_OF\_THE\_MONTH",
 }
 
 
@@ -119,7 +121,7 @@ def _source_labels_clause(
         k = f"{param_prefix}_{i}"
         params[k] = p
         label_keys.append(k)
-    label_or = " OR ".join(f"label_each.value LIKE :{k}" for k in label_keys)
+    label_or = " OR ".join(f"label_each.value LIKE :{k} ESCAPE '\\'" for k in label_keys)
     sub = (
         "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') src "
         f"WHERE json_extract(src.value, '$.source') = :{src_key} "
@@ -139,7 +141,7 @@ def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[s
     return sub, {src_key: source}
 
 
-def _apply_critical_reception_filters(
+def _apply_critical_reception_filters(  # noqa: PLR0913
     *,
     query_parts: list[str],
     query_params: dict[str, Any],
@@ -231,6 +233,37 @@ class AlbumsController(MediaControllerBase[Album]):
     db_table = DB_TABLE_ALBUMS
     media_type = MediaType.ALBUM
     item_cls = Album
+    # Sort keys that reference columns/JSON paths unique to the albums table.
+    # `NULLS LAST` keeps unsaved listen-later rows out of the way; the dr/amg/tps
+    # sorts target `albums.metadata` JSON fields that only exist on this table.
+    extra_sort_keys = {
+        "listen_later_added_at": "listen_later_added_at ASC NULLS LAST",
+        "listen_later_added_at_desc": "listen_later_added_at DESC NULLS LAST",
+        # `dr` sorts on the canonical (measured) album dynamic range — not the
+        # AMG-review-reported value, which lives at $.critical_reception.amg_dr.
+        "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC",
+        "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC",
+        "amg_rating": (
+            "(SELECT json_extract(value, '$.rating') "
+            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC"
+        ),
+        "amg_rating_desc": (
+            "(SELECT json_extract(value, '$.rating') "
+            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC"
+        ),
+        "tps_rating": (
+            "(SELECT json_extract(value, '$.rating') "
+            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC"
+        ),
+        "tps_rating_desc": (
+            "(SELECT json_extract(value, '$.rating') "
+            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
+            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC"
+        ),
+    }
 
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize class."""
@@ -295,7 +328,7 @@ class AlbumsController(MediaControllerBase[Album]):
         album.artists = album_artists
         return album
 
-    async def library_items(
+    async def library_items(  # noqa: PLR0913
         self,
         favorite: bool | None = None,
         search: str | None = None,
@@ -436,11 +469,14 @@ class AlbumsController(MediaControllerBase[Album]):
                         break
         return result
 
-    async def library_count(
+    async def library_count(  # type: ignore[override]  # noqa: PLR0913
         self,
-        favorite_only: bool = False,
+        favorite: bool | None = None,
+        search: str | None = None,
+        provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
         album_types: list[AlbumType] | None = None,
-        listen_later_only: bool = False,
+        listen_later: bool | None = None,
         dr_buckets: list[str] | None = None,
         amg_ratings: list[int] | None = None,
         amg_favorite: bool | None = None,
@@ -450,32 +486,45 @@ class AlbumsController(MediaControllerBase[Album]):
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
         tps_untagged: bool | None = None,
+        # Accept the legacy `*_only` names so older clients keep working without
+        # an immediate API contract bump. These are normalized into the boolean
+        # filters below; new callers should use `favorite=` / `listen_later=`.
+        favorite_only: bool = False,
+        listen_later_only: bool = False,
         **kwargs: Any,
     ) -> int:
-        """Return the total number of items in the library."""
-        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
-        query_parts: list[str] = []
+        """Return the total number of items in the library matching the filters.
+
+        Filter args mirror :meth:`library_items` so count and list track each
+        other 1-1 on any filtered view.
+        """
+        if favorite_only and favorite is None:
+            favorite = True
+        if listen_later_only and listen_later is None:
+            listen_later = True
         query_params: dict[str, Any] = {}
-        # Mirror library_items' default in_library JOIN so the count tracks the
-        # rows the user actually sees. Listen-later entries intentionally don't
-        # flip in_library, so the JOIN is dropped when the caller is asking for
-        # the listen-later subset — otherwise count and list would diverge as
-        # soon as any listen-later add lands.
-        if not listen_later_only:
-            query_params["provider_media_type"] = MediaType.ALBUM.value
-            sql_query += (
-                " JOIN provider_mappings "
-                f"ON provider_mappings.item_id = {self.db_table}.item_id "
-                "AND provider_mappings.media_type = :provider_media_type "
-                "AND provider_mappings.in_library = 1"
-            )
-        if favorite_only:
-            query_parts.append("favorite = 1")
-        if listen_later_only:
-            query_parts.append("listen_later = 1")
+        query_parts: list[str] = []
+        join_parts: list[str] = []
+        # in_library JOIN matches library_items: listen-later entries intentionally
+        # don't flip in_library, so the JOIN is dropped when the caller is asking
+        # for the listen-later subset.
+        in_library_only = listen_later is not True
+        self._apply_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            join_parts=join_parts,
+            favorite=favorite,
+            search=self._preprocess_search(search, query_params),
+            genre_ids=self._preprocess_genre_ids(genre),
+            provider_filter=self._ensure_provider_filter(provider),
+            in_library_only=in_library_only,
+        )
         if album_types:
             query_parts.append("albums.album_type IN :album_types")
             query_params["album_types"] = [x.value for x in album_types]
+        if listen_later is not None:
+            query_parts.append("albums.listen_later = :listen_later_flag")
+            query_params["listen_later_flag"] = listen_later
         _apply_critical_reception_filters(
             query_parts=query_parts,
             query_params=query_params,
@@ -489,12 +538,14 @@ class AlbumsController(MediaControllerBase[Album]):
             tps_labels=tps_labels,
             tps_untagged=tps_untagged,
         )
+        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
+        if join_parts:
+            sql_query += f" {' '.join(join_parts)}"
         if query_parts:
-            sql_query += f" WHERE {' AND '.join(query_parts)}"
-        if not listen_later_only:
-            # A track with multiple in-library mappings would otherwise be
-            # counted once per mapping — dedupe so the count stays album-level.
-            sql_query += f" GROUP BY {self.db_table}.item_id"
+            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
+        # A row with multiple in-library mappings would otherwise be counted
+        # once per mapping — dedupe so the count stays album-level.
+        sql_query += f" GROUP BY {self.db_table}.item_id"
         return await self.mass.music.database.get_count_from_query(sql_query, query_params)
 
     async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
@@ -704,18 +755,21 @@ class AlbumsController(MediaControllerBase[Album]):
         """Update existing record in the database."""
         db_id = int(item_id)  # ensure integer
         cur_item = await self.get_library_item(db_id)
+        # Capture the stored CR before metadata.update() so the server-side rule
+        # below compares against the pre-update value. update() runs the model's
+        # is_richer_than rule (source-count + amg_dr presence), which can swap the
+        # stored CR for a less-rich-by-our-rule one; without the pre-update copy
+        # we'd lose the ability to recover.
+        stored_cr = cur_item.metadata.critical_reception if cur_item.metadata else None
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
         # MediaItemMetadata.update() only fills None-valued fields and does not
-        # deep-merge structured sub-shapes like critical_reception — so a fresher
-        # CR (e.g. one that now carries a DR value) gets dropped on the floor when
-        # the existing field is already non-None. Apply a targeted replacement
-        # whenever the incoming CR strictly extends what's already stored.
+        # deep-merge structured sub-shapes like critical_reception. Apply our own
+        # per-source richness check against the pre-update CR and replace when the
+        # incoming payload strictly extends what was stored.
         if (
             not overwrite
             and update.metadata is not None
-            and _critical_reception_is_richer(
-                update.metadata.critical_reception, metadata.critical_reception
-            )
+            and _critical_reception_is_richer(update.metadata.critical_reception, stored_cr)
         ):
             metadata.critical_reception = update.metadata.critical_reception
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
