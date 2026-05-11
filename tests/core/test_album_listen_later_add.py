@@ -256,3 +256,72 @@ async def test_listen_later_add_unmatched_artist_album_raises(
     """No matching album across loaded providers raises MediaNotFoundError."""
     with pytest.raises(MediaNotFoundError):
         await mass.music.add_album_to_listen_later(artist="Nobody", album="Definitely Not An Album")
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_add_persists_cr_on_already_library_candidate(
+    mass: MusicAssistant,
+) -> None:
+    """CR payload must persist when the candidate resolves as `library://`.
+
+    First call seeds the listen-later row (no in_library mappings), so the
+    second call sees `candidate.provider == "library"`. A previous version of
+    the handler skipped the library add_item call in that branch, dropping the
+    user-supplied CR. The second call's richer payload must end up in the DB.
+    """
+    # Seed: listen-later-add with a partial CR (just AMG rating, no DR / TPS).
+    seed_cr = CriticalReception(
+        amg_dr=None,
+        sources=[ReviewSourceEntry(source="AMG", rating=4.0)],
+    )
+    await mass.music.add_album_to_listen_later(
+        artist="Radiohead", album="Kid A", critical_reception=seed_cr
+    )
+
+    # Second call: richer payload — adds amg_dr and a TPS source. The
+    # candidate now resolves as the existing library row (provider="library").
+    richer_cr = CriticalReception(
+        amg_dr=12.5,
+        sources=[
+            ReviewSourceEntry(source="AMG", rating=4.0, labels=["AOTY-2000"]),
+            ReviewSourceEntry(source="TPS", rating=8.5, favorite=True),
+        ],
+    )
+    library_album = await mass.music.add_album_to_listen_later(
+        artist="Radiohead", album="Kid A", critical_reception=richer_cr
+    )
+
+    assert library_album.metadata.critical_reception is not None
+    stored = library_album.metadata.critical_reception
+    assert stored.amg_dr == 12.5
+    sources_by_id = {s.source: s for s in (stored.sources or [])}
+    assert "TPS" in sources_by_id
+    assert sources_by_id["TPS"].rating == 8.5
+    assert sources_by_id["TPS"].favorite is True
+    assert sources_by_id["AMG"].labels == ["AOTY-2000"]
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_library_count_excludes_listen_later_only_items(
+    mass: MusicAssistant,
+) -> None:
+    """library_count must mirror library_items' default in_library JOIN.
+
+    Without the JOIN, a listen-later-only album (in_library=0 on all mappings)
+    inflates the count beyond what /library_items returns at the same call.
+    """
+    # Seed one real library album + one listen-later-only album.
+    library_uri = f"{_PROVIDER_INSTANCE}://album/alb-1"
+    await mass.music.add_item_to_library(library_uri)
+    await mass.music.add_album_to_listen_later(artist="Radiohead", album="OK Computer")
+
+    visible = await mass.music.albums.library_items()
+    total = await mass.music.albums.library_count()
+    listen_later_total = await mass.music.albums.library_count(listen_later_only=True)
+
+    assert total == len(visible), (
+        f"library_count ({total}) must match the number of items library_items returns "
+        f"({len(visible)})"
+    )
+    assert total == 1
+    assert listen_later_total == 1

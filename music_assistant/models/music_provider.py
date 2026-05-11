@@ -83,10 +83,12 @@ def _total_source_field_count(sources: Any) -> int:
 def _critical_reception_is_richer(new: object, existing: object) -> bool:
     """Return True if `new` carries more critical_reception data than `existing`.
 
-    "Richer" means strictly more populated fields — either an extra source, an
-    AMG DR landing where there was none, or a same-source refresh that filled
-    in fields that were previously blank. A regression (transient probe drop
-    that loses fields) returns False so the stored copy is kept.
+    "Richer" means strictly more populated fields — an extra source, an AMG DR
+    landing where there was none, or a same-source refresh that filled in
+    fields that were previously blank. The replace step on the caller side is
+    wholesale (`metadata.critical_reception = new`), so we must reject any
+    regression on either dimension — a lost amg_dr or a dropped source — or
+    that field would silently disappear from the stored copy.
     """
     if new is None:
         return False
@@ -94,15 +96,21 @@ def _critical_reception_is_richer(new: object, existing: object) -> bool:
         return True
     new_amg_dr = getattr(new, "amg_dr", None)
     cur_amg_dr = getattr(existing, "amg_dr", None)
-    if new_amg_dr is not None and cur_amg_dr is None:
-        return True
     new_sources = getattr(new, "sources", None) or []
     cur_sources = getattr(existing, "sources", None) or []
-    if len(new_sources) > len(cur_sources):
-        return True
+    # Either-direction regression: a signal present on `existing` and absent
+    # on `new` would be lost by the wholesale replacement, so keep the stored
+    # copy instead of "upgrading" to a shallower one.
+    if cur_amg_dr is not None and new_amg_dr is None:
+        return False
     if len(new_sources) < len(cur_sources):
         return False
-    return _total_source_field_count(new_sources) > _total_source_field_count(cur_sources)
+    # Compare total richness with amg_dr counted as a single field so an added
+    # amg_dr contributes to the score (and a same-shape CR can't claim to be
+    # richer when nothing actually changed).
+    new_total = (1 if new_amg_dr is not None else 0) + _total_source_field_count(new_sources)
+    cur_total = (1 if cur_amg_dr is not None else 0) + _total_source_field_count(cur_sources)
+    return new_total > cur_total
 
 
 class MusicProvider(Provider):

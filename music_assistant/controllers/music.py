@@ -985,11 +985,12 @@ class MusicController(CoreController):
             # strictly richer (see _critical_reception_is_richer).
             candidate.metadata.critical_reception = critical_reception
 
-        if candidate.provider != "library":
-            # Controller-level add: creates the row + provider_mappings with
-            # in_library left as None (NULL/0), without invoking the music.py
-            # api_command that flips in_library=True and triggers provider sync.
-            candidate = await self.albums.add_item_to_library(candidate)
+        # Always go through add_item_to_library — it routes new items through
+        # _add_library_item (in_library left at default 0, no provider sync) and
+        # existing rows through _update_library_item, which merges metadata
+        # under the richer-wins rule. Skipping the call for a candidate already
+        # resolved as `library://` would silently drop the supplied CR payload.
+        candidate = await self.albums.add_item_to_library(candidate)
         await self.albums.set_listen_later(candidate.item_id, True)
         return await self.albums.get_library_item(candidate.item_id)
 

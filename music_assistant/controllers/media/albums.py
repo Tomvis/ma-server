@@ -453,9 +453,22 @@ class AlbumsController(MediaControllerBase[Album]):
         **kwargs: Any,
     ) -> int:
         """Return the total number of items in the library."""
-        sql_query = f"SELECT item_id FROM {self.db_table}"
+        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
         query_parts: list[str] = []
         query_params: dict[str, Any] = {}
+        # Mirror library_items' default in_library JOIN so the count tracks the
+        # rows the user actually sees. Listen-later entries intentionally don't
+        # flip in_library, so the JOIN is dropped when the caller is asking for
+        # the listen-later subset — otherwise count and list would diverge as
+        # soon as any listen-later add lands.
+        if not listen_later_only:
+            query_params["provider_media_type"] = MediaType.ALBUM.value
+            sql_query += (
+                " JOIN provider_mappings "
+                f"ON provider_mappings.item_id = {self.db_table}.item_id "
+                "AND provider_mappings.media_type = :provider_media_type "
+                "AND provider_mappings.in_library = 1"
+            )
         if favorite_only:
             query_parts.append("favorite = 1")
         if listen_later_only:
@@ -478,6 +491,10 @@ class AlbumsController(MediaControllerBase[Album]):
         )
         if query_parts:
             sql_query += f" WHERE {' AND '.join(query_parts)}"
+        if not listen_later_only:
+            # A track with multiple in-library mappings would otherwise be
+            # counted once per mapping — dedupe so the count stays album-level.
+            sql_query += f" GROUP BY {self.db_table}.item_id"
         return await self.mass.music.database.get_count_from_query(sql_query, query_params)
 
     async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
