@@ -409,6 +409,12 @@ class GenreController(MediaControllerBase[Genre]):
         query_params: dict[str, Any] = {}
         query_parts: list[str] = []
         join_parts: list[str] = []
+        # The overridden _search_filter_clause matches by name (`:search`) AND by
+        # alias (`:search_raw`); library_items sets both via extra_params, so do
+        # the same here or the alias half of the OR clause errors out with
+        # "no value for binding parameter :search_raw" at execution.
+        if search:
+            query_params["search_raw"] = f"%{search.strip().lower()}%"
         self._apply_filters(
             query_parts=query_parts,
             query_params=query_params,

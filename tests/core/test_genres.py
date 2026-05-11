@@ -393,6 +393,21 @@ class TestGenreCRUD:
         assert fav >= 1
         assert fav <= total
 
+    async def test_library_count_with_search(self, genre_ctrl: GenreController) -> None:
+        """library_count must accept a search term without erroring.
+
+        GenreController overrides _search_filter_clause to match by name and by
+        alias, so the clause references both :search and :search_raw.
+        library_items sets both via extra_params; library_count has to populate
+        :search_raw on its own or sqlite raises ProgrammingError on execution.
+        """
+        await genre_ctrl.add_item_to_library(_make_genre("SearchCountA"))
+        await genre_ctrl.add_item_to_library(_make_genre("SearchCountB"))
+        # Regression: must not raise "you did not supply a value for binding
+        # parameter :search_raw".
+        matched = await genre_ctrl.library_count(search="SearchCountA")
+        assert matched >= 1
+
 
 # ===================================================================
 # Group C: Alias Operations (8 tests)

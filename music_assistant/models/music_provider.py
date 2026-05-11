@@ -1059,6 +1059,16 @@ class MusicProvider(Provider):
                     library_item = await self.mass.music.albums.update_item_in_library(
                         library_item.item_id, library_item
                     )
+                # Promote: a sync that flips in_library=True on an album which
+                # was previously sitting on listen-later means the user now has
+                # it in their proper library. Clear the listen-later flag so it
+                # doesn't show up in both views. The pre-flight check in
+                # add_album_to_listen_later guards the write path; this guards
+                # the read-back path where streaming-library sync wins the race.
+                if getattr(library_item, "listen_later", False) and any(
+                    pm.in_library for pm in library_item.provider_mappings
+                ):
+                    await self.mass.music.albums.set_listen_later(library_item.item_id, False)
                 if not library_item.favorite and prov_item.favorite:
                     # existing library item not favorite but should be
                     await self.mass.music.albums.set_favorite(library_item.item_id, True)

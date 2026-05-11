@@ -37,6 +37,12 @@ if TYPE_CHECKING:
     from music_assistant import MusicAssistant
 
 
+# Bare-text search cutoff: library_items returns up to this many title-matches
+# on page 1 before declining to top up with artist-only matches. library_count
+# mirrors the cutoff so counts and lists track 1-1 — above the cutoff, only
+# title-matching albums are visible, so the count must drop the artist union.
+_SEARCH_ARTIST_PASS_CUTOFF = 25
+
 # DR quality thresholds (mirrors src/helpers/album_tags.ts on the frontend).
 _DR_BUCKET_RANGES: dict[str, tuple[float, float | None]] = {
     "excellent": (14, None),
@@ -458,7 +464,12 @@ class AlbumsController(MediaControllerBase[Album]):
         # Calculate how many more items we need to reach the original limit
         remaining_limit = limit - len(result)
 
-        if search and len(result) < 25 and not offset and remaining_limit > 0:
+        if (
+            search
+            and len(result) < _SEARCH_ARTIST_PASS_CUTOFF
+            and not offset
+            and remaining_limit > 0
+        ):
             # append artist items to result
             search = create_safe_string(search, True, True)
             extra_join_parts.append(
@@ -523,64 +534,34 @@ class AlbumsController(MediaControllerBase[Album]):
             favorite = True
         if listen_later_only and listen_later is None:
             listen_later = True
-        query_params: dict[str, Any] = {}
-        query_parts: list[str] = []
-        join_parts: list[str] = []
-        # Mirror library_items' search semantics: "Artist - Album" splits into
-        # artist+title (AND, matched via JOIN), and bare-text matches album
-        # name OR album-artist name (the same union library_items achieves by
-        # appending an artist-match pass to a short title-match result set).
-        # Without this, count and list diverge for any search containing " - ".
-        search_handled = False
-        if search and " - " in search:
-            artist_str, title_str = search.split(" - ", 1)
-            title_safe = create_safe_string(title_str, True, True)
-            artist_safe = create_safe_string(artist_str, True, True)
-            query_parts.append("albums.search_name LIKE :search_title")
-            query_params["search_title"] = f"%{title_safe}%"
-            join_parts.append(
-                "JOIN album_artists ON album_artists.album_id = albums.item_id "
-                "JOIN artists ON artists.item_id = album_artists.artist_id "
-                "AND artists.search_name LIKE :search_artist"
-            )
-            query_params["search_artist"] = f"%{artist_safe}%"
-            search_handled = True
-        elif search:
-            search_safe = create_safe_string(search, True, True)
-            query_params["search"] = f"%{search_safe}%"
-            query_parts.append(
-                "(albums.search_name LIKE :search "
-                "OR EXISTS(SELECT 1 FROM album_artists "
-                "JOIN artists ON artists.item_id = album_artists.artist_id "
-                "WHERE album_artists.album_id = albums.item_id "
-                "AND artists.search_name LIKE :search))"
-            )
-            search_handled = True
+        # Build the non-search filter set once so we can apply it identically
+        # to whichever search clause(s) the count requires below.
+        base_params: dict[str, Any] = {}
+        base_parts: list[str] = []
+        base_joins: list[str] = []
         # in_library JOIN matches library_items: listen-later entries intentionally
         # don't flip in_library, so the JOIN is dropped when the caller is asking
         # for the listen-later subset.
         in_library_only = listen_later is not True
         self._apply_filters(
-            query_parts=query_parts,
-            query_params=query_params,
-            join_parts=join_parts,
+            query_parts=base_parts,
+            query_params=base_params,
+            join_parts=base_joins,
             favorite=favorite,
-            # _apply_filters' default search clause is title-only; we've already
-            # built a richer one above when search was supplied.
-            search=None if search_handled else self._preprocess_search(search, query_params),
+            search=None,
             genre_ids=self._preprocess_genre_ids(genre),
             provider_filter=self._ensure_provider_filter(provider),
             in_library_only=in_library_only,
         )
         if album_types:
-            query_parts.append("albums.album_type IN :album_types")
-            query_params["album_types"] = [x.value for x in album_types]
+            base_parts.append("albums.album_type IN :album_types")
+            base_params["album_types"] = [x.value for x in album_types]
         if listen_later is not None:
-            query_parts.append("albums.listen_later = :listen_later_flag")
-            query_params["listen_later_flag"] = listen_later
+            base_parts.append("albums.listen_later = :listen_later_flag")
+            base_params["listen_later_flag"] = listen_later
         _apply_critical_reception_filters(
-            query_parts=query_parts,
-            query_params=query_params,
+            query_parts=base_parts,
+            query_params=base_params,
             dr_buckets=dr_buckets,
             amg_ratings=amg_ratings,
             amg_favorite=amg_favorite,
@@ -591,15 +572,76 @@ class AlbumsController(MediaControllerBase[Album]):
             tps_labels=tps_labels,
             tps_untagged=tps_untagged,
         )
-        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
-        if join_parts:
-            sql_query += f" {' '.join(join_parts)}"
-        if query_parts:
-            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
-        # A row with multiple in-library mappings would otherwise be counted
-        # once per mapping — dedupe so the count stays album-level.
-        sql_query += f" GROUP BY {self.db_table}.item_id"
-        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
+
+        async def _count(
+            *,
+            extra_parts: list[str] | None = None,
+            extra_params_extra: dict[str, Any] | None = None,
+            extra_joins: list[str] | None = None,
+        ) -> int:
+            parts = base_parts + (extra_parts or [])
+            params = {**base_params, **(extra_params_extra or {})}
+            joins = base_joins + (extra_joins or [])
+            sql = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
+            if joins:
+                sql += f" {' '.join(joins)}"
+            if parts:
+                sql += " WHERE " + " AND ".join(self._clean_query_parts(parts))
+            # A row with multiple in-library mappings would otherwise be counted
+            # once per mapping — dedupe so the count stays album-level.
+            sql += f" GROUP BY {self.db_table}.item_id"
+            return await self.mass.music.database.get_count_from_query(sql, params)
+
+        # No search → single count with the base filters.
+        if not search:
+            return await _count()
+
+        # "Artist - Album" mode: library_items splits on " - " and AND-joins title
+        # against the album_artists table. There's no artist-pass fallback in this
+        # branch, so the count is just the JOIN-filtered total.
+        if " - " in search:
+            artist_str, title_str = search.split(" - ", 1)
+            title_safe = create_safe_string(title_str, True, True)
+            artist_safe = create_safe_string(artist_str, True, True)
+            return await _count(
+                extra_parts=["albums.search_name LIKE :search_title"],
+                extra_params_extra={
+                    "search_title": f"%{title_safe}%",
+                    "search_artist": f"%{artist_safe}%",
+                },
+                extra_joins=[
+                    "JOIN album_artists ON album_artists.album_id = albums.item_id "
+                    "JOIN artists ON artists.item_id = album_artists.artist_id "
+                    "AND artists.search_name LIKE :search_artist"
+                ],
+            )
+
+        # Bare-text mode: library_items pages return title-matches first, then
+        # — only when the title-match result on page 1 fell under the cutoff —
+        # top up with artist-only matches. So:
+        #   • title_count >= cutoff → only title rows are ever visible.
+        #     Counting the OR-union here would inflate by the artist-only delta.
+        #   • title_count <  cutoff → page 1 includes the artist-only delta.
+        #     |title ∪ artist| == |title| + |artist \ title|, which is exactly
+        #     what the user sees, so the union count is right.
+        search_safe = create_safe_string(search, True, True)
+        search_params = {"search": f"%{search_safe}%"}
+        title_count = await _count(
+            extra_parts=["albums.search_name LIKE :search"],
+            extra_params_extra=search_params,
+        )
+        if title_count >= _SEARCH_ARTIST_PASS_CUTOFF:
+            return title_count
+        return await _count(
+            extra_parts=[
+                "(albums.search_name LIKE :search "
+                "OR EXISTS(SELECT 1 FROM album_artists "
+                "JOIN artists ON artists.item_id = album_artists.artist_id "
+                "WHERE album_artists.album_id = albums.item_id "
+                "AND artists.search_name LIKE :search))"
+            ],
+            extra_params_extra=search_params,
+        )
 
     async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
         """Delete item from the library(database)."""

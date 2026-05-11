@@ -1089,8 +1089,25 @@ class MusicController(CoreController):
         self,
         library_item_id: str | int,
     ) -> None:
-        """Clear the listen-later flag on a library album."""
+        """Clear the listen-later flag, deleting the row if it has no other anchor.
+
+        A row added solely via the listen-later flow has no in_library provider
+        mapping, isn't favorited, and was never played — once the flag flips off
+        it's invisible to every default view. Clean it up so successive
+        listen-later churn doesn't accumulate orphan rows in the DB. Rows that
+        do have any other anchor (in_library, favorite, play history) keep their
+        state and only lose the flag.
+        """
+        library_item = await self.albums.get_library_item(library_item_id)
         await self.albums.set_listen_later(library_item_id, False)
+        has_anchor = (
+            library_item.favorite
+            or any(pm.in_library for pm in library_item.provider_mappings)
+            or bool(getattr(library_item, "play_count", 0))
+            or bool(getattr(library_item, "last_played", 0))
+        )
+        if not has_anchor:
+            await self.albums.remove_item_from_library(library_item_id)
 
     @api_command("music/library/remove_item")
     async def remove_item_from_library(

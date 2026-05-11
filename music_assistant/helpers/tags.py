@@ -1572,8 +1572,10 @@ def _write_replaygain_track_gain_sync(path: str, track_gain_db: float) -> bool:
             LOGGER.debug("could not initialise tags on %s: %s", path, err)
             return False
 
-    # ReplayGain 2.0 format: "-5.30 dB" (two decimals, space, dB suffix)
-    gain_str = f"{track_gain_db:.2f} dB"
+    # ReplayGain 2.0 format: explicit sign + two decimals + " dB" (e.g. "-5.30 dB" /
+    # "+5.30 dB"). The leading "+" matters: strict parsers (incl. some Lavf/foobar
+    # paths) expect a signed value and may misinterpret "5.30 dB" as missing/garbage.
+    gain_str = f"{track_gain_db:+.2f} dB"
     tags = audio.tags
 
     try:

@@ -302,6 +302,47 @@ async def test_listen_later_add_persists_cr_on_already_library_candidate(
 
 
 @pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_remove_deletes_orphan_row(
+    mass: MusicAssistant,
+) -> None:
+    """A listen-later add followed by remove must not leave an orphan row.
+
+    The row is invisible to every default view once the flag is cleared (no
+    in_library mappings, not favorited, never played), so it would otherwise
+    accumulate as dead DB state through listen-later churn.
+    """
+    library_album = await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
+    db_id = int(library_album.item_id)
+    # Sanity: row exists with the flag set.
+    assert library_album.listen_later is True
+    assert await mass.music.albums.get_library_item(db_id) is not None
+
+    await mass.music.remove_album_from_listen_later(db_id)
+
+    # Row must be gone — no anchor remains to keep it.
+    with pytest.raises(MediaNotFoundError):
+        await mass.music.albums.get_library_item(db_id)
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_remove_keeps_row_with_other_anchor(
+    mass: MusicAssistant,
+) -> None:
+    """If the row has another anchor (favorited), remove only clears the flag."""
+    library_album = await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
+    db_id = int(library_album.item_id)
+    # Make the row anchored by something other than listen_later.
+    await mass.music.albums.set_favorite(db_id, True)
+
+    await mass.music.remove_album_from_listen_later(db_id)
+
+    # Row must still exist, with the flag cleared and the anchor preserved.
+    refreshed = await mass.music.albums.get_library_item(db_id)
+    assert refreshed.listen_later is False
+    assert refreshed.favorite is True
+
+
+@pytest.mark.usefixtures("fake_provider")
 async def test_library_count_excludes_listen_later_only_items(
     mass: MusicAssistant,
 ) -> None:
