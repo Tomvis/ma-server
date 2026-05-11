@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import MediaType, ProviderFeature
@@ -52,13 +52,41 @@ if TYPE_CHECKING:
 CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
 
 
+def _source_filled_field_count(source: Any) -> int:
+    """Count populated fields on a single ReviewSourceEntry.
+
+    Used as a per-source richness signal so a refresh that gains a rating,
+    favorite flag, or extra accolade label wins over the stored copy even when
+    the total source count hasn't changed.
+    """
+    if source is None:
+        return 0
+    count = 0
+    if getattr(source, "rating", None) is not None:
+        count += 1
+    if getattr(source, "favorite", None) is not None:
+        count += 1
+    for field in ("types", "labels", "authors"):
+        val = getattr(source, field, None)
+        if val:
+            count += len(val)
+    return count
+
+
+def _total_source_field_count(sources: Any) -> int:
+    """Sum of filled fields across every entry in a sources iterable."""
+    if not sources:
+        return 0
+    return sum(_source_filled_field_count(s) for s in sources)
+
+
 def _critical_reception_is_richer(new: object, existing: object) -> bool:
     """Return True if `new` carries more critical_reception data than `existing`.
 
-    Uses a coarse "more fields filled" heuristic so any forward improvement (AMG
-    DR landing, more sources, etc.) wins, but a regression (e.g. a transient probe
-    failure that drops sources) does not overwrite known-good data. The canonical
-    (measured) DR lives on MediaItemMetadata.dynamic_range and is compared elsewhere.
+    "Richer" means strictly more populated fields — either an extra source, an
+    AMG DR landing where there was none, or a same-source refresh that filled
+    in fields that were previously blank. A regression (transient probe drop
+    that loses fields) returns False so the stored copy is kept.
     """
     if new is None:
         return False
@@ -72,7 +100,9 @@ def _critical_reception_is_richer(new: object, existing: object) -> bool:
     cur_sources = getattr(existing, "sources", None) or []
     if len(new_sources) > len(cur_sources):
         return True
-    return False
+    if len(new_sources) < len(cur_sources):
+        return False
+    return _total_source_field_count(new_sources) > _total_source_field_count(cur_sources)
 
 
 class MusicProvider(Provider):
@@ -928,9 +958,7 @@ class MusicProvider(Provider):
                     and prov_item.metadata.critical_reception is not None
                     and _critical_reception_is_richer(
                         prov_item.metadata.critical_reception,
-                        library_item.metadata.critical_reception
-                        if library_item.metadata
-                        else None,
+                        library_item.metadata.critical_reception if library_item.metadata else None,
                     )
                 ):
                     # Provider has surfaced fresher / more complete critical_reception

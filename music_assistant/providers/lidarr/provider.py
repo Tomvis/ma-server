@@ -103,7 +103,10 @@ class LidarrProvider(PluginProvider):
         album = cast("Album", media_item)
         if not album.artists:
             raise InvalidDataError(f"Album {album.name!r} has no artist information")
-        artist_name = album.artists[0].name
+        primary_artist = album.artists[0]
+        artist_name = getattr(primary_artist, "name", None) if primary_artist else None
+        if not artist_name:
+            raise InvalidDataError(f"Album {album.name!r} has no usable artist name")
 
         album_id = await self._resolve_album_id(
             album_uri=item, artist_name=artist_name, album_name=album.name
@@ -136,6 +139,16 @@ class LidarrProvider(PluginProvider):
             )
         return album_id
 
+    @staticmethod
+    def _as_count(value: Any) -> int:
+        """Coerce a music-rater counter field to int; default to 0 on garbage."""
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     def _build_result(
         self,
         response: dict[str, Any],
@@ -148,10 +161,10 @@ class LidarrProvider(PluginProvider):
         music-rater fields we read:
           artists_added, albums_monitored, skipped, errors, error_log, lidarr_synced
         """
-        artists_added = int(response.get("artists_added") or 0)
-        albums_monitored = int(response.get("albums_monitored") or 0)
-        skipped = int(response.get("skipped") or 0)
-        errors = int(response.get("errors") or 0)
+        artists_added = self._as_count(response.get("artists_added"))
+        albums_monitored = self._as_count(response.get("albums_monitored"))
+        skipped = self._as_count(response.get("skipped"))
+        errors = self._as_count(response.get("errors"))
         lidarr_synced = bool(response.get("lidarr_synced"))
 
         if errors > 0:

@@ -81,9 +81,11 @@ SORT_KEYS = {
     "year": "year ASC",
     "year_desc": "year DESC",
     # listen_later sorts — only valid for the albums table (only table with the
-    # column today). Use COALESCE so unsaved rows sort last on DESC.
-    "listen_later_added_at": "listen_later_added_at ASC",
-    "listen_later_added_at_desc": "COALESCE(listen_later_added_at, 0) DESC",
+    # column today). `NULLS LAST` keeps unsaved rows out of the way in both
+    # directions; SQLite supports it since 3.30 and MA's pinned sqlite is
+    # well past that.
+    "listen_later_added_at": "listen_later_added_at ASC NULLS LAST",
+    "listen_later_added_at_desc": "listen_later_added_at DESC NULLS LAST",
     "position": "position ASC",
     "position_desc": "position DESC",
     "artist_name": "artists.search_name ASC, year DESC",

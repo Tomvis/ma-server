@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from aiohttp import ClientTimeout
+from aiohttp import ClientResponseError, ClientTimeout
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
@@ -58,7 +58,12 @@ class MusicRaterClient:
         path: str,
         **kwargs: Any,
     ) -> tuple[int, Any]:
-        """Issue a request and return (status, parsed-body-or-text)."""
+        """Issue a request and return (status, parsed-body-or-text).
+
+        A malformed JSON body — Content-Type claims JSON but the bytes don't
+        parse — is treated like a text response; callers already handle the
+        "body isn't a dict" case and produce a useful error message.
+        """
         url = f"{self._base}/api/v1/{path.lstrip('/')}"
         async with self._session.request(
             method,
@@ -73,7 +78,10 @@ class MusicRaterClient:
                 return status, None
             ctype = resp.headers.get("Content-Type", "")
             if "application/json" in ctype:
-                return status, await resp.json()
+                try:
+                    return status, await resp.json()
+                except (ClientResponseError, ValueError):
+                    return status, await resp.text()
             return status, await resp.text()
 
     async def ping(self) -> None:
@@ -111,7 +119,12 @@ class MusicRaterClient:
         first = items[0]
         if not isinstance(first, dict) or "id" not in first:
             raise MusicRaterError(f"music-rater returned malformed album item: {first!r}")
-        return int(first["id"])
+        try:
+            return int(first["id"])
+        except (TypeError, ValueError) as err:
+            raise MusicRaterError(
+                f"music-rater returned non-numeric album id: {first['id']!r}"
+            ) from err
 
     async def queue_lidarr(self, album_id: int) -> dict[str, Any]:
         """POST /albums/{id}/lidarr/queue — flips lidarr_manual_add + inline sync.
@@ -120,8 +133,11 @@ class MusicRaterClient:
         toast carries a useful message.
         """
         status, body = await self._request("POST", f"albums/{int(album_id)}/lidarr/queue")
-        if status == 200 and isinstance(body, dict):
-            return body
+        if status == 200:
+            # An empty 200 body is treated as a successful no-op rather than an
+            # error; _build_result reads counters off the dict and a fully-empty
+            # dict produces a benign "nothing changed" result.
+            return body if isinstance(body, dict) else {}
         # Per music-rater's documented error surface.
         snippet = body if isinstance(body, str) else str(body)[:200]
         if status == 404:

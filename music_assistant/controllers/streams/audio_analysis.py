@@ -513,12 +513,19 @@ class AudioAnalysisController:
         finally:
             self._starting_sessions.discard(session_key)
 
+        # Explicit aclose() in finally guarantees the ffmpeg subprocess behind
+        # get_media_stream is torn down on early break or wait_for cancellation —
+        # otherwise cleanup defers to the async-generator GC hook and can leak
+        # subprocesses under sustained timeout pressure.
         audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
-        async for chunk in audio_source:
-            if session_key not in self._active_sessions:
-                # all providers evicted — bail early
-                break
-            await self._distribute_chunk(session_key, chunk)
+        try:
+            async for chunk in audio_source:
+                if session_key not in self._active_sessions:
+                    # all providers evicted — bail early
+                    break
+                await self._distribute_chunk(session_key, chunk)
+        finally:
+            await audio_source.aclose()
         if session_key in self._active_sessions:
             self._finalize_providers(session_key)
 
