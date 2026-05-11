@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import MediaType
+from music_assistant_models.enums import MediaType, StreamType
 
 from music_assistant.constants import CONF_LOG_LEVEL
 from music_assistant.models.audio_analysis import AudioAnalysisData
@@ -129,6 +129,7 @@ async def test_post_analysis_writes_tag_when_path_writable_and_config_on(
     provider = _make_loudness_provider(write_replaygain_tags=True)
     streamdetails = MagicMock()
     streamdetails.path = "/music/test.flac"
+    streamdetails.stream_type = StreamType.LOCAL_FILE
     analysis = AudioAnalysisData(loudness_integrated=-14.0)
 
     write_mock = AsyncMock(return_value=True)
@@ -151,6 +152,7 @@ async def test_post_analysis_skips_when_path_not_writable(
     provider = _make_loudness_provider(write_replaygain_tags=True)
     streamdetails = MagicMock()
     streamdetails.path = None
+    streamdetails.stream_type = StreamType.LOCAL_FILE
     analysis = AudioAnalysisData(loudness_integrated=-14.0)
 
     write_mock = AsyncMock(return_value=True)
@@ -172,6 +174,7 @@ async def test_post_analysis_skips_when_config_off(
     provider = _make_loudness_provider(write_replaygain_tags=False)
     streamdetails = MagicMock()
     streamdetails.path = "/music/test.flac"
+    streamdetails.stream_type = StreamType.LOCAL_FILE
     analysis = AudioAnalysisData(loudness_integrated=-14.0)
 
     write_mock = AsyncMock(return_value=True)
@@ -193,7 +196,35 @@ async def test_post_analysis_skips_when_loudness_missing(
     provider = _make_loudness_provider(write_replaygain_tags=True)
     streamdetails = MagicMock()
     streamdetails.path = "/music/test.flac"
+    streamdetails.stream_type = StreamType.LOCAL_FILE
     analysis = AudioAnalysisData(loudness_integrated=None)
+
+    write_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "music_assistant.providers.loudness_analysis.provider.write_replaygain_track_gain",
+        write_mock,
+    )
+
+    await provider.post_analysis(streamdetails, analysis)
+
+    write_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_analysis_skips_when_stream_not_local_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """post_analysis is a no-op when stream_type is not LOCAL_FILE.
+
+    Streaming-provider tracks have a non-empty string `path` (the streaming
+    URL), but writing ReplayGain tags into a URL is a contract violation
+    regardless of whether the helper happens to fail silently today.
+    """
+    provider = _make_loudness_provider(write_replaygain_tags=True)
+    streamdetails = MagicMock()
+    streamdetails.path = "https://example.com/track.mp3"
+    streamdetails.stream_type = StreamType.HTTP
+    analysis = AudioAnalysisData(loudness_integrated=-14.0)
 
     write_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(

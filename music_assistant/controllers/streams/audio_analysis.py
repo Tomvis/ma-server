@@ -28,6 +28,9 @@ from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 from music_assistant.models.music_provider import MusicProvider
 
 CHUNK_PROCESS_TIMEOUT_SECONDS = 1.0
+# Per-provider cap on start_analysis. Live-playback `AudioBuffer.get_buffer`
+# awaits this synchronously, so we can't let a hung provider stall the buffer.
+START_ANALYSIS_TIMEOUT_SECONDS = 5.0
 LOUDNESS_ANALYSIS_DOMAIN = "loudness_analysis"
 BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 BACKGROUND_PER_TRACK_TIMEOUT_SECONDS = 300
@@ -89,10 +92,27 @@ class AudioAnalysisController:
         for worker in workers:
             if not worker.done():
                 worker.cancel()
-        for session_key in list(self._active_sessions):
-            self._cancel_providers(session_key)
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
+        # Await provider cancels inline (with a per-call timeout). `_cancel_providers`
+        # would fire-and-forget via mass.create_task — but mass.stop already cancelled
+        # tracked tasks before calling streams.close(), so those new tasks would race
+        # event-loop shutdown and may not actually run.
+        cancel_tasks: list[asyncio.Task[None]] = []
+        for session_key in list(self._active_sessions):
+            provider_ids = self._active_sessions.pop(session_key, None)
+            if not provider_ids:
+                continue
+            for provider_id in provider_ids:
+                provider = self.mass.get_provider(provider_id)
+                if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+                    cancel_tasks.append(
+                        asyncio.create_task(
+                            asyncio.wait_for(provider.cancel(session_key), timeout=5)
+                        )
+                    )
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
     def _configure_thread_caps(self) -> None:
         """Cap PyTorch threading so Audio Analysis inference stays around a quarter of cpu_count."""
@@ -232,13 +252,18 @@ class AudioAnalysisController:
         :param analysis_version: Version of the AA provider's algorithm.
         :param media_type: The media type of the item being analyzed.
         """
-        if not (
-            provider := self.mass.get_provider(
-                provider_instance_id_or_domain, provider_type=MusicProvider
-            )
-        ):
-            return
-        prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
+        provider = self.mass.get_provider(
+            provider_instance_id_or_domain, provider_type=MusicProvider
+        )
+        # When the music provider has been unloaded mid-analysis (e.g. user disabled
+        # the filesystem provider during a long background scan), fall back to the
+        # raw input string so the analysis result still lands in the DB. Otherwise
+        # the candidate stays "missing analysis" forever and gets re-scanned every
+        # nightly run.
+        if provider is None:
+            prov_key = provider_instance_id_or_domain
+        else:
+            prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
         data_json = json_dumps(analysis.to_dict())
         await self.mass.music.database.insert_or_replace(
             DB_TABLE_AUDIO_ANALYSIS,
@@ -333,11 +358,17 @@ class AudioAnalysisController:
             loudness_integrated=loudness,
             loudness_album=loudness_album,
         )
+        # Use the live loudness provider's current analysis_version so a future
+        # provider-side bump correctly invalidates tag-derived rows. Default to 1
+        # when the provider isn't loaded yet (boot-order edge case).
+        loudness_provider = self.mass.get_provider(LOUDNESS_ANALYSIS_DOMAIN)
+        analysis_version = getattr(loudness_provider, "analysis_version", 1) or 1
         await self.set_audio_analysis(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
             aa_provider_domain=LOUDNESS_ANALYSIS_DOMAIN,
             analysis=analysis,
+            analysis_version=analysis_version,
             media_type=media_type,
         )
 
@@ -500,11 +531,14 @@ class AudioAnalysisController:
         session_key = streamdetails.uri
         # Also exclude sessions whose live-playback start is mid-await; otherwise the
         # background scan can shadow a live analysis and double-fire chunk callbacks.
+        # The add() is sync-adjacent to the check so a concurrent live start_analysis
+        # can't slip into the same gap; mirror the live entry point's pattern.
         if session_key in self._active_sessions or session_key in self._starting_sessions:
             self.logger.debug(
                 "Background streaming: session already active for %s, skipping", session_key
             )
             return
+        self._starting_sessions.add(session_key)
 
         try:
             await asyncio.wait_for(
@@ -535,6 +569,8 @@ class AudioAnalysisController:
                 BACKGROUND_SCAN_TASK_ID,
                 f"Failed: {session_key}: {err}",
             )
+        finally:
+            self._starting_sessions.discard(session_key)
 
     async def _run_background_streaming_inner(
         self,
@@ -552,17 +588,16 @@ class AudioAnalysisController:
             content_type=ContentType.from_bit_depth(streamdetails.audio_format.bit_depth),
         )
 
-        self._starting_sessions.add(session_key)
-        try:
-            accepted = await self._start_analysis_on_providers(
-                session_key, streamdetails, pcm_format, providers
-            )
-            if not accepted:
-                self.logger.debug("No providers accepted background analysis for %s", session_key)
-                return
-            self._active_sessions[session_key] = accepted
-        finally:
-            self._starting_sessions.discard(session_key)
+        # _starting_sessions is owned by the outer _run_background_streaming_for_track
+        # (added before the wait_for, discarded in its finally), closing the
+        # check-vs-add window against a concurrent live start_analysis.
+        accepted = await self._start_analysis_on_providers(
+            session_key, streamdetails, pcm_format, providers
+        )
+        if not accepted:
+            self.logger.debug("No providers accepted background analysis for %s", session_key)
+            return
+        self._active_sessions[session_key] = accepted
 
         # Explicit aclose() in finally guarantees the ffmpeg subprocess behind
         # get_media_stream is torn down on early break or wait_for cancellation —
@@ -672,18 +707,34 @@ class AudioAnalysisController:
     ) -> set[str]:
         """Call start_analysis on each provider, returning IDs of those that accepted."""
         provider_ids: set[str] = set()
+        # Bound each provider's start_analysis: AudioBuffer.get_buffer awaits this
+        # synchronously during playback setup, so a hung provider (torch model
+        # preload thrashing, slow network handshake, etc.) would otherwise block
+        # the first chunk indefinitely.
         for provider in providers:
             try:
-                if await provider.start_analysis(
-                    session_id=session_key,
-                    streamdetails=streamdetails,
-                    audio_format=audio_format,
-                ):
-                    provider_ids.add(provider.instance_id)
+                accepted = await asyncio.wait_for(
+                    provider.start_analysis(
+                        session_id=session_key,
+                        streamdetails=streamdetails,
+                        audio_format=audio_format,
+                    ),
+                    timeout=START_ANALYSIS_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                self.logger.warning(
+                    "Provider %s start_analysis timed out after %ss; skipping",
+                    provider.name,
+                    START_ANALYSIS_TIMEOUT_SECONDS,
+                )
+                continue
             except Exception as err:
                 self.logger.warning(
                     "Failed to start analysis on provider %s: %s", provider.name, err
                 )
+                continue
+            if accepted:
+                provider_ids.add(provider.instance_id)
         return provider_ids
 
     def _finalize_providers(self, session_key: str) -> None:

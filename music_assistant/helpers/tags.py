@@ -39,6 +39,13 @@ LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.tags")
 # artists actually containing a slash in the name, such as AC/DC
 TAG_SPLITTER = ";"
 
+# Outer cap on the synchronous ffprobe call inside parse_tags. The upstream
+# caller often wraps the async wrapper in asyncio.wait_for, but that only
+# cancels the await, not the executor thread running subprocess.check_output —
+# so a wedged ffprobe would leak threads until the pool saturates. 30s is well
+# above the worst case for a healthy file and short enough to bound damage.
+PARSE_TAGS_TIMEOUT_SECONDS = 30
+
 
 def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
     """Return a tuple with all empty values removed."""
@@ -635,13 +642,13 @@ class AudioTags:
         """Per-track measured Dynamic Range (DR14) for this audio file.
 
         Reads the DYNAMIC_RANGE file tag written by the upstream tag writer when
-        audio analysis is enabled. Falls back to a few legacy bare-DR conventions
-        (foobar2000 / TT DR Meter) so older files still expose a usable value.
-        Album-scope DR is exposed separately on `album_dynamic_range`.
+        audio analysis is enabled. Falls back to the bare ``DR`` convention so
+        older files still expose a usable per-track value. ``DR_ALBUM`` is NOT
+        a per-track value (foobar2000 / TT DR Meter stamp it identically on
+        every track of an album) and is exposed via ``album_dynamic_range``.
         """
         for key in (
             "dynamicrange",  # DYNAMIC_RANGE (per-track, ffmpeg+numpy DR14)
-            "dralbum",  # legacy foobar alt (track-only files sometimes use this)
             "dr",  # legacy bare DR
         ):
             if (val := _parse_float_tag(self.tags.get(key))) is not None:
@@ -652,11 +659,15 @@ class AudioTags:
     def album_dynamic_range(self) -> float | None:
         """Album-scope measured DR (mean of measured track DRs).
 
-        Reads the ALBUM_DYNAMIC_RANGE file tag, which the upstream tag writer
-        stamps onto every track of an album so any track read produces the same
-        album-level value.
+        Reads the ALBUM_DYNAMIC_RANGE file tag the upstream tag writer stamps
+        onto every track of an album, with a fallback to ``DR_ALBUM`` for files
+        tagged the foobar2000 way (where the album-scope number is stamped on
+        every track under that key).
         """
-        return _parse_float_tag(self.tags.get("albumdynamicrange"))
+        for key in ("albumdynamicrange", "dralbum"):
+            if (val := _parse_float_tag(self.tags.get(key))) is not None:
+                return val
+        return None
 
     @property
     def critical_reception(self) -> CriticalReception | None:
@@ -826,7 +837,12 @@ def parse_tags(
         input_file,
     )
     try:
-        res = subprocess.check_output(args)  # noqa: S603
+        # Bound the subprocess so a wedged ffprobe (malformed media, server-side
+        # stall when input_file is a URL) can't leak the worker thread. Without
+        # the timeout, `asyncio.wait_for` upstream can cancel its await but the
+        # underlying executor thread keeps running forever, eventually
+        # saturating the default thread pool.
+        res = subprocess.check_output(args, timeout=PARSE_TAGS_TIMEOUT_SECONDS)  # noqa: S603
         data = json.loads(res)
         if error := data.get("error"):
             raise InvalidDataError(error["string"])
@@ -865,6 +881,13 @@ def parse_tags(
             with suppress(KeyError):
                 error_msg = f"{error_msg} ({err_details['error']['string']})"
         raise InvalidDataError(error_msg) from err
+    except subprocess.TimeoutExpired as err:
+        # check_output kills the child on timeout (since 3.6+). Surface as
+        # InvalidDataError so callers' standard error handling kicks in instead
+        # of a raw TimeoutExpired bubbling through.
+        raise InvalidDataError(
+            f"ffprobe timed out after {PARSE_TAGS_TIMEOUT_SECONDS}s parsing {input_file}"
+        ) from err
     except (KeyError, ValueError, JSONDecodeError, InvalidDataError) as err:
         try:
             msg = f"Unable to retrieve info for {input_file}: {err!s}"

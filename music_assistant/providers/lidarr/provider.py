@@ -61,6 +61,24 @@ class LidarrProvider(PluginProvider):
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
 
+    def _sanitized_url(self) -> str:
+        """Return the configured music-rater URL with any userinfo stripped.
+
+        urlparse(url).netloc keeps the `user:pass@` portion in front of the
+        host, so logging or toasting the raw URL / netloc would leak embedded
+        credentials. Reassemble as scheme://host[:port] for user-visible
+        output.
+        """
+        url = str(self.config.get_value(CONF_URL) or "")
+        parsed = urlparse(url)
+        if not parsed.hostname:
+            return url
+        host = parsed.hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        scheme = parsed.scheme or "http"
+        return f"{scheme}://{host}"
+
     async def loaded_in_mass(self) -> None:
         """Register the WebSocket command and probe music-rater for connectivity.
 
@@ -81,7 +99,7 @@ class LidarrProvider(PluginProvider):
             self.logger.warning(
                 "music-rater at %s unreachable on load: %s. The 'Add to Lidarr' "
                 "action will surface this error on first use.",
-                self.config.get_value(CONF_URL),
+                self._sanitized_url(),
                 err,
             )
 
@@ -189,7 +207,9 @@ class LidarrProvider(PluginProvider):
             # not trip MA's framework-level provider-down retry path.
             raise MusicRaterError(f"music-rater reported {errors} Lidarr error(s): {err_log}")
         if skipped > 0:
-            base = str(self.config.get_value(CONF_URL) or "").rstrip("/")
+            # Use the sanitized URL helper so any embedded credentials in CONF_URL
+            # don't end up in the toast shown to admins.
+            base = self._sanitized_url().rstrip("/")
             raise InvalidDataError(
                 f"Lidarr couldn't match {artist_name!r} - {album_name!r}. "
                 f"Resolve manually at {base}/lidarr/unmatched."
@@ -225,6 +245,12 @@ class LidarrProvider(PluginProvider):
         URL's host:port — that's the only stable identity we have for the
         upstream service.
         """
+        # urlparse(url).netloc keeps userinfo (`user:pass@host:port`); use
+        # hostname[:port] so the toast can never leak credentials.
         url = str(self.config.get_value(CONF_URL) or "")
-        host = urlparse(url).netloc
-        return host or self.name
+        parsed = urlparse(url)
+        if parsed.hostname:
+            return (
+                f"{parsed.hostname}:{parsed.port}" if parsed.port is not None else parsed.hostname
+            )
+        return self.name

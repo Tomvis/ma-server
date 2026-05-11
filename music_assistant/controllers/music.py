@@ -1015,6 +1015,27 @@ class MusicController(CoreController):
         await self.albums.set_listen_later(candidate.item_id, True)
         return await self.albums.get_library_item(candidate.item_id)
 
+    @staticmethod
+    def _name_matches_search(query: str, candidate: str) -> bool:
+        """Asymmetric album-name match for the free-text resolver.
+
+        loose_compare_strings is symmetric — either side may be substring of the
+        other — which lets a short reissue name like "OK Computer" beat a more
+        specific user query like "OK Computer OKNOTOK 1997 2017" (the candidate
+        is a substring of the query). For free-text resolver semantics only the
+        query → candidate direction is meaningful: the user is asking for a
+        specific edition / version and the catalog name should *contain* what
+        they typed.
+        """
+        if len(query) <= 3 or len(candidate) <= 3:
+            return compare_strings(query, candidate, strict=True)
+        word_count = len(query.strip().split(" "))
+        if word_count == 1 and len(query) < 10:
+            return compare_strings(query, candidate, strict=False)
+        query_safe = create_safe_string(query)
+        candidate_safe = create_safe_string(candidate)
+        return bool(query_safe) and query_safe in candidate_safe
+
     async def _resolve_album_by_artist_title(self, artist: str, album: str) -> Album:
         """Find the best provider album match for free-text artist + album.
 
@@ -1070,13 +1091,20 @@ class MusicController(CoreController):
                 continue
             _prov, results = entry
             for result_album in results.albums:
+                # SearchResults.albums is typed Sequence[Album | ItemMapping];
+                # ItemMapping has no `.artists` field, so accessing it below would
+                # AttributeError out of the entire resolver. Skip minimal results —
+                # a provider that emits ItemMappings here just doesn't carry enough
+                # info for our match logic.
+                if not isinstance(result_album, Album):
+                    continue
                 key = (result_album.provider, result_album.item_id)
                 if key in seen:
                     continue
                 seen.add(key)
                 if not result_album.artists:
                     continue
-                if not loose_compare_strings(album, result_album.name):
+                if not self._name_matches_search(album, result_album.name):
                     continue
                 if not any(loose_compare_strings(artist, a.name) for a in result_album.artists):
                     continue
@@ -1137,11 +1165,36 @@ class MusicController(CoreController):
         # changes that landed between our entry and now (a concurrent sync
         # could have flipped in_library / favorite / playlog).
         library_item = await self.albums.get_library_item(library_item_id)
+        # If a concurrent add_album_to_listen_later flipped listen_later back to
+        # True between our set_listen_later(False) and this re-fetch, respect
+        # that — deleting the row would silently destroy the concurrent add and
+        # its user-supplied CR payload.
+        if getattr(library_item, "listen_later", False):
+            return
+        # `play_count` and `last_played` are on the albums DB row but not on the
+        # Album dataclass (mashumaro drops unknown keys on from_dict). Query the
+        # row directly so play history actually anchors the album as documented.
+        # database.get_row returns an sqlite3.Row which is dict-subscriptable
+        # but lacks .get(), so wrap each lookup defensively.
+        playlog_row = await self.mass.music.database.get_row(
+            DB_TABLE_ALBUMS,
+            {"item_id": int(library_item_id)},
+        )
+
+        def _row_int(row: Any, column: str) -> int:
+            try:
+                return int(row[column] or 0)
+            except (KeyError, IndexError, TypeError, ValueError):
+                return 0
+
+        has_play_history = bool(playlog_row) and (
+            _row_int(playlog_row, "play_count") > 0
+            or _row_int(playlog_row, "last_played") > 0
+        )
         has_anchor = (
             library_item.favorite
             or any(pm.in_library for pm in library_item.provider_mappings)
-            or bool(getattr(library_item, "play_count", 0))
-            or bool(getattr(library_item, "last_played", 0))
+            or has_play_history
         )
         if not has_anchor:
             await self.albums.remove_item_from_library(library_item_id)
@@ -2960,10 +3013,15 @@ class MusicController(CoreController):
             await self._database.execute(
                 f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_set("
                 "metadata, '$.dynamic_range', "
-                "json_extract(metadata, '$.critical_reception.dr')) "
+                "CAST(json_extract(metadata, '$.critical_reception.dr') AS REAL)) "
                 "WHERE json_extract(metadata, '$.critical_reception.dr') IS NOT NULL "
+                "AND typeof(json_extract(metadata, '$.critical_reception.dr')) "
+                "IN ('integer', 'real') "
                 "AND json_extract(metadata, '$.dynamic_range') IS NULL"
             )
+            # Always drop the legacy key, even when the source value was non-numeric
+            # garbage — the canonical $.dynamic_range path is the new home and the
+            # legacy path is no longer read.
             await self._database.execute(
                 f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_remove("
                 "metadata, '$.critical_reception.dr') "

@@ -166,6 +166,16 @@ class MusicRaterClient:
                 "music-rater's Lidarr config is incomplete (URL / API key / "
                 "profile / root folder missing)"
             )
+        # Any other 5xx (500, 504, etc.) means music-rater itself is in trouble —
+        # surface as provider-unavailable so MA's framework-level retry can kick
+        # in. Without this, a generic 500 looks like a per-request app error
+        # (MusicRaterError) and the retry never fires, mismatching the GET path
+        # which raises ProviderUnavailableError on any 5xx.
+        if status >= 500:
+            raise ProviderUnavailableError(
+                f"music-rater POST /albums/{album_id}/lidarr/queue failed "
+                f"(status={status}): {snippet[:200]}"
+            )
         raise MusicRaterError(
             f"POST /albums/{album_id}/lidarr/queue failed (status={status}): {snippet[:200]}"
         )

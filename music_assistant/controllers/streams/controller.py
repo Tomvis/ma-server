@@ -251,7 +251,11 @@ class StreamsController(CoreController):
                 description="Log level for the Smart Fades mixer and analyzer.",
                 options=CONF_ENTRY_LOG_LEVEL.options,
                 default_value="GLOBAL",
-                category="audio_analysis",
+                # The frontend's settings.category translation dict has no
+                # "audio_analysis" key, so vue-i18n would render the literal
+                # string. Use "advanced" until/unless the frontend gains an
+                # audio_analysis translation.
+                category="advanced",
                 advanced=True,
             ),
             ConfigEntry(
@@ -263,7 +267,8 @@ class StreamsController(CoreController):
                 description="Maximum number of tracks analyzed concurrently during the nightly "
                 "background scan. Default 1 (serial). Increase only if your hardware can handle "
                 "concurrent torch/ffmpeg work.",
-                category="audio_analysis",
+                category="advanced",
+                advanced=True,
             ),
         )
 
@@ -326,8 +331,18 @@ class StreamsController(CoreController):
 
     async def close(self) -> None:
         """Cleanup on exit."""
-        await self._audio_analysis.close()
-        await self._server.close()
+        # Both close()s must run; if the AA shutdown raises (e.g. a late-stage
+        # event-loop hiccup) the webserver would otherwise leak its aiohttp
+        # routes and sockets on restart. Suppress and log instead of letting
+        # one failure mask the other.
+        try:
+            await self._audio_analysis.close()
+        except Exception as err:
+            self.logger.warning("AudioAnalysis close raised: %s", err, exc_info=err)
+        try:
+            await self._server.close()
+        except Exception as err:
+            self.logger.warning("Streamserver close raised: %s", err, exc_info=err)
 
     async def resolve_stream_url(self, player_id: str, media: PlayerMedia) -> str:
         """

@@ -1507,7 +1507,12 @@ class StreamsAudio:
 
         # Yield the first WARMUP_DURATION worth of audio immediately so playback starts
         # right away. After that, start accumulating the crossfade holdback buffer.
+        # Clamp to crossfade_buffer_size: on short tracks the crossfade buffer wants
+        # less than 8s and the warmup would otherwise starve fade_out_data, producing
+        # a misaligned end-of-track crossfade.
         warmup_size = int(pcm_format.pcm_sample_size * WARMUP_DURATION)
+        if crossfade_buffer_size > 0:
+            warmup_size = min(warmup_size, crossfade_buffer_size)
         warmup_bytes = 0
         total_chunks_received = 0
         async for chunk in self.get_queue_item_stream(
@@ -1829,7 +1834,12 @@ class StreamsAudio:
             crossfade_buffer_size = int(pcm_format.pcm_sample_size * crossfade_buffer_duration)
             # Round down to nearest frame boundary
             crossfade_buffer_size = (crossfade_buffer_size // frame_size) * frame_size
+            # Clamp warmup to crossfade_buffer_size so short tracks (or aggressive
+            # smart_fades clamping) still have enough audio left to fill the
+            # crossfade buffer at end-of-track.
             warmup_size = int(pcm_format.pcm_sample_size * WARMUP_DURATION)
+            if crossfade_buffer_size > 0:
+                warmup_size = min(warmup_size, crossfade_buffer_size)
 
             bytes_written = 0
             crossfade_buffer = b""

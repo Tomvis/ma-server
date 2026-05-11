@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import VolumeNormalizationMode
+from music_assistant_models.enums import StreamType, VolumeNormalizationMode
 
 from music_assistant.constants import LOUDNESS_MEASUREMENT_MIN_LUFS
 from music_assistant.helpers.ffmpeg import FFMpeg
@@ -118,23 +118,27 @@ class LoudnessAnalysisProvider(AudioAnalysisProvider):
         if not data:
             return None
 
-        await self._send_eof(data)
+        # try/finally guarantees ffmpeg.close() on every exit path, including
+        # CancelledError during shutdown. close() also awaits the stderr
+        # reader, so the log_history is fully populated before we parse.
         try:
-            await asyncio.wait_for(data.ffmpeg.wait(), timeout=_FFMPEG_FINALIZE_TIMEOUT_SECONDS)
-        except TimeoutError:
-            self.logger.warning(
-                "Loudness analysis ffmpeg did not exit within %ss after EOF; killing",
-                _FFMPEG_FINALIZE_TIMEOUT_SECONDS,
-            )
-            await data.ffmpeg.close()
-            return None
-        except Exception as err:
-            self.logger.debug("Loudness analysis ffmpeg failed: %s", err)
-            await data.ffmpeg.close()
-            return None
+            await self._send_eof(data)
+            try:
+                await asyncio.wait_for(data.ffmpeg.wait(), timeout=_FFMPEG_FINALIZE_TIMEOUT_SECONDS)
+            except TimeoutError:
+                self.logger.warning(
+                    "Loudness analysis ffmpeg did not exit within %ss after EOF; killing",
+                    _FFMPEG_FINALIZE_TIMEOUT_SECONDS,
+                )
+                return None
+            except Exception as err:
+                self.logger.debug("Loudness analysis ffmpeg failed: %s", err)
+                return None
+        finally:
+            with contextlib.suppress(Exception):
+                await data.ffmpeg.close()
 
         metrics = _parse_ebur128_metrics(data.ffmpeg.log_history)
-        await data.ffmpeg.close()
 
         session = self._sessions.get(session_id)
         if session is None:
@@ -193,6 +197,8 @@ class LoudnessAnalysisProvider(AudioAnalysisProvider):
         analysis: AudioAnalysisData,
     ) -> None:
         """Write the ReplayGain track-gain tag back to the source file when configured."""
+        if streamdetails.stream_type != StreamType.LOCAL_FILE:
+            return
         if not isinstance(streamdetails.path, str) or not streamdetails.path:
             return
         if not self.config.get_value(CONF_WRITE_REPLAYGAIN_TAGS):

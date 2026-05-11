@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 from asyncio import TaskGroup
@@ -399,15 +400,18 @@ class OpenSonicProvider(MusicProvider):
         :param sonic_album: Pre-fetched album record; lets callers that already paid
             for ``conn.get_album`` skip the round-trip on cache miss.
         """
+        # Bind the cache key to the configured server URL so a config edit that
+        # repoints this provider at a different Subsonic server doesn't return
+        # stale CR/DR for an album_id that happens to collide.
+        cache_key = f"{self._cr_cache_namespace()}:{prov_album_id}"
         cached = await self.mass.cache.get(
-            key=prov_album_id,
+            key=cache_key,
             provider=self.instance_id,
             category=CACHE_CATEGORY_CRITICAL_RECEPTION,
             default=None,
         )
         if cached is not None:
             return _deserialize_cr_cache_entry(cached)
-        extracted: tuple[CriticalReception | None, float | None] | None = None
         if sonic_album is None:
             try:
                 sonic_album = await self.conn.get_album(prov_album_id)
@@ -418,22 +422,49 @@ class OpenSonicProvider(MusicProvider):
             # (user uploads tracks, server comes back) and a 24h negative cache
             # would block a follow-up sync from re-probing.
             return None
-        # Try a handful of tracks: the first one may be a bonus / hidden track
-        # whose tag writer skipped AMG/TPS/DR keys even when the album as a
-        # whole carries them. Stop as soon as we get a signal.
+        # Try a handful of tracks and OR-merge their signals. A bonus / hidden
+        # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
+        # later track carries DR but no CR — break out only once both have been
+        # observed (or probe budget is exhausted) so neither signal is lost.
+        cr: CriticalReception | None = None
+        album_dr: float | None = None
         for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
             probe = await self._extract_critical_reception_from_song(sonic_song.id)
-            if probe is not None and (probe[0] is not None or probe[1] is not None):
-                extracted = probe
+            if probe is None:
+                continue
+            probe_cr, probe_dr = probe
+            if cr is None and probe_cr is not None:
+                cr = probe_cr
+            if album_dr is None and probe_dr is not None:
+                album_dr = probe_dr
+            if cr is not None and album_dr is not None:
                 break
+        extracted: tuple[CriticalReception | None, float | None] | None = (
+            (cr, album_dr) if (cr is not None or album_dr is not None) else None
+        )
         await self.mass.cache.set(
-            key=prov_album_id,
+            key=cache_key,
             data=_serialize_cr_cache_entry(extracted),
             provider=self.instance_id,
             category=CACHE_CATEGORY_CRITICAL_RECEPTION,
             expiration=CRITICAL_RECEPTION_CACHE_TTL,
         )
         return extracted
+
+    def _cr_cache_namespace(self) -> str:
+        """Stable, URL-derived prefix for the CR cache key.
+
+        Without this prefix the cache key is just ``prov_album_id`` — a config
+        edit that swings this provider over to a different Subsonic server
+        keeps the same MA provider instance_id but the album IDs no longer
+        refer to the same albums, so the cache returns stale CR/DR for the
+        new server. Hashing the URL bumps the namespace on any URL change.
+        """
+        url = str(self.config.get_value(CONF_BASE_URL) or "")
+        if not url:
+            return "default"
+        # md5 is fine here — this is a cache namespace, not a security boundary.
+        return hashlib.md5(url.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
     async def _extract_critical_reception_from_song(
         self, song_id: str
@@ -456,11 +487,16 @@ class OpenSonicProvider(MusicProvider):
         # here would orphan a freshly-created file whenever the caller's task is
         # cancelled mid-await, because the executor keeps running but the
         # outer try/finally hasn't been entered yet.
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
-        bytes_read = 0
+        #
+        # The aiohttp ClientResponse must be released even if mkstemp raises
+        # (OSError on tmpdir EACCES / ENFILE / disk full). Wrap the whole flow
+        # in `async with resp:` so a mkstemp failure still triggers __aexit__.
+        tmp_path: str | None = None
         try:
-            try:
-                async with resp:
+            async with resp:
+                tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
+                bytes_read = 0
+                try:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         if not chunk:
                             break
@@ -472,8 +508,8 @@ class OpenSonicProvider(MusicProvider):
                         bytes_read += len(write_chunk)
                         if bytes_read >= CRITICAL_RECEPTION_PROBE_BYTES:
                             break
-            finally:
-                await asyncio.to_thread(os.close, tmp_fd)
+                finally:
+                    await asyncio.to_thread(os.close, tmp_fd)
             if bytes_read == 0:
                 return None
             try:
@@ -485,7 +521,8 @@ class OpenSonicProvider(MusicProvider):
                 return None
             return tags.critical_reception, tags.album_dynamic_range
         finally:
-            await asyncio.to_thread(_silent_unlink, tmp_path)
+            if tmp_path is not None:
+                await asyncio.to_thread(_silent_unlink, tmp_path)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
         """Provide a generator for library playlists."""

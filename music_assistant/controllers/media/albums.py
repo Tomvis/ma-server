@@ -519,6 +519,12 @@ class AlbumsController(MediaControllerBase[Album]):
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
         tps_untagged: bool | None = None,
+        # Caller's effective page-size hint. library_items's artist top-up only
+        # fires on page 1 when page 1 has < cutoff hits AND remaining_limit > 0.
+        # When the caller is paging at < cutoff items per page, the artist-only
+        # delta is never visible — gating the union below on min(cutoff, limit)
+        # keeps count parity with what the user actually sees.
+        limit: int | None = None,
         # Accept the legacy `*_only` names so older clients keep working without
         # an immediate API contract bump. These are normalized into the boolean
         # filters below; new callers should use `favorite=` / `listen_later=`.
@@ -631,7 +637,14 @@ class AlbumsController(MediaControllerBase[Album]):
             extra_parts=["albums.search_name LIKE :search"],
             extra_params_extra=search_params,
         )
-        if title_count >= _SEARCH_ARTIST_PASS_CUTOFF:
+        # `limit` mirrors library_items' remaining_limit: the artist top-up never
+        # fires once page 1 is already full of title hits, so a caller paging at
+        # limit < cutoff never sees artist-only matches. Cap the cutoff to limit
+        # so the count agrees with what the user actually scrolls through.
+        effective_cutoff = (
+            min(_SEARCH_ARTIST_PASS_CUTOFF, limit) if limit else _SEARCH_ARTIST_PASS_CUTOFF
+        )
+        if title_count >= effective_cutoff:
             return title_count
         return await _count(
             extra_parts=[
@@ -859,13 +872,17 @@ class AlbumsController(MediaControllerBase[Album]):
         # check and either keep the incoming CR or restore stored_cr.
         stored_cr = cur_item.metadata.critical_reception if cur_item.metadata else None
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
-        if not overwrite and update.metadata is not None:
+        # Apply the strict CR rule on BOTH branches. On the merge branch (overwrite
+        # False) the lenient model rule may have already swapped CR; on the wholesale
+        # branch (overwrite True, e.g. refresh_item) the update payload's CR replaces
+        # stored CR wholesale even when it's empty / less rich, silently wiping
+        # filesystem-tag-derived CR. Either way, restore stored_cr when the strict
+        # rule says the incoming payload isn't richer.
+        if update.metadata is not None:
             incoming_cr = update.metadata.critical_reception
             if _critical_reception_is_richer(incoming_cr, stored_cr):
                 metadata.critical_reception = incoming_cr
             else:
-                # Strict rule rejects — undo any (lenient) replacement model.update()
-                # may have done. Safe no-op when CR was untouched.
                 metadata.critical_reception = stored_cr
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
@@ -898,19 +915,16 @@ class AlbumsController(MediaControllerBase[Album]):
         if overwrite:
             provider_mappings: Iterable[ProviderMapping] = update.provider_mappings
         else:
-            # Merge by (provider_instance, item_id). ProviderMapping equality
-            # is keyed on that pair, so a plain set union keeps the first-
-            # inserted entry on collision — which means an `update` payload
-            # carrying in_library=False would silently downgrade an
-            # in_library=True written to `cur_item` by a concurrent sync
-            # (e.g. listen-later add running while library sync flips the
-            # same album to in_library=True). Promote in_library=True from
-            # either side on collision so the merge can only go True→True
-            # or False→True, never True→False.
+            # Merge by (provider_instance, item_id). Seed from the update side so
+            # refreshed fields (available, url, audio_format, details, is_unique)
+            # actually land in the DB; layer cur_item's mappings on top for keys
+            # update doesn't know about, and promote in_library=True from cur on
+            # collision so a concurrent in_library flip can never get downgraded
+            # to False by an update payload that hasn't seen it yet.
             merged: dict[tuple[str, str], ProviderMapping] = {
-                (pm.provider_instance, pm.item_id): pm for pm in cur_item.provider_mappings
+                (pm.provider_instance, pm.item_id): pm for pm in update.provider_mappings
             }
-            for pm in update.provider_mappings:
+            for pm in cur_item.provider_mappings:
                 key = (pm.provider_instance, pm.item_id)
                 existing_pm = merged.get(key)
                 if existing_pm is None:

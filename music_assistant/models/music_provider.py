@@ -99,8 +99,24 @@ def _field_is_populated(value: Any) -> bool:
 
 
 def _sources_by_name(sources: Any) -> dict[str, Any]:
-    """Map source identifier -> ReviewSourceEntry for a sources iterable."""
-    return {getattr(s, "source", ""): s for s in (sources or []) if s is not None}
+    """Map source identifier -> ReviewSourceEntry for a sources iterable.
+
+    Drops empty / blank source names. On duplicate source names (which the
+    downstream SQL filters assume away), keep the FIRST entry — the strict
+    richness check then compares each cur entry against the same stable
+    reference. A dict comprehension would otherwise keep the *last* entry,
+    making the richness check asymmetric on inputs that violate the
+    "one entry per source" invariant.
+    """
+    result: dict[str, Any] = {}
+    for s in sources or []:
+        if s is None:
+            continue
+        name = getattr(s, "source", "") or ""
+        if not name or name in result:
+            continue
+        result[name] = s
+    return result
 
 
 def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
@@ -108,17 +124,28 @@ def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
 
     A field that's populated on the stored copy must still be populated on the
     incoming one — losing a rating, an accolade label, etc. would erase data on
-    the caller's wholesale `metadata.critical_reception = new` assignment.
+    the caller's wholesale `metadata.critical_reception = new` assignment. For
+    list-valued fields (types, labels, authors) the new side must additionally
+    be a superset of cur's elements — losing a label X out of [X, Y] while
+    keeping Y still drops data on the wholesale replace, even though the field
+    technically stays "populated".
     """
     if cur_source is None:
         return True
     if new_source is None:
         return False
     for field in _REVIEW_SOURCE_FIELDS:
-        if _field_is_populated(getattr(cur_source, field, None)) and not _field_is_populated(
-            getattr(new_source, field, None)
-        ):
+        cur_val = getattr(cur_source, field, None)
+        new_val = getattr(new_source, field, None)
+        if not _field_is_populated(cur_val):
+            continue
+        if not _field_is_populated(new_val):
             return False
+        # List-valued fields: cur's element set must survive on new.
+        if isinstance(cur_val, list | tuple | set):
+            new_elements = set(new_val) if isinstance(new_val, list | tuple | set) else set()
+            if not set(cur_val).issubset(new_elements):
+                return False
     return True
 
 
@@ -1073,6 +1100,27 @@ class MusicProvider(Provider):
                         library_item.metadata.critical_reception = (
                             prov_item.metadata.critical_reception
                         )
+                    library_item = await self.mass.music.albums.update_item_in_library(
+                        library_item.item_id, library_item
+                    )
+                elif (
+                    prov_item.metadata
+                    and prov_item.metadata.dynamic_range is not None
+                    and prov_item.metadata.dynamic_range
+                    != (
+                        library_item.metadata.dynamic_range
+                        if library_item.metadata is not None
+                        else None
+                    )
+                ):
+                    # Provider has surfaced a refreshed measured DR (e.g. OpenSubsonic
+                    # just ffprobed an updated ALBUM_DYNAMIC_RANGE tag, or filesystem
+                    # re-scanned tracks). MediaItemMetadata.update() skips None values
+                    # but also skips populated non-None scalars on the cur side, so the
+                    # new DR would otherwise never overwrite an older one. Do the same
+                    # in-place override the CR arm above does.
+                    if library_item.metadata is not None:
+                        library_item.metadata.dynamic_range = prov_item.metadata.dynamic_range
                     library_item = await self.mass.music.albums.update_item_in_library(
                         library_item.item_id, library_item
                     )
