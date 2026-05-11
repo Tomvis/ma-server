@@ -429,9 +429,7 @@ class AudioAnalysisController:
                             item_id, MediaType.TRACK
                         )
                     except Exception as err:
-                        self.logger.debug(
-                            "Skipping %s: stream details failed: %s", item_id, err
-                        )
+                        self.logger.debug("Skipping %s: stream details failed: %s", item_id, err)
                         continue
 
                     if streamdetails.stream_type != StreamType.LOCAL_FILE:
@@ -575,7 +573,12 @@ class AudioAnalysisController:
                 # exception path leaves `completed` False and we cancel below.
                 completed = True
         finally:
-            await audio_source.aclose()
+            # Suppress aclose errors so a teardown failure (e.g. the underlying
+            # ffmpeg subprocess died mid-stream) doesn't mask whatever caused the
+            # loop to exit. The leak is what aclose was here to prevent in the
+            # first place — if it can't run, the GC hook still eventually fires.
+            with contextlib.suppress(Exception):
+                await audio_source.aclose()
         if session_key not in self._active_sessions:
             return
         if completed:

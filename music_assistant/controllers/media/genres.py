@@ -388,6 +388,8 @@ class GenreController(MediaControllerBase[Genre]):
         search: str | None = None,
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        hide_empty: bool | None = None,
+        media_type: MediaType | None = None,
         favorite_only: bool = False,
         **kwargs: Any,
     ) -> int:
@@ -396,6 +398,11 @@ class GenreController(MediaControllerBase[Genre]):
         Overridden to skip the in_library_only provider_mappings JOIN that the
         base applies — genres are library-only items and never carry an
         in_library=1 provider mapping, so the base JOIN would return 0.
+
+        Mirrors :meth:`library_items` filtering so count and list track 1-1:
+        the ``hide_empty`` / ``media_type`` flags drop unmapped or
+        wrong-media-type genres from the count, otherwise it would over-report
+        relative to what the UI actually shows.
         """
         if favorite_only and favorite is None:
             favorite = True
@@ -412,6 +419,23 @@ class GenreController(MediaControllerBase[Genre]):
             provider_filter=None,
             in_library_only=False,
         )
+        # Reproduce library_items' default-vs-empty / media-type filtering so
+        # the count matches what gets listed.
+        if media_type is not None:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            query_parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
+                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
+                "AND gm_mt.media_type = :filter_media_type)"
+            )
+            query_params["filter_media_type"] = media_type.value
+        elif hide_empty is None:
+            query_parts.append(f"{self.db_table}.translation_key IS NOT NULL")
+        elif hide_empty:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            query_parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
+            )
         sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
         if join_parts:
             sql_query += f" {' '.join(join_parts)}"

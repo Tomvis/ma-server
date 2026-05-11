@@ -58,9 +58,27 @@ _LABEL_KIND_PATTERNS: dict[str, str] = {
 }
 
 
+def _coerce_int_list(values: list[Any] | None) -> list[int]:
+    """Coerce a heterogeneous list to ints; drop entries that won't survive int().
+
+    The api command parses these as ``list[int]``, but the JSON deserializer
+    preserves stray ``null`` / non-numeric entries; without this filter a
+    malformed payload would raise out of the bucket-clause builders.
+    """
+    result: list[int] = []
+    for v in values or ():
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            result.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def _amg_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Build the WHERE fragment for AMG rating buckets (1..5; floor(rating) == N)."""
-    int_values = sorted({int(v) for v in values if 1 <= int(v) <= 5})
+    int_values = sorted({v for v in _coerce_int_list(values) if 1 <= v <= 5})
     if not int_values:
         return "", {}
     params = {f"{param_prefix}_{i}": v for i, v in enumerate(int_values)}
@@ -75,7 +93,7 @@ def _amg_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str
 
 def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Build WHERE fragment for TPS rating buckets (selectors 1,3,5,7,9 → [N, N+2))."""
-    valid = sorted({int(v) for v in values if int(v) in (1, 3, 5, 7, 9)})
+    valid = sorted({v for v in _coerce_int_list(values) if v in (1, 3, 5, 7, 9)})
     if not valid:
         return "", {}
     bucket_clauses: list[str] = []
@@ -241,27 +259,30 @@ class AlbumsController(MediaControllerBase[Album]):
         "listen_later_added_at_desc": "listen_later_added_at DESC NULLS LAST",
         # `dr` sorts on the canonical (measured) album dynamic range — not the
         # AMG-review-reported value, which lives at $.critical_reception.amg_dr.
-        "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC",
-        "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC",
+        # NULLS LAST so albums without a measured DR don't float to the top of
+        # an ASC sort (a long tail of un-analyzed albums would otherwise hide
+        # the entries the user actually wants to see).
+        "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC NULLS LAST",
+        "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC NULLS LAST",
         "amg_rating": (
             "(SELECT json_extract(value, '$.rating') "
             "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC"
+            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC NULLS LAST"
         ),
         "amg_rating_desc": (
             "(SELECT json_extract(value, '$.rating') "
             "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC"
+            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC NULLS LAST"
         ),
         "tps_rating": (
             "(SELECT json_extract(value, '$.rating') "
             "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC"
+            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC NULLS LAST"
         ),
         "tps_rating_desc": (
             "(SELECT json_extract(value, '$.rating') "
             "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC"
+            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC NULLS LAST"
         ),
     }
 
@@ -505,6 +526,36 @@ class AlbumsController(MediaControllerBase[Album]):
         query_params: dict[str, Any] = {}
         query_parts: list[str] = []
         join_parts: list[str] = []
+        # Mirror library_items' search semantics: "Artist - Album" splits into
+        # artist+title (AND, matched via JOIN), and bare-text matches album
+        # name OR album-artist name (the same union library_items achieves by
+        # appending an artist-match pass to a short title-match result set).
+        # Without this, count and list diverge for any search containing " - ".
+        search_handled = False
+        if search and " - " in search:
+            artist_str, title_str = search.split(" - ", 1)
+            title_safe = create_safe_string(title_str, True, True)
+            artist_safe = create_safe_string(artist_str, True, True)
+            query_parts.append("albums.search_name LIKE :search_title")
+            query_params["search_title"] = f"%{title_safe}%"
+            join_parts.append(
+                "JOIN album_artists ON album_artists.album_id = albums.item_id "
+                "JOIN artists ON artists.item_id = album_artists.artist_id "
+                "AND artists.search_name LIKE :search_artist"
+            )
+            query_params["search_artist"] = f"%{artist_safe}%"
+            search_handled = True
+        elif search:
+            search_safe = create_safe_string(search, True, True)
+            query_params["search"] = f"%{search_safe}%"
+            query_parts.append(
+                "(albums.search_name LIKE :search "
+                "OR EXISTS(SELECT 1 FROM album_artists "
+                "JOIN artists ON artists.item_id = album_artists.artist_id "
+                "WHERE album_artists.album_id = albums.item_id "
+                "AND artists.search_name LIKE :search))"
+            )
+            search_handled = True
         # in_library JOIN matches library_items: listen-later entries intentionally
         # don't flip in_library, so the JOIN is dropped when the caller is asking
         # for the listen-later subset.
@@ -514,7 +565,9 @@ class AlbumsController(MediaControllerBase[Album]):
             query_params=query_params,
             join_parts=join_parts,
             favorite=favorite,
-            search=self._preprocess_search(search, query_params),
+            # _apply_filters' default search clause is title-only; we've already
+            # built a richer one above when search was supplied.
+            search=None if search_handled else self._preprocess_search(search, query_params),
             genre_ids=self._preprocess_genre_ids(genre),
             provider_filter=self._ensure_provider_filter(provider),
             in_library_only=in_library_only,

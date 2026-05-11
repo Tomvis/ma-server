@@ -115,7 +115,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 43
+DB_SCHEMA_VERSION: Final[int] = 44
 
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
@@ -997,6 +997,15 @@ class MusicController(CoreController):
         # under the richer-wins rule. Skipping the call for a candidate already
         # resolved as `library://` would silently drop the supplied CR payload.
         candidate = await self.albums.add_item_to_library(candidate)
+        # Re-check in_library on the freshly persisted row: between the pre-flight
+        # check above and add_item_to_library, a concurrent library sync could
+        # have flipped in_library=True. If so, refuse rather than create a row
+        # that ends up in both views.
+        if any(pm.in_library for pm in candidate.provider_mappings):
+            raise InvalidDataError(
+                f"Album {candidate.name!r} is already in your library "
+                "(added concurrently); listen-later not applied"
+            )
         await self.albums.set_listen_later(candidate.item_id, True)
         return await self.albums.get_library_item(candidate.item_id)
 
@@ -1007,7 +1016,11 @@ class MusicController(CoreController):
         only candidates whose name and artist loosely match the inputs (so
         "The Beatles - Abbey Road" still matches a "Beatles - Abbey Road
         (Remastered)" hit). Streaming-provider hits sort first so the
-        resulting listen-later entry stays playable.
+        resulting listen-later entry stays playable whenever a streaming
+        catalog has the album; if only local/filesystem providers match,
+        the picked candidate may become unplayable later (file moved /
+        deleted / volume offline). Callers that require playability should
+        verify ``result.is_streaming_provider`` on their side.
 
         :param artist: Artist name to match against album.artists[*].name.
         :param album: Album title to match against album.name.
@@ -1049,14 +1062,16 @@ class MusicController(CoreController):
 
         # Prefer Tidal first (operator's primary streaming source), then any
         # other streaming provider, then everything else. Sort is stable, so
-        # within a tier we keep the discovery order.
+        # within a tier we keep the discovery order. `is_streaming_provider`
+        # lives on MusicProvider only, so guard with isinstance to avoid the
+        # silently-false getattr fallback hiding misclassification bugs.
         def _tier(a: Album) -> int:
             prov = self.mass.get_provider(a.provider)
             if prov is None:
                 return 2
             if prov.domain == "tidal":
                 return 0
-            if getattr(prov, "is_streaming_provider", False):
+            if isinstance(prov, MusicProvider) and prov.is_streaming_provider:
                 return 1
             return 2
 
@@ -2874,6 +2889,29 @@ class MusicController(CoreController):
                 except Exception as err:
                     if "duplicate column" not in str(err):
                         raise
+
+        if prev_version <= 43:
+            # Earlier rating-branch builds stored album DR under
+            # `$.critical_reception.dr`. The new schema splits that into the
+            # canonical (measured) `$.dynamic_range` and the AMG-review-reported
+            # `$.critical_reception.amg_dr`. Move legacy values to
+            # `$.dynamic_range` so DR filtering/sorting keeps working — the
+            # old payloads were dominated by measured DR. The old key is
+            # dropped only when the destination either gets a value or already
+            # has one, so a measured re-scan from the upstream tag writer
+            # always wins.
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_set("
+                "metadata, '$.dynamic_range', "
+                "json_extract(metadata, '$.critical_reception.dr')) "
+                "WHERE json_extract(metadata, '$.critical_reception.dr') IS NOT NULL "
+                "AND json_extract(metadata, '$.dynamic_range') IS NULL"
+            )
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_remove("
+                "metadata, '$.critical_reception.dr') "
+                "WHERE json_extract(metadata, '$.critical_reception.dr') IS NOT NULL"
+            )
 
         # save changes
         await self._database.commit()
