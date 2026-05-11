@@ -485,6 +485,7 @@ class AlbumsController(MediaControllerBase[Album]):
             for album in await self.get_library_items_by_query(
                 favorite=favorite,
                 search=None,
+                genre_ids=genre,
                 limit=remaining_limit,
                 order_by=order_by,
                 provider_filter=self._ensure_provider_filter(provider),

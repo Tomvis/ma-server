@@ -138,10 +138,18 @@ class MusicRaterClient:
         """
         status, body = await self._request("POST", f"albums/{int(album_id)}/lidarr/queue")
         if status == 200:
-            # An empty 200 body is treated as a successful no-op rather than an
-            # error; _build_result reads counters off the dict and a fully-empty
-            # dict produces a benign "nothing changed" result.
-            return body if isinstance(body, dict) else {}
+            # The queue endpoint is documented to return a LidarrQueueResponse
+            # JSON object with counters. An empty body / non-dict shape means
+            # music-rater violated its own contract; surface that to the user
+            # rather than silently treating it as a benign no-op (which
+            # _build_result would then re-raise as a misleading error anyway).
+            if not isinstance(body, dict):
+                snippet = body if isinstance(body, str) else str(body)[:200]
+                raise MusicRaterError(
+                    f"music-rater POST /albums/{album_id}/lidarr/queue returned "
+                    f"status=200 with no JSON body: {snippet[:200] or '(empty)'}"
+                )
+            return body
         # Per music-rater's documented error surface.
         snippet = body if isinstance(body, str) else str(body)[:200]
         if status == 404:

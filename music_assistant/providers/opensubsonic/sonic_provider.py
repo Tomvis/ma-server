@@ -105,6 +105,11 @@ CRITICAL_RECEPTION_PROBE_TIMEOUT = 12.0
 # CR/DR tags are written to the file once and rarely change; cache the extraction
 # result long enough to amortize across the next several syncs.
 CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
+# How many tracks to ffprobe before giving up. A first track that's a bonus /
+# hidden track may have been written without the album's AMG/TPS/DR tags even
+# when later tracks carry them; sampling a few covers this without blowing up
+# sync cost.
+_CR_PROBE_SONG_ATTEMPTS = 3
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
@@ -408,8 +413,19 @@ class OpenSonicProvider(MusicProvider):
                 sonic_album = await self.conn.get_album(prov_album_id)
             except (ParameterError, DataNotFoundError):
                 sonic_album = None
-        if sonic_album is not None and sonic_album.song:
-            extracted = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
+        if sonic_album is None or not sonic_album.song:
+            # Don't cache "no songs" or "fetch failed" — those states can change
+            # (user uploads tracks, server comes back) and a 24h negative cache
+            # would block a follow-up sync from re-probing.
+            return None
+        # Try a handful of tracks: the first one may be a bonus / hidden track
+        # whose tag writer skipped AMG/TPS/DR keys even when the album as a
+        # whole carries them. Stop as soon as we get a signal.
+        for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
+            probe = await self._extract_critical_reception_from_song(sonic_song.id)
+            if probe is not None and (probe[0] is not None or probe[1] is not None):
+                extracted = probe
+                break
         await self.mass.cache.set(
             key=prov_album_id,
             data=_serialize_cr_cache_entry(extracted),
@@ -435,8 +451,12 @@ class OpenSonicProvider(MusicProvider):
             resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
         except (ParameterError, DataNotFoundError):
             return None
-        # Create the temp file off-loop; tempfile.NamedTemporaryFile does sync I/O.
-        tmp_fd, tmp_path = await asyncio.to_thread(tempfile.mkstemp, prefix="ma-cr-", suffix=".bin")
+        # mkstemp is synchronous (single syscall; not worth the executor hop) and
+        # importantly leaves no cancellation hole: awaiting `asyncio.to_thread`
+        # here would orphan a freshly-created file whenever the caller's task is
+        # cancelled mid-await, because the executor keeps running but the
+        # outer try/finally hasn't been entered yet.
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
         bytes_read = 0
         try:
             try:

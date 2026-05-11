@@ -122,6 +122,9 @@ CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
 PROVIDER_MAPPING_CORRECTION_TASK_ID: Final[str] = "music_provider_mapping_correction"
 MUSIC_SYNC_COMPLETION_CHECK_TASK_ID: Final[str] = "music_sync_completion_check"
+# Per-provider timeout for the listen-later resolver fan-out. A slow provider
+# would otherwise wedge the WS request for the full underlying search timeout.
+_LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT: Final[float] = 10.0
 
 
 class MusicController(CoreController):
@@ -1028,21 +1031,44 @@ class MusicController(CoreController):
         :param artist: Artist name to match against album.artists[*].name.
         :param album: Album title to match against album.name.
         """
+        artist = artist.strip()
+        album = album.strip()
+        if not artist or not album:
+            raise InvalidDataError("Both 'artist' and 'album' must be non-blank")
         search_query = f"{artist} - {album}"
-        candidates: list[Album] = []
-        seen: set[tuple[str, str]] = set()
-        for provider in self.providers:
-            if not isinstance(provider, MusicProvider):
-                continue
-            if ProviderFeature.SEARCH not in provider.supported_features:
-                continue
+        searchable_providers = [
+            p
+            for p in self.providers
+            if isinstance(p, MusicProvider) and ProviderFeature.SEARCH in p.supported_features
+        ]
+
+        async def _search_one(prov: MusicProvider) -> tuple[MusicProvider, Any] | None:
             try:
-                results = await self._search_provider(
-                    search_query, provider.instance_id, [MediaType.ALBUM], limit=10
+                results = await asyncio.wait_for(
+                    self._search_provider(
+                        search_query, prov.instance_id, [MediaType.ALBUM], limit=10
+                    ),
+                    timeout=_LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT,
                 )
             except Exception as err:
-                self.logger.debug("Album search failed on %s: %s", provider.instance_id, err)
+                # asyncio.wait_for raises TimeoutError (an Exception subclass);
+                # anything else from _search_provider is treated identically.
+                self.logger.debug("Album search failed on %s: %s", prov.instance_id, err)
+                return None
+            return prov, results
+
+        # Fan out so one hung provider can't block the resolver. `self.providers`
+        # is stable for the lifetime of this call, so the gathered order is
+        # deterministic and matches the discovery order used by the tier sort
+        # below.
+        search_results = await asyncio.gather(*[_search_one(p) for p in searchable_providers])
+
+        candidates: list[Album] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in search_results:
+            if entry is None:
                 continue
+            _prov, results = entry
             for result_album in results.albums:
                 key = (result_album.provider, result_album.item_id)
                 if key in seen:
@@ -1099,6 +1125,13 @@ class MusicController(CoreController):
         do have any other anchor (in_library, favorite, play history) keep their
         state and only lose the flag.
         """
+        # Bail out if the row wasn't actually on listen-later. The anchor-based
+        # cleanup below would otherwise happily delete any stale anchorless row
+        # (e.g. left over from a streaming-library deletion) — the endpoint's
+        # contract is "clear the flag", not "garbage-collect orphan albums".
+        library_item = await self.albums.get_library_item(library_item_id)
+        if not getattr(library_item, "listen_later", False):
+            return
         await self.albums.set_listen_later(library_item_id, False)
         # Re-fetch *after* the flag write so the anchor check sees any state
         # changes that landed between our entry and now (a concurrent sync
@@ -2879,10 +2912,12 @@ class MusicController(CoreController):
                 if "duplicate column" not in str(err):
                     raise
 
-        if prev_version <= 41:
+        if 40 <= prev_version <= 41:
             # Recovery: an earlier rating-branch build bumped the schema version
             # past 39 without running the is_manual migration, leaving DBs at
             # version 40/41 without the column. Re-run the idempotent ADD COLUMN.
+            # Bounded to 40/41 so clean upgrades from older schemas don't trip
+            # the duplicate-column branch and pollute logs.
             # Those same builds also stamped a `rating INTEGER` column onto
             # tracks/albums/artists that the current schema no longer models;
             # the orphan column is harmless (mashumaro ignores unknown keys,
@@ -2911,7 +2946,7 @@ class MusicController(CoreController):
                     if "duplicate column" not in str(err):
                         raise
 
-        if prev_version <= 43:
+        if 42 <= prev_version <= 43:
             # Earlier rating-branch builds stored album DR under
             # `$.critical_reception.dr`. The new schema splits that into the
             # canonical (measured) `$.dynamic_range` and the AMG-review-reported
@@ -2920,7 +2955,8 @@ class MusicController(CoreController):
             # old payloads were dominated by measured DR. The old key is
             # dropped only when the destination either gets a value or already
             # has one, so a measured re-scan from the upstream tag writer
-            # always wins.
+            # always wins. Bounded to 42/43 because only those rating-branch
+            # builds shipped the legacy `$.critical_reception.dr` shape.
             await self._database.execute(
                 f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_set("
                 "metadata, '$.dynamic_range', "

@@ -39,7 +39,7 @@ async def setup(
 
 async def get_config_entries(
     mass: MusicAssistant,
-    instance_id: str | None = None,
+    instance_id: str | None = None,  # noqa: ARG001 — required by framework signature
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
@@ -55,7 +55,11 @@ async def get_config_entries(
     test_ok = False
     test_error: str | None = None
 
-    should_probe = bool(url) and (action == CONF_ACTION_TEST or instance_id is not None)
+    # Probe only when the user explicitly clicks "Test connection". Including
+    # `instance_id is not None` would trigger a 30s blocking HTTP probe every
+    # time the config dialog opens for an existing instance — if music-rater
+    # is down, the form takes the full timeout to render.
+    should_probe = bool(url) and action == CONF_ACTION_TEST
     if should_probe:
         client = MusicRaterClient(url, mass.http_session, verify_ssl=verify_ssl)
         try:

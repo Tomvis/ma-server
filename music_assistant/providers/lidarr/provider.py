@@ -21,12 +21,13 @@ Two-step flow per music-rater's documented API:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlparse
 
 from music_assistant_models.enums import MediaType
-from music_assistant_models.errors import InvalidDataError, ProviderUnavailableError
+from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.models.plugin import PluginProvider
-from music_assistant.providers.lidarr.client import MusicRaterClient
+from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
 from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
 
 if TYPE_CHECKING:
@@ -61,19 +62,28 @@ class LidarrProvider(PluginProvider):
         )
 
     async def loaded_in_mass(self) -> None:
-        """Probe music-rater and register the WebSocket command."""
-        try:
-            await self._client.ping()
-        except Exception as err:
-            raise ProviderUnavailableError(
-                f"Could not reach music-rater at {self.config.get_value(CONF_URL)}: {err}"
-            ) from err
+        """Register the WebSocket command and probe music-rater for connectivity.
 
+        The command is registered unconditionally so users still see the action
+        in the UI when music-rater is down — invocations will fail with a useful
+        error from the client. Raising here would leave the provider marked
+        available (the framework swallows post-setup exceptions) but with the
+        command silently missing.
+        """
         self._unregister_handles.append(
             self.mass.register_api_command(
                 "lidarr/add_album", self.add_album, required_role="admin"
             )
         )
+        try:
+            await self._client.ping()
+        except Exception as err:
+            self.logger.warning(
+                "music-rater at %s unreachable on load: %s. The 'Add to Lidarr' "
+                "action will surface this error on first use.",
+                self.config.get_value(CONF_URL),
+                err,
+            )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Drop the registered command handler."""
@@ -173,9 +183,11 @@ class LidarrProvider(PluginProvider):
 
         if errors > 0:
             err_log = response.get("error_log") or "(no error log)"
-            raise ProviderUnavailableError(
-                f"music-rater reported {errors} Lidarr error(s): {err_log}"
-            )
+            # Upstream Lidarr per-album error (bad MBID / profile mismatch /
+            # root-folder denial). Music-rater answered fine — this is an
+            # application-level failure, not "provider unavailable", and must
+            # not trip MA's framework-level provider-down retry path.
+            raise MusicRaterError(f"music-rater reported {errors} Lidarr error(s): {err_log}")
         if skipped > 0:
             base = str(self.config.get_value(CONF_URL) or "").rstrip("/")
             raise InvalidDataError(
@@ -188,10 +200,10 @@ class LidarrProvider(PluginProvider):
         # i.e. the album was already monitored before this request.
         already_monitored = lidarr_synced and albums_monitored == 0
         # No counters and no sync flag means music-rater accepted the POST but
-        # neither monitored nor reported activity — treat that as an unexpected
-        # backend response rather than a silent success.
+        # neither monitored nor reported activity — surface as a malformed
+        # backend response (per-request error, not provider-wide outage).
         if not (albums_monitored > 0 or already_monitored or artists_added > 0):
-            raise ProviderUnavailableError(
+            raise MusicRaterError(
                 f"music-rater returned no-op for {artist_name!r} - {album_name!r} "
                 "(no errors, no monitors, no sync). Check music-rater logs."
             )
@@ -201,5 +213,18 @@ class LidarrProvider(PluginProvider):
             "artist_added": artists_added > 0,
             "album_monitored": albums_monitored > 0 or already_monitored,
             "already_monitored": already_monitored,
-            "lidarr_instance": self.name,
+            "lidarr_instance": self._music_rater_label(),
         }
+
+    def _music_rater_label(self) -> str:
+        """Human-readable identifier for the music-rater backend that handled this call.
+
+        Frontend toasts use this to tell the operator which music-rater is
+        acting when they've configured several. `self.name` is the MA-side
+        display label (often just "Lidarr"), so we fall back to the configured
+        URL's host:port — that's the only stable identity we have for the
+        upstream service.
+        """
+        url = str(self.config.get_value(CONF_URL) or "")
+        host = urlparse(url).netloc
+        return host or self.name

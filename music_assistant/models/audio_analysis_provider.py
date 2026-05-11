@@ -80,7 +80,16 @@ class AudioAnalysisProvider(Provider):
             streamdetails=streamdetails,
             audio_format=audio_format,
         )
-        if not await self._start_analysis(session_id, streamdetails, audio_format):
+        # Pop on raise too, not just on returns-False. Otherwise an exception in
+        # _start_analysis (e.g. ffmpeg failing to spawn) leaves the session in
+        # self._sessions forever; the controller catches the exception and skips
+        # adding our instance_id, so no later finalize/cancel will clean it up.
+        try:
+            accepted = await self._start_analysis(session_id, streamdetails, audio_format)
+        except BaseException:
+            self._sessions.pop(session_id, None)
+            raise
+        if not accepted:
             self._sessions.pop(session_id, None)
             return False
         return True

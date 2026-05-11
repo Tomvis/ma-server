@@ -407,7 +407,10 @@ class GenreController(MediaControllerBase[Genre]):
         if favorite_only and favorite is None:
             favorite = True
         query_params: dict[str, Any] = {}
-        query_parts: list[str] = []
+        # base_query wraps `genres` in a `WHERE is_excluded = 0` derived view so
+        # library_items hides soft-deleted entries; the raw FROM below bypasses
+        # that view, so filter explicitly here or counts include excluded rows.
+        query_parts: list[str] = [f"{self.db_table}.is_excluded = 0"]
         join_parts: list[str] = []
         # The overridden _search_filter_clause matches by name (`:search`) AND by
         # alias (`:search_raw`); library_items sets both via extra_params, so do
