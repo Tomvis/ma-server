@@ -88,11 +88,13 @@ SORT_KEYS = {
     "position_desc": "position DESC",
     "artist_name": "artists.search_name ASC, year DESC",
     "artist_name_desc": "artists.search_name DESC, year DESC",
-    # critical_reception sorts — only valid for the albums table since they
+    # critical_reception / DR sorts — only valid for the albums table since they
     # reference albums.metadata directly. Non-album controllers should not pass
     # these keys (no SQL fallback is provided).
-    "dr": "json_extract(albums.metadata, '$.critical_reception.dr') ASC",
-    "dr_desc": "json_extract(albums.metadata, '$.critical_reception.dr') DESC",
+    # `dr` sorts on the canonical (measured) album dynamic range — not the
+    # AMG-review-reported value, which lives at $.critical_reception.amg_dr.
+    "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC",
+    "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC",
     "amg_rating": (
         "(SELECT json_extract(value, '$.rating') "
         "FROM json_each(albums.metadata, '$.critical_reception.sources') "

@@ -474,6 +474,7 @@ def parse_value(  # noqa: PLR0911
                 name, subvalue, get_args(value_type)[0], allow_value_convert=allow_value_convert
             )
             for subvalue in value
+            if subvalue is not None
         )
     if origin is dict:
         subkey_type = get_args(value_type)[0]

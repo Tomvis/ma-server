@@ -330,19 +330,26 @@ class OpenSonicProvider(MusicProvider):
             )
 
     async def _enrich_album_with_critical_reception(self, album: Album, prov_album_id: str) -> None:
-        """Populate album.metadata.critical_reception by ffprobing one track of the album."""
+        """Populate album CR + album-scope DR by ffprobing one track of the album."""
         try:
-            cr = await self._get_album_critical_reception(prov_album_id)
+            extracted = await self._get_album_critical_reception(prov_album_id)
         except Exception as err:
             self.logger.debug(
                 "critical_reception extraction failed for album %s: %s", prov_album_id, err
             )
             return
+        if extracted is None:
+            return
+        cr, album_dr = extracted
         if cr is not None:
             album.metadata.critical_reception = cr
+        if album_dr is not None:
+            album.metadata.dynamic_range = album_dr
 
-    async def _get_album_critical_reception(self, prov_album_id: str) -> CriticalReception | None:
-        """Fetch one track of an album, ffprobe it, return CriticalReception or None.
+    async def _get_album_critical_reception(
+        self, prov_album_id: str
+    ) -> tuple[CriticalReception | None, float | None] | None:
+        """Fetch one track of an album, ffprobe it, return (CR, album_dr) or None.
 
         Intentionally NOT cached: when tag-extraction logic changes (e.g. new tag-key
         aliases land), a stale per-album cache would mask the new behavior on resync.
@@ -359,8 +366,14 @@ class OpenSonicProvider(MusicProvider):
         sample_song_id = sonic_album.song[0].id
         return await self._extract_critical_reception_from_song(sample_song_id)
 
-    async def _extract_critical_reception_from_song(self, song_id: str) -> CriticalReception | None:
-        """Stream a small prefix of the song and ffprobe it for AMG/TPS/DR tags."""
+    async def _extract_critical_reception_from_song(
+        self, song_id: str
+    ) -> tuple[CriticalReception | None, float | None] | None:
+        """Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
+
+        Album-scope DR is the upstream tag writer's ALBUM_DYNAMIC_RANGE — same value
+        on every track, so reading any one of them gives us the album-level number.
+        """
         # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
         # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
         # for some containers (M4A 'moov' atom can sit before mdat but ffprobe still
@@ -394,9 +407,9 @@ class OpenSonicProvider(MusicProvider):
                     async_parse_tags(tmp_path),
                     timeout=CRITICAL_RECEPTION_PROBE_TIMEOUT,
                 )
-            except (TimeoutError, Exception):
+            except Exception:
                 return None
-            return tags.critical_reception
+            return tags.critical_reception, tags.album_dynamic_range
         finally:
             if tmp_path:
                 with suppress(OSError):
@@ -468,14 +481,20 @@ class OpenSonicProvider(MusicProvider):
         # rather than re-fetching the album in _get_album_critical_reception.
         if sonic_album.song:
             try:
-                cr = await self._extract_critical_reception_from_song(sonic_album.song[0].id)
+                extracted = await self._extract_critical_reception_from_song(
+                    sonic_album.song[0].id
+                )
             except Exception as err:
                 self.logger.debug(
                     "critical_reception extraction failed for album %s: %s", prov_album_id, err
                 )
             else:
-                if cr is not None:
-                    album.metadata.critical_reception = cr
+                if extracted is not None:
+                    cr, album_dr = extracted
+                    if cr is not None:
+                        album.metadata.critical_reception = cr
+                    if album_dr is not None:
+                        album.metadata.dynamic_range = album_dr
         return album
 
     @use_cache(3600 * 3)  # cache for 3 hours

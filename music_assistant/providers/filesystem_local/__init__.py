@@ -1109,6 +1109,9 @@ class LocalFileSystemProvider(MusicProvider):
         track.metadata.lyrics = tags.lyrics
         track.metadata.grouping = tags.get("grouping")
         track.metadata.description = tags.get("comment")
+        # Per-track measured DR (DR14, ffmpeg+numpy), written into the file by the
+        # upstream tag writer when audio analysis is enabled.
+        track.metadata.dynamic_range = tags.dynamic_range
         explicit_tag = tags.get("itunesadvisory")
         if explicit_tag is not None:
             track.metadata.explicit = explicit_tag == "1"
@@ -1635,6 +1638,11 @@ class LocalFileSystemProvider(MusicProvider):
         album.album_type = track_tags.album_type
         if critical_reception := track_tags.critical_reception:
             album.metadata.critical_reception = critical_reception
+        # Album-scope measured DR (mean of measured track DRs). Stamped onto every
+        # track of an album by the upstream tag writer, so reading any track file
+        # produces the same album-level value.
+        if (album_dr := track_tags.album_dynamic_range) is not None:
+            album.metadata.dynamic_range = album_dr
 
         # hunt for additional metadata and images in the folder structure
         if not album_dir:

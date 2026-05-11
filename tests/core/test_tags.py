@@ -801,17 +801,34 @@ def _make_audio_tags(custom_tags: dict[str, str]) -> tags.AudioTags:
 
 
 def test_critical_reception_returns_none_when_no_tags() -> None:
-    """No DR/AMG/TPS tags → critical_reception is None (no empty payload)."""
+    """No AMG/TPS tags → critical_reception is None (no empty payload)."""
     assert _make_audio_tags({}).critical_reception is None
     assert _make_audio_tags({"album": "Foo"}).critical_reception is None
+    # Bare DR tags (DYNAMIC_RANGE / ALBUM_DYNAMIC_RANGE) don't belong to CR — they
+    # surface on AudioTags.dynamic_range / .album_dynamic_range instead.
+    assert _make_audio_tags({"dynamicrange": "12.5"}).critical_reception is None
+    assert _make_audio_tags({"albumdynamicrange": "13"}).critical_reception is None
 
 
-def test_critical_reception_extracts_dr_only() -> None:
-    """A DR tag alone produces a CriticalReception with no source entries."""
-    cr = _make_audio_tags({"dr": "12.5"}).critical_reception
+def test_critical_reception_extracts_amg_dr_only() -> None:
+    """An AMG_ALBUM_DYNAMIC_RANGE tag alone produces a CR with amg_dr set."""
+    cr = _make_audio_tags({"amgalbumdynamicrange": "12.5"}).critical_reception
     assert cr is not None
-    assert cr.dr == 12.5
+    assert cr.amg_dr == 12.5
     assert cr.sources is None
+
+
+def test_critical_reception_legacy_amg_dr_tag_still_recognized() -> None:
+    """Legacy AMG_DR (pre-TAG_SCHEMA_VERSION 3.0.0) still maps to amg_dr."""
+    cr = _make_audio_tags({"amgdr": "11"}).critical_reception
+    assert cr is not None
+    assert cr.amg_dr == 11.0
+    # New canonical key wins over the legacy alias.
+    cr = _make_audio_tags(
+        {"amgalbumdynamicrange": "12", "amgdr": "20"}
+    ).critical_reception
+    assert cr is not None
+    assert cr.amg_dr == 12.0
 
 
 def test_critical_reception_extracts_amg_full_entry() -> None:
@@ -848,12 +865,12 @@ def test_critical_reception_favorite_only_entry() -> None:
 
 
 def test_critical_reception_amg_and_tps_coexist() -> None:
-    """AMG + TPS tags on the same album yield both entries plus DR."""
+    """AMG + TPS tags on the same album yield both entries plus AMG DR."""
     cr = _make_audio_tags(
-        {"dr": "12", "amgrating": "4", "tpsrating": "8.5"}
+        {"amgalbumdynamicrange": "12", "amgrating": "4", "tpsrating": "8.5"}
     ).critical_reception
     assert cr is not None and cr.sources is not None
-    assert cr.dr == 12.0
+    assert cr.amg_dr == 12.0
     assert {s.source for s in cr.sources} == {"AMG", "TPS"}
     assert next(s for s in cr.sources if s.source == "TPS").rating == 8.5
 
@@ -861,7 +878,7 @@ def test_critical_reception_amg_and_tps_coexist() -> None:
 def test_critical_reception_drops_empty_source_entries() -> None:
     """A source with all-empty fields is omitted, not added as a hollow entry."""
     cr = _make_audio_tags(
-        {"dr": "10", "amgtype": "", "amgrating": "  "}
+        {"amgalbumdynamicrange": "10", "amgtype": "", "amgrating": "  "}
     ).critical_reception
     assert cr is not None
     assert cr.sources is None
@@ -870,7 +887,7 @@ def test_critical_reception_drops_empty_source_entries() -> None:
 def test_critical_reception_invalid_numerics_dropped() -> None:
     """NaN/inf/garbage in rating tags do not surface as values."""
     cr = _make_audio_tags(
-        {"amgrating": "nan", "tpsrating": "inf", "dr": "not-a-number"}
+        {"amgrating": "nan", "tpsrating": "inf", "amgalbumdynamicrange": "not-a-number"}
     ).critical_reception
     # all fields invalid → nothing left, CR is None
     assert cr is None
@@ -878,21 +895,28 @@ def test_critical_reception_invalid_numerics_dropped() -> None:
 
 def test_critical_reception_european_decimal_separator() -> None:
     """Tags written with comma decimals (12,5) parse like 12.5."""
-    cr = _make_audio_tags({"dr": "12,5"}).critical_reception
+    cr = _make_audio_tags({"amgalbumdynamicrange": "12,5"}).critical_reception
     assert cr is not None
-    assert cr.dr == 12.5
+    assert cr.amg_dr == 12.5
 
 
-def test_critical_reception_amg_dr_tag_recognized() -> None:
-    """AMG_DR / TPS_DR / common DR tag aliases all surface as the album DR."""
-    # AudioTags lowercases and strips _-/space, so AMG_DR -> amgdr
-    cr = _make_audio_tags({"amgdr": "11"}).critical_reception
-    assert cr is not None
-    assert cr.dr == 11.0
-    cr = _make_audio_tags({"dynamicrange": "9.5"}).critical_reception
-    assert cr is not None
-    assert cr.dr == 9.5
-    # First match wins (priority: amgdr > tpsdr > albumdynamicrange > … > dr)
-    cr = _make_audio_tags({"amgdr": "12", "dr": "20"}).critical_reception
-    assert cr is not None
-    assert cr.dr == 12.0
+def test_dynamic_range_per_track_tag() -> None:
+    """DYNAMIC_RANGE tag → AudioTags.dynamic_range (per-track measurement)."""
+    tags = _make_audio_tags({"dynamicrange": "13.5"})
+    assert tags.dynamic_range == 13.5
+    assert tags.critical_reception is None
+
+
+def test_album_dynamic_range_tag() -> None:
+    """ALBUM_DYNAMIC_RANGE tag → AudioTags.album_dynamic_range (album mean)."""
+    tags = _make_audio_tags({"albumdynamicrange": "12"})
+    assert tags.album_dynamic_range == 12.0
+    # Album-scope tag does not leak into the per-track .dynamic_range fallback.
+    assert tags.dynamic_range is None
+
+
+def test_dynamic_range_legacy_aliases() -> None:
+    """Legacy bare-DR conventions still surface on .dynamic_range as a fallback."""
+    assert _make_audio_tags({"dr": "9.5"}).dynamic_range == 9.5
+    # The newer DYNAMIC_RANGE tag wins over the legacy bare DR alias.
+    assert _make_audio_tags({"dynamicrange": "11", "dr": "20"}).dynamic_range == 11.0

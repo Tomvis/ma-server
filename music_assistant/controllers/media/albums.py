@@ -40,17 +40,18 @@ if TYPE_CHECKING:
 def _critical_reception_is_richer(new: object, existing: object) -> bool:
     """True if `new` carries strictly more critical_reception data than `existing`.
 
-    Coarse "more fields filled" heuristic: a forward improvement (DR landing,
+    Coarse "more fields filled" heuristic: a forward improvement (AMG DR landing,
     additional sources) wins; a regression (transient probe failure that drops
-    sources) is rejected.
+    sources) is rejected. The canonical (measured) DR has moved off CriticalReception
+    onto MediaItemMetadata.dynamic_range, so it isn't part of this comparison.
     """
     if new is None:
         return False
     if existing is None:
         return True
-    new_dr = getattr(new, "dr", None)
-    cur_dr = getattr(existing, "dr", None)
-    if new_dr is not None and cur_dr is None:
+    new_amg_dr = getattr(new, "amg_dr", None)
+    cur_amg_dr = getattr(existing, "amg_dr", None)
+    if new_amg_dr is not None and cur_amg_dr is None:
         return True
     new_sources = getattr(new, "sources", None) or []
     cur_sources = getattr(existing, "sources", None) or []
@@ -114,13 +115,15 @@ def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str
     return sub, params
 
 
-def _source_favorite_clause(source: str) -> str:
+def _source_favorite_clause(source: str, param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Match albums where the given source has favorite=true."""
-    return (
+    src_key = f"{param_prefix}_src"
+    sub = (
         "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        f"WHERE json_extract(value, '$.source') = '{source}' "
+        f"WHERE json_extract(value, '$.source') = :{src_key} "
         "AND json_extract(value, '$.favorite') = 1)"
     )
+    return sub, {src_key: source}
 
 
 def _source_labels_clause(
@@ -130,23 +133,31 @@ def _source_labels_clause(
     patterns = [_LABEL_KIND_PATTERNS[k] for k in kinds if k in _LABEL_KIND_PATTERNS]
     if not patterns:
         return "", {}
-    params = {f"{param_prefix}_{i}": p for i, p in enumerate(patterns)}
-    label_or = " OR ".join(f"label_each.value LIKE :{k}" for k in params)
+    src_key = f"{param_prefix}_src"
+    params: dict[str, Any] = {src_key: source}
+    label_keys: list[str] = []
+    for i, p in enumerate(patterns):
+        k = f"{param_prefix}_{i}"
+        params[k] = p
+        label_keys.append(k)
+    label_or = " OR ".join(f"label_each.value LIKE :{k}" for k in label_keys)
     sub = (
         "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') src "
-        f"WHERE json_extract(src.value, '$.source') = '{source}' "
+        f"WHERE json_extract(src.value, '$.source') = :{src_key} "
         "AND EXISTS(SELECT 1 FROM json_each(json_extract(src.value, '$.labels')) label_each "
         f"WHERE {label_or}))"
     )
     return sub, params
 
 
-def _source_untagged_clause(source: str) -> str:
+def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Match albums that do not carry an entry for the given source."""
-    return (
+    src_key = f"{param_prefix}_src"
+    sub = (
         "NOT EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        f"WHERE json_extract(value, '$.source') = '{source}')"
+        f"WHERE json_extract(value, '$.source') = :{src_key})"
     )
+    return sub, {src_key: source}
 
 
 def _apply_critical_reception_filters(
@@ -170,10 +181,12 @@ def _apply_critical_reception_filters(
     in any of the chosen buckets).
     """
     # DR buckets — combine into a single OR clause referencing one extracted value.
+    # Filters on the canonical (measured) album dynamic range; the AMG-review-reported
+    # value at $.critical_reception.amg_dr is intentionally not part of this filter.
     if dr_buckets:
         kinds = [b for b in dr_buckets if b in _DR_BUCKET_RANGES or b == "untagged"]
         if kinds:
-            dr_path = "json_extract(albums.metadata, '$.critical_reception.dr')"
+            dr_path = "json_extract(albums.metadata, '$.dynamic_range')"
             or_parts: list[str] = []
             for i, kind in enumerate(kinds):
                 if kind == "untagged":
@@ -203,9 +216,13 @@ def _apply_critical_reception_filters(
 
     # AMG / TPS favorite flag
     if amg_favorite:
-        query_parts.append(_source_favorite_clause("AMG"))
+        clause, params = _source_favorite_clause("AMG", "amg_fav")
+        query_parts.append(clause)
+        query_params.update(params)
     if tps_favorite:
-        query_parts.append(_source_favorite_clause("TPS"))
+        clause, params = _source_favorite_clause("TPS", "tps_fav")
+        query_parts.append(clause)
+        query_params.update(params)
 
     # AMG / TPS label-kind filters
     for source, labels_list, prefix in (
@@ -220,9 +237,13 @@ def _apply_critical_reception_filters(
 
     # untagged-source flags
     if amg_untagged:
-        query_parts.append(_source_untagged_clause("AMG"))
+        clause, params = _source_untagged_clause("AMG", "amg_unt")
+        query_parts.append(clause)
+        query_params.update(params)
     if tps_untagged:
-        query_parts.append(_source_untagged_clause("TPS"))
+        clause, params = _source_untagged_clause("TPS", "tps_unt")
+        query_parts.append(clause)
+        query_params.update(params)
 
 
 class AlbumsController(MediaControllerBase[Album]):

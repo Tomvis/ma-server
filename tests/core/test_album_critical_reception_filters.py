@@ -44,25 +44,27 @@ def _make_db() -> sqlite3.Connection:
     """In-memory SQLite seeded with a fixed mix of albums for filter tests."""
     con = sqlite3.connect(":memory:")
     con.execute("CREATE TABLE albums (item_id INTEGER PRIMARY KEY, metadata json)")
+    # DR values now live at metadata.dynamic_range (the canonical, measured value).
+    # critical_reception holds only review-derived data (AMG/TPS sources + amg_dr).
     rows = [
         # 1: AMG 4.5 + AOTY-2024 + DR 16 (excellent)
         (
             1,
             {
+                "dynamic_range": 16.0,
                 "critical_reception": {
-                    "dr": 16.0,
                     "sources": [
                         {"source": "AMG", "rating": 4.5, "labels": ["AOTY-2024"]},
                     ],
-                }
+                },
             },
         ),
         # 2: TPS 8.5 + AOTM-2024-03 + DR 11 (good)
         (
             2,
             {
+                "dynamic_range": 11.0,
                 "critical_reception": {
-                    "dr": 11.0,
                     "sources": [
                         {
                             "source": "TPS",
@@ -70,25 +72,25 @@ def _make_db() -> sqlite3.Connection:
                             "labels": ["AOTM-2024-03"],
                         }
                     ],
-                }
+                },
             },
         ),
         # 3: AMG list-pick (favorite) only, DR 6 (poor)
         (
             3,
             {
+                "dynamic_range": 6.0,
                 "critical_reception": {
-                    "dr": 6.0,
                     "sources": [{"source": "AMG", "favorite": True}],
-                }
+                },
             },
         ),
         # 4: TPS 9.2 + Record of the Month + DR 8 (fair)
         (
             4,
             {
+                "dynamic_range": 8.0,
                 "critical_reception": {
-                    "dr": 8.0,
                     "sources": [
                         {
                             "source": "TPS",
@@ -96,13 +98,13 @@ def _make_db() -> sqlite3.Connection:
                             "labels": ["RECORD_OF_THE_MONTH"],
                         }
                     ],
-                }
+                },
             },
         ),
         # 5: completely untagged
         (5, {}),
         # 6: only DR, no sources, DR 13 (good)
-        (6, {"critical_reception": {"dr": 13.0}}),
+        (6, {"dynamic_range": 13.0}),
     ]
     for item_id, meta in rows:
         con.execute(

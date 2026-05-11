@@ -104,7 +104,7 @@ def _build_review_source_entry(
     return ReviewSourceEntry(
         source=source_id,
         rating=rating,
-        favorite=favorite if favorite else None,
+        favorite=favorite,
         types=types or None,
         labels=labels or None,
         authors=authors or None,
@@ -617,39 +617,69 @@ class AudioTags:
         return None
 
     @property
+    def amg_dr(self) -> float | None:
+        """AMG-reported album DR (parsed from AMG's review metadata block).
+
+        Maps to the AMG_ALBUM_DYNAMIC_RANGE file tag (TAG_SCHEMA_VERSION 3.0.0+;
+        renamed from AMG_DR — the legacy key is still accepted for back-compat).
+        """
+        # tag-key transform lowercases and strips spaces/underscores/hyphens,
+        # so AMG_ALBUM_DYNAMIC_RANGE -> amgalbumdynamicrange and AMG_DR -> amgdr.
+        for key in ("amgalbumdynamicrange", "amgdr"):
+            if (val := _parse_float_tag(self.tags.get(key))) is not None:
+                return val
+        return None
+
+    @property
+    def dynamic_range(self) -> float | None:
+        """Per-track measured Dynamic Range (DR14) for this audio file.
+
+        Reads the DYNAMIC_RANGE file tag written by the upstream tag writer when
+        audio analysis is enabled. Falls back to a few legacy bare-DR conventions
+        (foobar2000 / TT DR Meter) so older files still expose a usable value.
+        Album-scope DR is exposed separately on `album_dynamic_range`.
+        """
+        for key in (
+            "dynamicrange",  # DYNAMIC_RANGE (per-track, ffmpeg+numpy DR14)
+            "dralbum",       # legacy foobar alt (track-only files sometimes use this)
+            "dr",            # legacy bare DR
+        ):
+            if (val := _parse_float_tag(self.tags.get(key))) is not None:
+                return val
+        return None
+
+    @property
+    def album_dynamic_range(self) -> float | None:
+        """Album-scope measured DR (mean of measured track DRs).
+
+        Reads the ALBUM_DYNAMIC_RANGE file tag, which the upstream tag writer
+        stamps onto every track of an album so any track read produces the same
+        album-level value.
+        """
+        return _parse_float_tag(self.tags.get("albumdynamicrange"))
+
+    @property
     def critical_reception(self) -> CriticalReception | None:
-        """Build CriticalReception from custom AMG/TPS/DR tags, if any are present.
+        """Build CriticalReception from custom AMG/TPS review tags, if any are present.
 
         Tag schema (case-insensitive; underscores/spaces/hyphens stripped during parse):
-          DR / DYNAMIC RANGE / Album Dynamic Range / DR_Album  -> album-level DR numeric
-          AMG_RATING      -> /5 numeric review score
-          AMG_FAVORITE    -> truthy when the album is an AMG list-pick without a score
-          AMG_TYPE        -> ;-separated review kind labels (Review, TYMHM, …)
-          AMG_LABELS      -> ;-separated accolade labels (AOTY-2024, RECORD_OF_THE_MONTH, …)
-          AMG_AUTHOR      -> ;-separated author names (canonical, secondary, list-pick)
+          AMG_ALBUM_DYNAMIC_RANGE -> AMG-reported album DR (numeric, /5 source)
+          AMG_RATING              -> /5 numeric review score
+          AMG_FAVORITE            -> truthy when the album is an AMG list-pick without a score
+          AMG_TYPE                -> ;-separated review kind labels (Review, TYMHM, …)
+          AMG_LABELS              -> ;-separated accolade labels (AOTY-2024, RECORD_OF_THE_MONTH, …)
+          AMG_AUTHOR              -> ;-separated author names (canonical, secondary, list-pick)
           TPS_RATING / TPS_FAVORITE / TPS_TYPE / TPS_LABELS / TPS_AUTHOR  (mirror of AMG, /10)
+
+        The canonical (measured) DR lives on AudioTags.dynamic_range, not here.
         """
-        # DR can show up under several common conventions. Tag-key transform
-        # already lowercased and stripped spaces/underscores/hyphens, so e.g.
-        # AMG_DR -> amgdr, "Album Dynamic Range" -> albumdynamicrange.
-        dr: float | None = None
-        for dr_key in (
-            "amgdr",              # AMG-prefixed (user's schema; per-source DR)
-            "tpsdr",              # TPS-prefixed mirror
-            "albumdynamicrange",  # foobar2000 DR Meter (album)
-            "dralbum",            # alt foobar convention
-            "dynamicrange",       # TT DR Meter / foobar (default)
-            "dr",                 # bare DR
-        ):
-            dr = _parse_float_tag(self.tags.get(dr_key))
-            if dr is not None:
-                break
+        amg_dr = self.amg_dr
         amg = _build_review_source_entry(self.tags, "AMG", "amg")
         tps = _build_review_source_entry(self.tags, "TPS", "tps")
         sources: list[ReviewSourceEntry] = [s for s in (amg, tps) if s is not None]
-        if dr is None and not sources:
+        if amg_dr is None and not sources:
             return None
-        return CriticalReception(dr=dr, sources=sources or None)
+        return CriticalReception(amg_dr=amg_dr, sources=sources or None)
 
     @property
     def chapters(self) -> list[AudioTagsChapter]:

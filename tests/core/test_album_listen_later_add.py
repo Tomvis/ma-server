@@ -171,7 +171,7 @@ async def fake_provider(
 
 def _sample_critical_reception() -> CriticalReception:
     return CriticalReception(
-        dr=12.0,
+        amg_dr=12.0,
         sources=[
             ReviewSourceEntry(
                 source="AMG",
@@ -203,7 +203,7 @@ async def test_listen_later_add_by_artist_album_with_critical_reception(
     assert library_album.listen_later is True
     assert library_album.metadata.critical_reception is not None
     stored = library_album.metadata.critical_reception
-    assert stored.dr == 12.0
+    assert stored.amg_dr == 12.0
     assert stored.sources is not None
     sources_by_id = {s.source: s for s in stored.sources}
     assert sources_by_id["AMG"].rating == 4.5

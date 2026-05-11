@@ -1044,9 +1044,9 @@ class MusicController(CoreController):
                 f"No matching album found for {artist!r} - {album!r} on any loaded music provider"
             )
 
-        # Prefer Tidal first (best lossless catalog), then any other streaming
-        # provider (so the entry stays playable), then non-streaming hits.
-        # Sort is stable, so within a tier we keep the discovery order.
+        # Prefer Tidal first (operator's primary streaming source), then any
+        # other streaming provider, then everything else. Sort is stable, so
+        # within a tier we keep the discovery order.
         def _tier(a: Album) -> int:
             prov = self.mass.get_provider(a.provider)
             if prov is None:

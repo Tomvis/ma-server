@@ -55,17 +55,18 @@ CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
 def _critical_reception_is_richer(new: object, existing: object) -> bool:
     """Return True if `new` carries more critical_reception data than `existing`.
 
-    Uses a coarse "more fields filled" heuristic so any forward improvement (DR
-    landing, more sources, etc.) wins, but a regression (e.g. a transient probe
-    failure that drops sources) does not overwrite known-good data.
+    Uses a coarse "more fields filled" heuristic so any forward improvement (AMG
+    DR landing, more sources, etc.) wins, but a regression (e.g. a transient probe
+    failure that drops sources) does not overwrite known-good data. The canonical
+    (measured) DR lives on MediaItemMetadata.dynamic_range and is compared elsewhere.
     """
     if new is None:
         return False
     if existing is None:
         return True
-    new_dr = getattr(new, "dr", None)
-    cur_dr = getattr(existing, "dr", None)
-    if new_dr is not None and cur_dr is None:
+    new_amg_dr = getattr(new, "amg_dr", None)
+    cur_amg_dr = getattr(existing, "amg_dr", None)
+    if new_amg_dr is not None and cur_amg_dr is None:
         return True
     new_sources = getattr(new, "sources", None) or []
     cur_sources = getattr(existing, "sources", None) or []
