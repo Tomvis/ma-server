@@ -196,6 +196,62 @@ def test_unknown_label_kind_silently_dropped() -> None:
     assert params == {}
 
 
+def _make_amg_dr_fallback_db() -> sqlite3.Connection:
+    """Separate fixture so amg_dr-fallback assertions don't perturb the main fixture.
+
+    Mirrors the streaming-album case that motivated the COALESCE: a Listen Later
+    row with no measured DR (never played → never analyzed) but with an AMG-tagged
+    DR carried in via the listen_later_add `critical_reception` payload.
+    """
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE albums (item_id INTEGER PRIMARY KEY, metadata json)")
+    rows = [
+        # 10: amg_dr only (good via fallback)
+        (10, {"critical_reception": {"amg_dr": 12.0, "sources": []}}),
+        # 11: amg_dr only (poor via fallback)
+        (11, {"critical_reception": {"amg_dr": 5.0, "sources": []}}),
+        # 12: measured 16 + amg_dr 5 — measured must win (COALESCE picks the first
+        # non-null), so this album buckets as excellent, not poor.
+        (
+            12,
+            {
+                "dynamic_range": 16.0,
+                "critical_reception": {"amg_dr": 5.0, "sources": []},
+            },
+        ),
+        # 13: neither — still untagged.
+        (13, {"critical_reception": {"sources": []}}),
+    ]
+    for item_id, meta in rows:
+        con.execute(
+            "INSERT INTO albums (item_id, metadata) VALUES (?, ?)",
+            (item_id, json.dumps(meta)),
+        )
+    return con
+
+
+def test_dr_bucket_falls_back_to_amg_dr() -> None:
+    """An album with only amg_dr buckets by that value (matches the badge fallback)."""
+    con = _make_amg_dr_fallback_db()
+    assert _exec_with_filters(con, dr_buckets=["good"]) == [10]
+    assert _exec_with_filters(con, dr_buckets=["poor"]) == [11]
+
+
+def test_dr_bucket_measured_wins_over_amg_dr() -> None:
+    """When both values exist, measured wins (COALESCE picks dynamic_range first)."""
+    con = _make_amg_dr_fallback_db()
+    # Album 12 has measured=16 (excellent) and amg_dr=5 — must bucket as excellent.
+    assert _exec_with_filters(con, dr_buckets=["excellent"]) == [12]
+    assert _exec_with_filters(con, dr_buckets=["poor"]) == [11]
+
+
+def test_dr_bucket_untagged_requires_both_null() -> None:
+    """`untagged` matches only albums where both measured and amg_dr are null."""
+    con = _make_amg_dr_fallback_db()
+    # Albums 10, 11, 12 all have *some* DR value; only 13 has neither.
+    assert _exec_with_filters(con, dr_buckets=["untagged"]) == [13]
+
+
 def test_sort_keys_are_registered_for_albums() -> None:
     """The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
 

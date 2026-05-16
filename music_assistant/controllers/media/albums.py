@@ -186,12 +186,20 @@ def _apply_critical_reception_filters(  # noqa: PLR0913
     in any of the chosen buckets).
     """
     # DR buckets — combine into a single OR clause referencing one extracted value.
-    # Filters on the canonical (measured) album dynamic range; the AMG-review-reported
-    # value at $.critical_reception.amg_dr is intentionally not part of this filter.
+    # Prefers the canonical (measured) `$.dynamic_range` and falls back to the
+    # AMG-review-reported `$.critical_reception.amg_dr` so an album with only the
+    # review value still buckets the same way the on-cover badge displays it (the
+    # badge does the same fallback in useAlbumTags / parseAlbumTags on the
+    # frontend). `untagged` matches albums where both values are null.
     if dr_buckets:
         kinds = [b for b in dr_buckets if b in _DR_BUCKET_RANGES or b == "untagged"]
         if kinds:
-            dr_path = "json_extract(albums.metadata, '$.dynamic_range')"
+            dr_path = (
+                "COALESCE("
+                "json_extract(albums.metadata, '$.dynamic_range'), "
+                "json_extract(albums.metadata, '$.critical_reception.amg_dr')"
+                ")"
+            )
             or_parts: list[str] = []
             for i, kind in enumerate(kinds):
                 if kind == "untagged":
