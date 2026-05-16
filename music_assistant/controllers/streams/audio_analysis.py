@@ -45,8 +45,11 @@ BACKGROUND_SCAN_MAX_CANDIDATES_PER_RUN = 20_000
 # Per-chunk dispatch interval bounds. One PCM chunk = one audio-second of decoded data:
 # the floor is the fastest pace allowed; the ceiling is both the slowest pace and the
 # per-chunk processing timeout that evicts unresponsive providers.
-REAL_TIME_PACE_INTERVAL_SECONDS_FLOOR = 0.250
+REAL_TIME_PACE_INTERVAL_SECONDS_FLOOR = 0.100
 REAL_TIME_PACE_INTERVAL_SECONDS_CEILING = 1.0
+BACKGROUND_PACE_INTERVAL_SECONDS_FLOOR = 0.250
+BACKGROUND_PACE_INTERVAL_SECONDS_CEILING = 4.0
+ANALYSIS_QUEUE_MAXSIZE = 30
 FILESYSTEM_PROVIDER_DOMAINS: tuple[str, ...] = (
     "filesystem_local",
     "filesystem_smb",
@@ -183,7 +186,7 @@ class AudioAnalysisController:
         # we must roll back the active-session entry and cancel the providers we
         # already started, otherwise the session key is stuck in _active_sessions
         # forever and future retries get the "already active" early-return.
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=ANALYSIS_QUEUE_MAXSIZE)
         try:
             self._workers[session_key] = self.mass.create_task(
                 self._chunk_worker(
@@ -540,8 +543,8 @@ class AudioAnalysisController:
         self,
         streamdetails: StreamDetails,
         providers: list[AudioAnalysisProvider],
-        min_interval: float = REAL_TIME_PACE_INTERVAL_SECONDS_FLOOR,
-        max_interval: float = REAL_TIME_PACE_INTERVAL_SECONDS_CEILING,
+        min_interval: float = BACKGROUND_PACE_INTERVAL_SECONDS_FLOOR,
+        max_interval: float = BACKGROUND_PACE_INTERVAL_SECONDS_CEILING,
     ) -> None:
         """
         Run a single track through the streaming pipeline using ffmpeg as the source.
@@ -606,8 +609,8 @@ class AudioAnalysisController:
         session_key: str,
         streamdetails: StreamDetails,
         providers: list[AudioAnalysisProvider],
-        min_interval: float = REAL_TIME_PACE_INTERVAL_SECONDS_FLOOR,
-        max_interval: float = REAL_TIME_PACE_INTERVAL_SECONDS_CEILING,
+        min_interval: float = BACKGROUND_PACE_INTERVAL_SECONDS_FLOOR,
+        max_interval: float = BACKGROUND_PACE_INTERVAL_SECONDS_CEILING,
     ) -> None:
         """
         Inner body of _run_background_streaming_for_track, wrapped by wait_for.
