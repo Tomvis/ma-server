@@ -1,0 +1,69 @@
+# Layer the rating-branch server + frontend + Lidarr plugin onto the upstream
+# MA server image. Avoids a full venv rebuild (which currently needs an
+# unreleased aiosendspin wheel). The upstream image's installed dependencies
+# (aiosendspin, av, etc.) are kept; the music_assistant Python source is
+# replaced wholesale with the rating-branch checkout, so server-side features
+# like critical_reception filters and listen_later are present.
+ARG UPSTREAM=ghcr.io/music-assistant/server:latest
+FROM ${UPSTREAM}
+
+# Replace upstream's installed music_assistant Python package with the
+# rating-branch source. The first RM clears the existing site-packages
+# directory so stale upstream files (e.g. removed providers, old controllers)
+# don't shadow rating-branch code.
+RUN rm -rf /app/venv/lib/python3.13/site-packages/music_assistant
+COPY music_assistant_overlay/ \
+     /app/venv/lib/python3.13/site-packages/music_assistant/
+
+# Replace upstream's installed music_assistant_models package with the
+# rating-branch source — needed for the new dataclass fields like
+# critical_reception, listen_later, etc.
+RUN rm -rf /app/venv/lib/python3.13/site-packages/music_assistant_models
+COPY models_overlay/ \
+     /app/venv/lib/python3.13/site-packages/music_assistant_models/
+
+# Pull in the rating-branch frontend (already-built static assets in the
+# music_assistant_frontend Python package). Replaces the upstream-bundled
+# frontend so Listen Later, Add to Lidarr, and other rating-branch UI changes
+# are present in the deployed app.
+COPY frontend_overlay/ \
+     /app/venv/lib/python3.13/site-packages/music_assistant_frontend/
+
+# Replace upstream's released aiosendspin with the rating-branch local-wheel
+# build (5.2.0.dev2+trackfields). Adds StaticDelayChangedEvent and the
+# trackfields shape that the rating-branch sendspin/airplay/chromecast
+# providers import — without this overlay those providers fail to import.
+RUN rm -rf /app/venv/lib/python3.13/site-packages/aiosendspin \
+           /app/venv/lib/python3.13/site-packages/aiosendspin-*.dist-info
+COPY aiosendspin_overlay/ \
+     /app/venv/lib/python3.13/site-packages/aiosendspin/
+COPY aiosendspin_dist_info_overlay/ \
+     /app/venv/lib/python3.13/site-packages/aiosendspin-5.2.0.dev2+trackfields.dist-info/
+
+# local_audio's sendspin_bridge imports sounddevice unconditionally; that
+# loads libportaudio2.so at module init. Neither the Python package nor the
+# system library is in upstream, so install both before touching the venv.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libportaudio2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rating-branch server pulls in deps that aren't in upstream's installed
+# venv (torch for audio analysis, etc.). Install the deltas without rebuilding
+# the whole venv.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN /bin/uv pip install --python /app/venv/bin/python --no-cache \
+    --index-strategy unsafe-best-match \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch==2.11.0 \
+    torchaudio==2.11.0 \
+    nnAudio==0.3.3 \
+    sounddevice==0.5.5 \
+    beat-this==1.1.0 \
+    einops
+
+# Re-compile bytecode so module imports don't pay first-import cost on boot.
+RUN /app/venv/bin/python -m compileall -q \
+    /app/venv/lib/python3.13/site-packages/music_assistant \
+    /app/venv/lib/python3.13/site-packages/music_assistant_models \
+    /app/venv/lib/python3.13/site-packages/aiosendspin \
+    || true

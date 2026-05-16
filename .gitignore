@@ -28,3 +28,12 @@ docs/superpowers
 .devenv*
 devenv.local.nix
 devenv.local.yaml
+
+# Rating-branch overlay artifacts. The *_overlay/ dirs are populated by
+# scripts/staging for Dockerfile.lidarr's overlay-based image build; they
+# mirror installed venv packages and are recreated locally as needed.
+/aiosendspin_overlay/
+/aiosendspin_dist_info_overlay/
+/frontend_overlay/
+/models_overlay/
+/music_assistant_overlay/

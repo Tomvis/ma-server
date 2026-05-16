@@ -15,6 +15,31 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ENV VIRTUAL_ENV=/app/venv
 RUN uv venv $VIRTUAL_ENV
 
+# Pre-install local sibling wheels so requirements_all.txt's pinned versions
+# resolve without PyPI. On feature branches the server pins
+# music-assistant-frontend / music-assistant-models / aiosendspin versions
+# that aren't on PyPI yet (carry feature-branch-only commits — currently
+# music-assistant-frontend@2.17.155, music-assistant-models@1.1.118 and
+# aiosendspin@5.2.0.dev2+trackfields, which exposes extra track-info fields
+# the rating-branch sendspin provider relies on). The matching wheels are
+# dropped into dist/ alongside the server wheel before the docker build.
+#
+# requirements_all.txt is rewritten in-place to point aiosendspin at the
+# local wheel — otherwise uv would resolve the bare ==5.2.0 pin from PyPI
+# and overwrite our pre-installed trackfields build (PEP 440: 5.2.0.dev2 is
+# a pre-release of 5.2.0, so the bare == constraint doesn't accept it).
+RUN if ls dist/music_assistant_frontend-*.whl 2>/dev/null | grep -q .; then \
+        uv pip install --no-cache dist/music_assistant_frontend-*.whl; \
+    fi && \
+    if ls dist/music_assistant_models-*.whl 2>/dev/null | grep -q .; then \
+        uv pip install --no-cache dist/music_assistant_models-*.whl; \
+    fi && \
+    if ls dist/aiosendspin-*.whl 2>/dev/null | grep -q .; then \
+        AIOSENDSPIN_WHL=$(ls dist/aiosendspin-*.whl | head -1); \
+        uv pip install --no-cache "aiosendspin[server] @ file:${AIOSENDSPIN_WHL}"; \
+        sed -i -E "s|^aiosendspin\[server\]==.*|aiosendspin[server] @ file:./${AIOSENDSPIN_WHL}|" requirements_all.txt; \
+    fi
+
 # pre-install ALL requirements into the venv
 # comes at a cost of a slightly larger image size but is faster to start
 # because we do not have to install dependencies at runtime
