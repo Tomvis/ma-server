@@ -27,6 +27,20 @@ from music_assistant_models.api import CommandMessage
 from music_assistant_models.auth import UserRole
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
+from music_assistant_models.errors import (
+    AlreadyInLibraryError,
+    AlreadyInListenLaterError,
+    AuthenticationFailed,
+    AuthenticationRequired,
+    InsufficientPermissions,
+    InvalidToken,
+    MediaNotFoundError,
+    MusicAssistantError,
+    PlayerUnavailableError,
+    ProviderPermissionDenied,
+    ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
+)
 
 from music_assistant.constants import (
     CONF_AUTH_ALLOW_SELF_REGISTRATION,
@@ -514,6 +528,27 @@ class WebserverController(CoreController):
         finally:
             self.clients.discard(connection)
 
+    def _jsonrpc_error_response(self, command: str, err: MusicAssistantError) -> web.Response:
+        """Map a MusicAssistantError to a JSON-RPC 4xx/5xx response."""
+        if isinstance(err, MediaNotFoundError | PlayerUnavailableError | ProviderUnavailableError):
+            status = 404
+        elif isinstance(err, AuthenticationRequired | AuthenticationFailed | InvalidToken):
+            status = 401
+        elif isinstance(err, InsufficientPermissions | ProviderPermissionDenied):
+            status = 403
+        elif isinstance(err, AlreadyInLibraryError | AlreadyInListenLaterError):
+            # Both are 409, but the `code` field in the body differentiates them.
+            status = 409
+        elif isinstance(err, ResourceTemporarilyUnavailable):
+            status = 503
+        else:
+            status = 400
+        self.logger.warning("%s: %s: %s", command, type(err).__name__, err)
+        return web.json_response(
+            {"error": type(err).__name__, "message": str(err), "code": err.error_code},
+            status=status,
+        )
+
     async def _handle_jsonrpc_api_command(self, request: web.Request) -> web.Response:
         """Handle incoming JSON RPC API command."""
         # Fail early if we don't have any users yet
@@ -583,8 +618,13 @@ class WebserverController(CoreController):
             elif inspect.iscoroutine(result):
                 result = await result
             return web.json_response(result, dumps=json_dumps)
+        except MusicAssistantError as e:
+            # Domain errors (album not in library, media not found, etc.) aren't
+            # server faults — map to 4xx so clients can distinguish "won't ever
+            # work" from "transient server bug" and the WS and HTTP JSON-RPC
+            # paths report failures consistently.
+            return self._jsonrpc_error_response(command_msg.command, e)
         except Exception as e:
-            # Return clean error message without stacktrace
             error_type = type(e).__name__
             error_msg = str(e)
             error = f"{error_type}: {error_msg}"

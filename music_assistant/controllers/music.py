@@ -24,6 +24,8 @@ from music_assistant_models.enums import (
     TaskStatus,
 )
 from music_assistant_models.errors import (
+    AlreadyInLibraryError,
+    AlreadyInListenLaterError,
     InvalidDataError,
     InvalidProviderID,
     InvalidProviderURI,
@@ -987,12 +989,18 @@ class MusicController(CoreController):
         # Reject if the album already lives in the library proper. Listen-later
         # rows have no in_library mapping by design; a hit with in_library=True
         # means the user already has it from a sync/library-add and wouldn't see
-        # the listen-later entry anyway.
+        # the listen-later entry anyway. Also reject re-adds of an album that
+        # is already flagged listen-later so the client can distinguish "no-op"
+        # from "added".
         existing_id = await self.albums.find_existing_library_id(candidate)
         if existing_id is not None:
             existing = await self.albums.get_library_item(existing_id)
             if any(pm.in_library for pm in existing.provider_mappings):
-                raise InvalidDataError(f"Album {existing.name!r} is already in your library")
+                raise AlreadyInLibraryError(f"Album {existing.name!r} is already in your library")
+            if existing.listen_later:
+                raise AlreadyInListenLaterError(
+                    f"Album {existing.name!r} is already in listen-later"
+                )
 
         if critical_reception is not None:
             # Land CR on the in-memory album so _add_library_item persists it on
@@ -1014,7 +1022,7 @@ class MusicController(CoreController):
         # have flipped in_library=True. If so, refuse rather than create a row
         # that ends up in both views.
         if any(pm.in_library for pm in candidate.provider_mappings):
-            raise InvalidDataError(
+            raise AlreadyInLibraryError(
                 f"Album {candidate.name!r} is already in your library "
                 "(added concurrently); listen-later not applied"
             )
@@ -1194,8 +1202,7 @@ class MusicController(CoreController):
                 return 0
 
         has_play_history = bool(playlog_row) and (
-            _row_int(playlog_row, "play_count") > 0
-            or _row_int(playlog_row, "last_played") > 0
+            _row_int(playlog_row, "play_count") > 0 or _row_int(playlog_row, "last_played") > 0
         )
         has_anchor = (
             library_item.favorite
