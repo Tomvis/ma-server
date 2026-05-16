@@ -899,7 +899,6 @@ class SendspinPlayer(SendspinBasePlayer):
             track_number = track.track_number or None
             album_mapping = track.album
             if album_mapping is not None:
-                year = album_mapping.year
                 if not isinstance(album_mapping, Album):
                     # Cheap DB-only lookup, no external API call; None if not in library
                     result = await self.mass.music.get_library_item_by_prov_id(
@@ -908,6 +907,8 @@ class SendspinPlayer(SendspinBasePlayer):
                     full_album: Album | None = result if isinstance(result, Album) else None
                 else:
                     full_album = album_mapping
+                # ItemMapping.year is usually unset; prefer the full Album's year.
+                year = (full_album.year if full_album is not None else None) or album_mapping.year
                 if full_album and full_album.artists:
                     album_artist = full_album.artist_str
 
