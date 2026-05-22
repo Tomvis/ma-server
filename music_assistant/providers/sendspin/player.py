@@ -499,7 +499,6 @@ class SendspinPlayer(SendspinBasePlayer):
                     "Web Player",
                     "Mobile Application",
                     "PWA",
-                    "SendSpinDroid",
                 )
                 or device_info.manufacturer == "Music Assistant"
             )
