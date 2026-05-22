@@ -338,14 +338,16 @@ class SendspinProvider(PlayerProvider):
             if sendspin_client is None:
                 self.logger.debug("Client %s disconnected before hello completed", client_id)
                 return
-            # Wait for client hello to be processed (info becomes available)
-            # ClientAddedEvent fires before the hello handshake completes
-            for _ in range(50):  # Wait up to 5 seconds
-                if sendspin_client._info is not None:
-                    break
-                await asyncio.sleep(0.1)
-            else:
-                self.logger.warning("Client %s hello not received within timeout", client_id)
+            # aiosendspin fires ClientAddedEvent after mark_connected(), which
+            # in turn runs after attach_connection() has set _info from the
+            # hello payload. So _info is guaranteed populated by the time we
+            # get here. If it isn't, something has gone wrong inside the
+            # connection layer and we shouldn't paper over it.
+            if sendspin_client._info is None:
+                self.logger.warning(
+                    "Client %s connected without hello info (aiosendspin invariant violation)",
+                    client_id,
+                )
                 return
             if not self._is_current_client_event(client_id, event_version):
                 self.logger.debug("Skipping stale add event for %s", client_id)
