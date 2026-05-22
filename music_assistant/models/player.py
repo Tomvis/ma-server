@@ -1035,6 +1035,21 @@ class Player(ABC):
                     is_native=True,
                 )
             )
+        elif (
+            self.provider.domain in PROTOCOL_PRIORITY
+            and PlayerFeature.SET_MEMBERS in self.supported_features
+        ):
+            # Player is itself a native endpoint of a known protocol domain.
+            result.append(
+                OutputProtocol(
+                    output_protocol_id=self.player_id,
+                    name=self.provider.name,
+                    protocol_domain=self.provider.domain,
+                    priority=PROTOCOL_PRIORITY[self.provider.domain],
+                    available=self.available,
+                    is_native=True,
+                )
+            )
 
         # Add active protocol players
         active_ids: set[str] = set()
@@ -1335,7 +1350,7 @@ class Player(ABC):
             return ""
         return (
             f"{media.uri}|{media.title}|{media.source_id}|{media.queue_item_id}|"
-            f"{media.image_url}|{media.duration}|{media.elapsed_time}"
+            f"{media.image_url}|{media.duration}|{media.elapsed_time}|{media.palette}"
         )
 
     @final
@@ -1535,18 +1550,24 @@ class Player(ABC):
             elapsed_time = self.elapsed_time
             elapsed_time_last_updated = self.elapsed_time_last_updated
 
-        # If a PluginSource is active with elapsed_time metadata, prefer it
-        # over the player/protocol elapsed_time (which tracks bytes consumed,
-        # not the source's logical playback position).
-        active_source = self.__final_active_source
+        # If the active queue item is an AudioSource with upstream-clock
+        # metadata (e.g. Spotify Connect / AirPlay / Yandex Ynison reporting
+        # the source's logical position), prefer that over the protocol /
+        # self elapsed_time — the latter tracks bytes consumed, which is the
+        # wrong clock for live plugin sources (loses upstream seeks and
+        # pause-resume on the queue's corrected_elapsed_time, which the
+        # player_queues controller and several player providers consume).
         if (
-            active_source
-            and (source := self.mass.players.get_plugin_source(active_source))
-            and source.metadata
-            and source.metadata.elapsed_time is not None
+            (active_source := self.__final_active_source)
+            and (queue := self.mass.player_queues.get(active_source))
+            and (current_item := queue.current_item) is not None
+            and (sd := current_item.streamdetails) is not None
+            and sd.media_type == MediaType.AUDIO_SOURCE
+            and sd.stream_metadata is not None
+            and sd.stream_metadata.elapsed_time is not None
         ):
-            elapsed_time = source.metadata.elapsed_time
-            elapsed_time_last_updated = source.metadata.elapsed_time_last_updated or time.time()
+            elapsed_time = sd.stream_metadata.elapsed_time
+            elapsed_time_last_updated = sd.stream_metadata.elapsed_time_last_updated or time.time()
 
         return (playback_state, elapsed_time, elapsed_time_last_updated)
 
@@ -1658,6 +1679,9 @@ class Player(ABC):
     @final
     def __final_current_media(self) -> PlayerMedia | None:
         """Return the FINAL current media for the player."""
+        # Lazy import to avoid helpers.colors -> helpers.images -> models.plugin cycle.
+        from music_assistant.helpers.colors import peek_palette_for_url  # noqa: PLC0415
+
         # if the player is grouped/synced, use the current_media of the group/parent player
         if parent_player_id := (self.__final_active_group or self.__final_synced_to):
             if parent_player_id != self.player_id and (
@@ -1669,26 +1693,8 @@ class Player(ABC):
         if self.type == PlayerType.PROTOCOL and self.__attr_protocol_parent_id:
             if parent_player := self.mass.players.get_player(self.__attr_protocol_parent_id):
                 return parent_player.state.current_media
-        # if a pluginsource is currently active, return those details
-        active_source = self.__final_active_source
-        if (
-            active_source
-            and (source := self.mass.players.get_plugin_source(active_source))
-            and source.metadata
-        ):
-            return PlayerMedia(
-                uri=source.metadata.uri or source.id,
-                media_type=MediaType.PLUGIN_SOURCE,
-                title=source.metadata.title,
-                artist=source.metadata.artist,
-                album=source.metadata.album,
-                image_url=source.metadata.image_url,
-                duration=source.metadata.duration,
-                source_id=source.id,
-                elapsed_time=source.metadata.elapsed_time,
-                elapsed_time_last_updated=source.metadata.elapsed_time_last_updated,
-            )
         # if MA queue is active, return those details
+        active_source = self.__final_active_source
         active_queue: PlayerQueue | None = None
         if not active_queue and active_source:
             active_queue = self.mass.player_queues.get(active_source)
@@ -1705,13 +1711,15 @@ class Player(ABC):
                 stream_metadata := current_item.streamdetails.stream_metadata
             ):
                 # handle stream metadata in streamdetails (e.g. for radio stream)
+                image_url = stream_metadata.image_url or item_image_url
                 return PlayerMedia(
                     uri=current_item.uri,
                     media_type=current_item.media_type,
                     title=stream_metadata.title or current_item.name,
                     artist=stream_metadata.artist,
                     album=stream_metadata.album or stream_metadata.description or current_item.name,
-                    image_url=(stream_metadata.image_url or item_image_url),
+                    image_url=image_url,
+                    palette=peek_palette_for_url(image_url),
                     duration=stream_metadata.duration or current_item.duration,
                     source_id=active_queue.queue_id,
                     queue_item_id=current_item.queue_item_id,
@@ -1727,19 +1735,23 @@ class Player(ABC):
                 podcast = getattr(media_item, "podcast", None)
                 metadata = getattr(media_item, "metadata", None)
                 description = getattr(metadata, "description", None) if metadata else None
+                # the image format needs to be 500x500 jpeg for maximum player compatibility
+                image_url = (
+                    self.mass.metadata.get_image_url(
+                        current_item.media_item.image, size=500, image_format="jpeg"
+                    )
+                    or item_image_url
+                    if current_item.media_item.image
+                    else item_image_url
+                )
                 return PlayerMedia(
                     uri=str(media_item.uri),
                     media_type=media_item.media_type,
                     title=f"{media_item.name} ({version})" if version else media_item.name,
                     artist=getattr(media_item, "artist_str", None),
                     album=album.name if album else podcast.name if podcast else description,
-                    # the image format needs to be 500x500 jpeg for maximum player compatibility
-                    image_url=self.mass.metadata.get_image_url(
-                        current_item.media_item.image, size=500, image_format="jpeg"
-                    )
-                    or item_image_url
-                    if current_item.media_item.image
-                    else item_image_url,
+                    image_url=image_url,
+                    palette=peek_palette_for_url(image_url),
                     duration=media_item.duration,
                     source_id=active_queue.queue_id,
                     queue_item_id=current_item.queue_item_id,
@@ -1753,6 +1765,7 @@ class Player(ABC):
                 media_type=current_item.media_type,
                 title=current_item.name,
                 image_url=item_image_url,
+                palette=peek_palette_for_url(item_image_url),
                 duration=current_item.duration,
                 source_id=active_queue.queue_id,
                 queue_item_id=current_item.queue_item_id,
@@ -1764,13 +1777,15 @@ class Player(ABC):
             return None
         # return native current media if no group/queue is active
         if self.current_media:
+            image_url = self.current_media.image_url
             return PlayerMedia(
                 uri=self.current_media.uri,
                 media_type=self.current_media.media_type,
                 title=self.current_media.title,
                 artist=self.current_media.artist,
                 album=self.current_media.album,
-                image_url=self.current_media.image_url,
+                image_url=image_url,
+                palette=peek_palette_for_url(image_url),
                 duration=self.current_media.duration,
                 source_id=self.current_media.source_id or active_source,
                 queue_item_id=self.current_media.queue_item_id,
@@ -1803,12 +1818,6 @@ class Player(ABC):
                 can_next_previous=True,
             )
             sources.append(mass_source)
-        # append all/any plugin sources (convert to PlayerSource to avoid deepcopy issues)
-        for plugin_source in self.mass.players.get_plugin_sources():
-            if hasattr(plugin_source, "as_player_source"):
-                sources.append(plugin_source.as_player_source())
-            else:
-                sources.append(plugin_source)
         return sources
 
     @cached_property
@@ -2022,11 +2031,6 @@ class Player(ABC):
         ):
             return parent_player.state.active_source
 
-        # if a plugin source is active that belongs to this player, return that
-        for plugin_source in self.mass.players.get_plugin_sources():
-            if plugin_source.in_use_by == self.player_id:
-                return plugin_source.id
-
         # always prefer active MA source but add a guard to detect if player is really playing
         # something different, such as a line-in or TV input, we use an explicit list here
         # because many players do not accurately report the active_source
@@ -2102,15 +2106,9 @@ class Player(ABC):
         if active_source == self.player_id:
             return False
 
-        # Check if it's a known queue ID
-        if self.mass.player_queues.get(active_source):
-            return False
-
-        # Check if it's a plugin source - if not, it's an external source
-        return not any(
-            plugin_source.id == active_source
-            for plugin_source in self.mass.players.get_plugin_sources()
-        )
+        # If it's a known queue ID it's MA-managed; anything else is external
+        # (line-in, TV input, etc.)
+        return self.mass.player_queues.get(active_source) is None
 
     @final
     def _expand_can_group_with(self) -> set[Player]:

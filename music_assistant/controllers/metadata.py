@@ -1230,13 +1230,6 @@ class MetaDataController(CoreController):
         if TYPE_CHECKING:
             local_provs = cast("set[str]", local_provs)
 
-        # Track whether a LOCAL (non-streaming) music provider — file tags, NFO,
-        # etc. — actually contributed genres. The user-facing CONF_PREFER_LOCAL_GENRES
-        # setting is described as "online providers will not add genres to items
-        # that already have a genre from a local source"; checking
-        # `bool(metadata.genres)` after the merge would also trip on genres pulled
-        # in by streaming providers, the opposite of the documented behaviour.
-        local_provided_genres = False
         # collect metadata from all [music] providers
         # note that we sort the providers by priority so that we always
         # prefer local providers over online providers
@@ -1257,12 +1250,6 @@ class MetaDataController(CoreController):
                 prov_item = await self.mass.music.artists.get_provider_item(
                     prov_mapping.item_id, prov_mapping.provider_instance
                 )
-                if (
-                    not prov.is_streaming_provider
-                    and prov_item.metadata is not None
-                    and prov_item.metadata.genres
-                ):
-                    local_provided_genres = True
                 artist.metadata.update(prov_item.metadata)
 
         # The musicbrainz ID is mandatory for all metadata lookups
@@ -1270,9 +1257,13 @@ class MetaDataController(CoreController):
             if mbid := await self._get_artist_mbid(artist):
                 artist.mbid = mbid
 
-        # don't merge online genres on top of source-supplied ones
-        prefer_local_genres = (
-            self.config.get_value(CONF_PREFER_LOCAL_GENRES) and local_provided_genres
+        # don't merge online genres on top of source-supplied ones; propagation-derived
+        # genres also count as a local source so they survive metadata refreshes
+        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
+            bool(artist.metadata.genres)
+            or await self.mass.music.genres.has_derived_genre_mappings(
+                MediaType.ARTIST, artist.item_id
+            )
         )
 
         # collect metadata from all (online)[metadata] providers
@@ -1305,9 +1296,6 @@ class MetaDataController(CoreController):
 
         self.logger.debug("Updating metadata for Album %s", album.name)
 
-        # Track whether a LOCAL music provider contributed genres (see the matching
-        # comment in _update_artist_metadata for the rationale).
-        local_provided_genres = False
         # collect metadata from all [music] providers
         # note that we sort the providers by priority so that we always
         # prefer local providers over online providers
@@ -1327,21 +1315,19 @@ class MetaDataController(CoreController):
                 prov_item = await self.mass.music.albums.get_provider_item(
                     prov_mapping.item_id, prov_mapping.provider_instance
                 )
-                if (
-                    not prov.is_streaming_provider
-                    and prov_item.metadata is not None
-                    and prov_item.metadata.genres
-                ):
-                    local_provided_genres = True
                 album.metadata.update(prov_item.metadata)
                 if album.year is None and prov_item.year:
                     album.year = prov_item.year
                 if album.album_type == AlbumType.UNKNOWN:
                     album.album_type = prov_item.album_type
 
-        # don't merge online genres on top of source-supplied ones
-        prefer_local_genres = (
-            self.config.get_value(CONF_PREFER_LOCAL_GENRES) and local_provided_genres
+        # don't merge online genres on top of source-supplied ones; propagation-derived
+        # genres also count as a local source so they survive metadata refreshes
+        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
+            bool(album.metadata.genres)
+            or await self.mass.music.genres.has_derived_genre_mappings(
+                MediaType.ALBUM, album.item_id
+            )
         )
 
         # collect metadata from all (online) [metadata] providers
@@ -1634,7 +1620,7 @@ class MetaDataController(CoreController):
         for ref_album in ref_albums:
             if mb_artist := await musicbrainz.get_artist_details_by_album(artist.name, ref_album):
                 return mb_artist.id
-        # last restort: track matching by name
+        # last resort: track matching by name
         for ref_track in ref_tracks:
             if not ref_track.album:
                 continue
