@@ -165,7 +165,7 @@ def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[s
     return sub, {src_key: source}
 
 
-def _apply_critical_reception_filters(  # noqa: PLR0913
+def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
     *,
     query_parts: list[str],
     query_params: dict[str, Any],
@@ -178,13 +178,28 @@ def _apply_critical_reception_filters(  # noqa: PLR0913
     tps_favorite: bool | None,
     tps_labels: list[str] | None,
     tps_untagged: bool | None,
+    match_mode: str = "all",
 ) -> None:
     """Append SQL clauses for critical_reception filters into the supplied lists.
 
-    All filters are independent; multiple filters AND together. Each list-shaped filter
-    OR-combines its values internally (a DR bucket selector matches if the album falls
-    in any of the chosen buckets).
+    Each list-shaped filter OR-combines its values internally (a DR bucket selector
+    matches if the album falls in any of the chosen buckets). The ``match_mode``
+    parameter controls how the resulting top-level clauses combine with each other:
+
+    - ``"all"`` (default): clauses are appended individually to ``query_parts`` so
+      they AND with each other and with the rest of the surrounding query.
+    - ``"any"``: clauses are collected locally and appended as one OR group so an
+      album matches if it satisfies *any* active critical-reception filter, while
+      the OR group itself still ANDs with non-reception filters (favorite, genre,
+      provider, etc.). Falls back to "all" semantics when zero or one clause is
+      active, since OR over a single clause is identical to AND.
+
+    :param match_mode: ``"all"`` or ``"any"``; any other value is treated as ``"all"``.
     """
+    # Collect clauses locally; we'll decide how to splice them into query_parts
+    # based on match_mode at the end.
+    local_parts: list[str] = []
+
     # DR buckets — combine into a single OR clause referencing one extracted value.
     # Prefers the canonical (measured) `$.dynamic_range` and falls back to the
     # AMG-review-reported `$.critical_reception.amg_dr` so an album with only the
@@ -213,28 +228,28 @@ def _apply_critical_reception_filters(  # noqa: PLR0913
                 else:
                     query_params[hi_key] = hi
                     or_parts.append(f"({dr_path} >= :{lo_key} AND {dr_path} < :{hi_key})")
-            query_parts.append("(" + " OR ".join(or_parts) + ")")
+            local_parts.append("(" + " OR ".join(or_parts) + ")")
 
     # AMG / TPS rating buckets
     if amg_ratings:
         clause, params = _amg_rating_bucket_clause(list(amg_ratings), "amg_rb")
         if clause:
-            query_parts.append(clause)
+            local_parts.append(clause)
             query_params.update(params)
     if tps_ratings:
         clause, params = _tps_rating_bucket_clause(list(tps_ratings), "tps_rb")
         if clause:
-            query_parts.append(clause)
+            local_parts.append(clause)
             query_params.update(params)
 
     # AMG / TPS favorite flag
     if amg_favorite:
         clause, params = _source_favorite_clause("AMG", "amg_fav")
-        query_parts.append(clause)
+        local_parts.append(clause)
         query_params.update(params)
     if tps_favorite:
         clause, params = _source_favorite_clause("TPS", "tps_fav")
-        query_parts.append(clause)
+        local_parts.append(clause)
         query_params.update(params)
 
     # AMG / TPS label-kind filters
@@ -245,18 +260,27 @@ def _apply_critical_reception_filters(  # noqa: PLR0913
         if labels_list:
             clause, params = _source_labels_clause(source, list(labels_list), prefix)
             if clause:
-                query_parts.append(clause)
+                local_parts.append(clause)
                 query_params.update(params)
 
     # untagged-source flags
     if amg_untagged:
         clause, params = _source_untagged_clause("AMG", "amg_unt")
-        query_parts.append(clause)
+        local_parts.append(clause)
         query_params.update(params)
     if tps_untagged:
         clause, params = _source_untagged_clause("TPS", "tps_unt")
-        query_parts.append(clause)
+        local_parts.append(clause)
         query_params.update(params)
+
+    if not local_parts:
+        return
+    if match_mode == "any" and len(local_parts) > 1:
+        # Single OR group ANDed against everything else in query_parts. Parenthesize
+        # to keep the precedence intact when the caller joins with " AND ".
+        query_parts.append("(" + " OR ".join(local_parts) + ")")
+    else:
+        query_parts.extend(local_parts)
 
 
 class AlbumsController(MediaControllerBase[Album]):
@@ -383,6 +407,7 @@ class AlbumsController(MediaControllerBase[Album]):
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
         tps_untagged: bool | None = None,
+        critical_reception_match: str = "all",
         **kwargs: Any,
     ) -> list[Album]:
         """Get in-database albums.
@@ -400,6 +425,8 @@ class AlbumsController(MediaControllerBase[Album]):
         :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
         :param amg_labels / tps_labels: Filter by accolade label kind.
         :param amg_untagged / tps_untagged: Keep only albums missing that source.
+        :param critical_reception_match: ``"all"`` (default) ANDs all DR/AMG/TPS clauses;
+            ``"any"`` ORs them so an album matches if it satisfies at least one.
         """
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
@@ -426,6 +453,7 @@ class AlbumsController(MediaControllerBase[Album]):
             tps_favorite=tps_favorite,
             tps_labels=tps_labels,
             tps_untagged=tps_untagged,
+            match_mode=critical_reception_match,
         )
         if order_by and "artist_name" in order_by:
             # join artist table to allow sorting on artist name
@@ -527,6 +555,7 @@ class AlbumsController(MediaControllerBase[Album]):
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
         tps_untagged: bool | None = None,
+        critical_reception_match: str = "all",
         # Caller's effective page-size hint. library_items's artist top-up only
         # fires on page 1 when page 1 has < cutoff hits AND remaining_limit > 0.
         # When the caller is paging at < cutoff items per page, the artist-only
@@ -586,6 +615,7 @@ class AlbumsController(MediaControllerBase[Album]):
             tps_favorite=tps_favorite,
             tps_labels=tps_labels,
             tps_untagged=tps_untagged,
+            match_mode=critical_reception_match,
         )
 
         async def _count(
@@ -637,7 +667,7 @@ class AlbumsController(MediaControllerBase[Album]):
         #   • title_count >= cutoff → only title rows are ever visible.
         #     Counting the OR-union here would inflate by the artist-only delta.
         #   • title_count <  cutoff → page 1 includes the artist-only delta.
-        #     |title ∪ artist| == |title| + |artist \ title|, which is exactly
+        #     |title ∪ artist| == |title| + |artist \ title|, which is exactly  # noqa: RUF003
         #     what the user sees, so the union count is right.
         search_safe = create_safe_string(search, True, True)
         search_params = {"search": f"%{search_safe}%"}
