@@ -1060,15 +1060,17 @@ class MusicController(CoreController):
         # Reject if the album already lives in the library proper. Listen-later
         # rows have no in_library mapping by design; a hit with in_library=True
         # means the user already has it from a sync/library-add and wouldn't see
-        # the listen-later entry anyway. Also reject re-adds of an album that
-        # is already flagged listen-later so the client can distinguish "no-op"
-        # from "added".
+        # the listen-later entry anyway. Reject pure re-adds of an album that's
+        # already flagged listen-later so the client can distinguish "no-op"
+        # from "added" — but let a re-add through when the caller is supplying
+        # fresh critical_reception data: that's a metadata-update gesture (the
+        # user is tagging an album they've already saved), not a duplicate add.
         existing_id = await self.albums.find_existing_library_id(candidate)
         if existing_id is not None:
             existing = await self.albums.get_library_item(existing_id)
             if any(pm.in_library for pm in existing.provider_mappings):
                 raise AlreadyInLibraryError(f"Album {existing.name!r} is already in your library")
-            if existing.listen_later:
+            if existing.listen_later and critical_reception is None:
                 raise AlreadyInListenLaterError(
                     f"Album {existing.name!r} is already in listen-later"
                 )
@@ -1082,6 +1084,15 @@ class MusicController(CoreController):
                 candidate.metadata = MediaItemMetadata()
             candidate.metadata.critical_reception = critical_reception
 
+        # Scrub provider-mapping in_library before persisting: a streaming
+        # provider candidate (e.g. an album the user has saved in Tidal/Spotify)
+        # can arrive with in_library=True on its mapping, and set_provider_mappings
+        # writes that verbatim — which would land the freshly-inserted row in the
+        # regular Albums view alongside its listen-later entry. Listen-later rows
+        # must never carry in_library=True on any mapping. The hash is on
+        # (provider_instance, item_id) so this in-place mutation is set-safe.
+        for pm in candidate.provider_mappings:
+            pm.in_library = False
         # Always go through add_item_to_library — it routes new items through
         # _add_library_item (in_library left at default 0, no provider sync) and
         # existing rows through _update_library_item, which merges metadata

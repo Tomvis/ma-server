@@ -644,11 +644,16 @@ class AudioAnalysisController:
         # Explicit aclose() in finally guarantees the ffmpeg subprocess behind
         # get_media_stream is torn down on early break or wait_for cancellation —
         # otherwise cleanup defers to the async-generator GC hook and can leak
-        # subprocesses under sustained timeout pressure.
-        audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
+        # subprocesses under sustained timeout pressure. The construction itself
+        # lives inside the try so any synchronous failure in get_media_stream still
+        # routes through aclose (no-op when audio_source never bound) AND through
+        # the outer except in _run_background_streaming_for_track, which pops the
+        # session entry via _cancel_providers.
+        audio_source = None
         completed = False
         next_allowed = time.monotonic()
         try:
+            audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
             async for chunk in audio_source:
                 if session_key not in self._active_sessions:
                     # all providers evicted — bail early
@@ -668,8 +673,9 @@ class AudioAnalysisController:
             # ffmpeg subprocess died mid-stream) doesn't mask whatever caused the
             # loop to exit. The leak is what aclose was here to prevent in the
             # first place — if it can't run, the GC hook still eventually fires.
-            with contextlib.suppress(Exception):
-                await audio_source.aclose()
+            if audio_source is not None:
+                with contextlib.suppress(Exception):
+                    await audio_source.aclose()
         if session_key not in self._active_sessions:
             return
         if completed:
