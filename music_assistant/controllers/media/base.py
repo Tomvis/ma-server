@@ -7,7 +7,7 @@ import logging
 from abc import ABCMeta, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar, cast, final
 
@@ -1192,7 +1192,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             db_row_dict["listen_later"] = bool(db_row_dict["listen_later"])
         db_row_dict["item_id"] = str(db_row_dict["item_id"])
         db_row_dict["date_added"] = datetime.fromtimestamp(
-            db_row_dict["timestamp_added"]
+            db_row_dict["timestamp_added"], tz=UTC
         ).isoformat()
 
         for key in JSON_KEYS:
