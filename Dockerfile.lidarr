@@ -49,7 +49,9 @@ RUN apt-get update \
 
 # Rating-branch server pulls in deps that aren't in upstream's installed
 # venv (torch for audio analysis, etc.). Install the deltas without rebuilding
-# the whole venv.
+# the whole venv. modern_colorthief is a NEW base dependency (helpers/colors.py,
+# imported during core player-controller startup) that the upstream base image
+# predates — without it the server fails to boot with ModuleNotFoundError.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 RUN /bin/uv pip install --python /app/venv/bin/python --no-cache \
     --index-strategy unsafe-best-match \
@@ -59,7 +61,8 @@ RUN /bin/uv pip install --python /app/venv/bin/python --no-cache \
     nnAudio==0.3.3 \
     sounddevice==0.5.5 \
     beat-this==1.1.0 \
-    einops
+    einops \
+    modern_colorthief==0.2.1
 
 # Re-compile bytecode so module imports don't pay first-import cost on boot.
 RUN /app/venv/bin/python -m compileall -q \
