@@ -217,12 +217,32 @@ class LidarrProvider(PluginProvider):
 
         # albums_monitored == 1 → newly monitored now.
         # lidarr_synced=True with albums_monitored == 0 → idempotent re-call,
-        # i.e. the album was already monitored before this request.
-        already_monitored = lidarr_synced and albums_monitored == 0
+        # i.e. the album was already monitored before this request. The
+        # artists_added == 0 guard matters: lidarr_synced only means an inline
+        # sync ran, not that *this album* was already monitored. When a brand-
+        # new artist is added the sync runs (lidarr_synced=True) yet
+        # albums_monitored == 0, because Lidarr hasn't refreshed the new
+        # artist's metadata and its albums don't exist in Lidarr's DB to
+        # monitor yet. Without this guard that case is misread as "already
+        # monitored" and reported as a false success.
+        already_monitored = lidarr_synced and albums_monitored == 0 and artists_added == 0
+        # New artist added but no album monitored: Lidarr accepted the artist
+        # but its albums aren't available to monitor until the artist-metadata
+        # refresh completes. This is the bug the user hits — the artist lands in
+        # Lidarr while the album is silently never monitored, yet the call would
+        # otherwise return success and the frontend would toast "added". Surface
+        # it as a per-request error; a retry once Lidarr has refreshed the
+        # artist will pick up the album.
+        if artists_added > 0 and albums_monitored == 0:
+            raise MusicRaterError(
+                f"Lidarr added the artist {artist_name!r} but couldn't monitor "
+                f"{album_name!r} yet — its catalog hasn't been refreshed. "
+                "Try 'Add to Lidarr' again in a minute."
+            )
         # No counters and no sync flag means music-rater accepted the POST but
         # neither monitored nor reported activity — surface as a malformed
         # backend response (per-request error, not provider-wide outage).
-        if not (albums_monitored > 0 or already_monitored or artists_added > 0):
+        if not (albums_monitored > 0 or already_monitored):
             raise MusicRaterError(
                 f"music-rater returned no-op for {artist_name!r} - {album_name!r} "
                 "(no errors, no monitors, no sync). Check music-rater logs."

@@ -27,9 +27,18 @@ if TYPE_CHECKING:
     from aiohttp import ClientSession
 
 
-# Cap each music-rater call. The /lidarr/queue endpoint runs an inline single-album
-# sync against Lidarr, so allow a bit of headroom; everything else is a quick list.
+# Cap each music-rater call. Resolve / ping / list are quick reads.
 _REQUEST_TIMEOUT = ClientTimeout(total=30)
+
+# The /lidarr/queue endpoint runs an inline single-album sync against Lidarr.
+# For a brand-new artist that means waiting out Lidarr's async metadata
+# refresh — music-rater polls the discography until the target album hydrates
+# (backoff to ~120s) and then drains the post-add RefreshArtist before
+# re-verifying the monitored flag (backoff to ~60s). Give the POST a much
+# larger ceiling so a legitimate new-artist add isn't cut off mid-sync.
+# Lidarr's absolute worst case can still edge past this; music-rater finishes
+# server-side and the next add/sync reconciles, so we don't size for it.
+_QUEUE_REQUEST_TIMEOUT = ClientTimeout(total=180)
 
 
 class MusicRaterError(InvalidDataError):
@@ -60,6 +69,8 @@ class MusicRaterClient:
         self,
         method: str,
         path: str,
+        *,
+        timeout: ClientTimeout = _REQUEST_TIMEOUT,
         **kwargs: Any,
     ) -> tuple[int, Any]:
         """Issue a request and return (status, parsed-body-or-text).
@@ -67,6 +78,9 @@ class MusicRaterClient:
         A malformed JSON body — Content-Type claims JSON but the bytes don't
         parse — is treated like a text response; callers already handle the
         "body isn't a dict" case and produce a useful error message.
+
+        ``timeout`` defaults to the quick-read cap; the inline /lidarr/queue
+        sync passes the larger ``_QUEUE_REQUEST_TIMEOUT``.
         """
         url = f"{self._base}/api/v1/{path.lstrip('/')}"
         async with self._session.request(
@@ -74,7 +88,7 @@ class MusicRaterClient:
             url,
             headers=self._headers,
             ssl=self._verify_ssl,
-            timeout=_REQUEST_TIMEOUT,
+            timeout=timeout,
             **kwargs,
         ) as resp:
             status = resp.status
@@ -136,7 +150,11 @@ class MusicRaterClient:
         Maps documented status codes to MA error types so the global error
         toast carries a useful message.
         """
-        status, body = await self._request("POST", f"albums/{int(album_id)}/lidarr/queue")
+        status, body = await self._request(
+            "POST",
+            f"albums/{int(album_id)}/lidarr/queue",
+            timeout=_QUEUE_REQUEST_TIMEOUT,
+        )
         if status == 200:
             # The queue endpoint is documented to return a LidarrQueueResponse
             # JSON object with counters. An empty body / non-dict shape means
