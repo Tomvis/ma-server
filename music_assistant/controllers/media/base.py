@@ -315,15 +315,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             provider_filter=self._ensure_provider_filter(provider),
             in_library_only=True,
         )
-        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
-        if join_parts:
-            sql_query += f" {' '.join(join_parts)}"
-        if query_parts:
-            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
-        # A provider_mappings JOIN can fan a row out per-mapping — dedupe so the
-        # count stays media-item-level.
-        sql_query += f" GROUP BY {self.db_table}.item_id"
-        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
+        return await self._execute_count(query_parts, join_parts, query_params)
 
     async def library_items(
         self,
@@ -1051,6 +1043,30 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     def _clean_query_parts(query_parts: list[str]) -> list[str]:
         """Clean the query parts list by removing duplicate where statements."""
         return [x[5:] if x.lower().startswith("where ") else x for x in query_parts]
+
+    @final
+    async def _execute_count(
+        self,
+        query_parts: list[str],
+        join_parts: list[str],
+        query_params: dict[str, Any],
+    ) -> int:
+        """
+        Assemble and execute a deduplicated COUNT over this controller's table.
+
+        :param query_parts: WHERE-clause fragments (combined with AND).
+        :param join_parts: JOIN fragments appended after the FROM clause.
+        :param query_params: Bound query parameters.
+        """
+        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
+        if join_parts:
+            sql_query += f" {' '.join(join_parts)}"
+        if query_parts:
+            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
+        # A provider_mappings JOIN can fan a row out per-mapping — dedupe so the
+        # count stays media-item-level.
+        sql_query += f" GROUP BY {self.db_table}.item_id"
+        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
 
     @final
     def _apply_random_subquery(

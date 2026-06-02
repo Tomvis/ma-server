@@ -627,15 +627,7 @@ class AlbumsController(MediaControllerBase[Album]):
             parts = base_parts + (extra_parts or [])
             params = {**base_params, **(extra_params_extra or {})}
             joins = base_joins + (extra_joins or [])
-            sql = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
-            if joins:
-                sql += f" {' '.join(joins)}"
-            if parts:
-                sql += " WHERE " + " AND ".join(self._clean_query_parts(parts))
-            # A row with multiple in-library mappings would otherwise be counted
-            # once per mapping — dedupe so the count stays album-level.
-            sql += f" GROUP BY {self.db_table}.item_id"
-            return await self.mass.music.database.get_count_from_query(sql, params)
+            return await self._execute_count(parts, joins, params)
 
         # No search → single count with the base filters.
         if not search:

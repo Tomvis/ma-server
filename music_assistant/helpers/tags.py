@@ -56,14 +56,18 @@ _TRUTHY_TAG_VALUES = frozenset({"1", "true", "yes", "y", "t"})
 _FALSY_TAG_VALUES = frozenset({"0", "false", "no", "n", "f"})
 
 
+def _first_tag_value(raw: str | list[str] | tuple[str, ...] | None) -> str | None:
+    """Unwrap a possibly multi-valued tag to its first scalar value (None if empty/missing)."""
+    if isinstance(raw, list | tuple):
+        return raw[0] if raw else None
+    return raw
+
+
 def _parse_float_tag(raw: str | list[str] | tuple[str, ...] | None) -> float | None:
     """Parse a single numeric tag value to float; return None for missing/invalid input."""
+    raw = _first_tag_value(raw)
     if raw is None:
         return None
-    if isinstance(raw, list | tuple):
-        raw = raw[0] if raw else None
-        if raw is None:
-            return None
     text = str(raw).strip().replace(",", ".")
     if not text:
         return None
@@ -79,12 +83,9 @@ def _parse_float_tag(raw: str | list[str] | tuple[str, ...] | None) -> float | N
 
 def _parse_bool_tag(raw: str | list[str] | tuple[str, ...] | None) -> bool | None:
     """Parse a boolean tag (1/0, true/false). Return None for missing/unrecognized input."""
+    raw = _first_tag_value(raw)
     if raw is None:
         return None
-    if isinstance(raw, list | tuple):
-        raw = raw[0] if raw else None
-        if raw is None:
-            return None
     text = str(raw).strip().lower()
     if text in _TRUTHY_TAG_VALUES:
         return True

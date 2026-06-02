@@ -61,22 +61,31 @@ class LidarrProvider(PluginProvider):
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
 
+    def _host_port(self) -> str | None:
+        """Return the configured URL's hostname[:port] with userinfo stripped, or None.
+
+        urlparse(url).netloc keeps the `user:pass@` userinfo in front of the host, so
+        deriving host:port from it would leak embedded credentials. This rebuilds from
+        hostname/port only, so callers can safely log or toast the result.
+        """
+        parsed = urlparse(str(self.config.get_value(CONF_URL) or ""))
+        if not parsed.hostname:
+            return None
+        if parsed.port is not None:
+            return f"{parsed.hostname}:{parsed.port}"
+        return parsed.hostname
+
     def _sanitized_url(self) -> str:
         """Return the configured music-rater URL with any userinfo stripped.
 
-        urlparse(url).netloc keeps the `user:pass@` portion in front of the
-        host, so logging or toasting the raw URL / netloc would leak embedded
-        credentials. Reassemble as scheme://host[:port] for user-visible
-        output.
+        Reassembled as scheme://host[:port] so logging or toasting the result can
+        never leak credentials embedded in the configured URL.
         """
+        host = self._host_port()
         url = str(self.config.get_value(CONF_URL) or "")
-        parsed = urlparse(url)
-        if not parsed.hostname:
+        if host is None:
             return url
-        host = parsed.hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        scheme = parsed.scheme or "http"
+        scheme = urlparse(url).scheme or "http"
         return f"{scheme}://{host}"
 
     async def loaded_in_mass(self) -> None:
@@ -265,12 +274,4 @@ class LidarrProvider(PluginProvider):
         URL's host:port — that's the only stable identity we have for the
         upstream service.
         """
-        # urlparse(url).netloc keeps userinfo (`user:pass@host:port`); use
-        # hostname[:port] so the toast can never leak credentials.
-        url = str(self.config.get_value(CONF_URL) or "")
-        parsed = urlparse(url)
-        if parsed.hostname:
-            return (
-                f"{parsed.hostname}:{parsed.port}" if parsed.port is not None else parsed.hostname
-            )
-        return self.name
+        return self._host_port() or self.name

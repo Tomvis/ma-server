@@ -323,6 +323,48 @@ class GenreController(MediaControllerBase[Genre]):
         )
         self.logger.debug("updated %s in database: (id %s)", update.name, db_id)
 
+    def _apply_genre_visibility_filter(
+        self,
+        parts: list[str],
+        params: dict[str, Any],
+        *,
+        search: str | None,
+        hide_empty: bool | None,
+        media_type: MediaType | None,
+    ) -> None:
+        """
+        Apply the shared genre visibility filter used by library_items and library_count.
+
+        Sets the raw lowered search param (for alias matching, since the normalized
+        :search param strips spaces/special chars) and the media_type / hide_empty
+        clause, so the listing and its count stay in sync.
+
+        :param parts: WHERE-clause fragments to extend in place.
+        :param params: Query params to extend in place.
+        :param search: Free-text search; sets :search_raw for alias matching.
+        :param hide_empty: Only applies when media_type is not set. True: only mapped
+            genres; False: all genres; None: only default genres (translation_key set).
+        :param media_type: When set, restrict to genres with a mapping for this media
+            type (implies non-empty); takes precedence over hide_empty.
+        """
+        if search:
+            params["search_raw"] = f"%{search.strip().lower()}%"
+        if media_type is not None:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
+                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
+                "AND gm_mt.media_type = :filter_media_type)"
+            )
+            params["filter_media_type"] = media_type.value
+        elif hide_empty is None:
+            parts.append(f"{self.db_table}.translation_key IS NOT NULL")
+        elif hide_empty:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
+            )
+
     async def library_items(
         self,
         favorite: bool | None = None,
@@ -352,29 +394,15 @@ class GenreController(MediaControllerBase[Genre]):
             raise ValueError(msg)
         # Genres are library-only items without provider_mappings, so ignore
         # the provider filter (the frontend always sends provider="library").
-        # Pass raw lowered search for alias matching (search_raw),
-        # since the normalized :search param strips spaces/special chars.
         extra_params: dict[str, Any] = {}
         extra_parts: list[str] = []
-        if search:
-            extra_params["search_raw"] = f"%{search.strip().lower()}%"
-        if media_type is not None:
-            # media_type implies non-empty: return all genres (including non-default) that
-            # have at least one mapping for the requested type.
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            extra_parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
-                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
-                "AND gm_mt.media_type = :filter_media_type)"
-            )
-            extra_params["filter_media_type"] = media_type.value
-        elif hide_empty is None:
-            extra_parts.append(f"{self.db_table}.translation_key IS NOT NULL")
-        elif hide_empty:
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            extra_parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
-            )
+        self._apply_genre_visibility_filter(
+            extra_parts,
+            extra_params,
+            search=search,
+            hide_empty=hide_empty,
+            media_type=media_type,
+        )
         return await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
@@ -415,12 +443,6 @@ class GenreController(MediaControllerBase[Genre]):
         # that view, so filter explicitly here or counts include excluded rows.
         query_parts: list[str] = [f"{self.db_table}.is_excluded = 0"]
         join_parts: list[str] = []
-        # The overridden _search_filter_clause matches by name (`:search`) AND by
-        # alias (`:search_raw`); library_items sets both via extra_params, so do
-        # the same here or the alias half of the OR clause errors out with
-        # "no value for binding parameter :search_raw" at execution.
-        if search:
-            query_params["search_raw"] = f"%{search.strip().lower()}%"
         self._apply_filters(
             query_parts=query_parts,
             query_params=query_params,
@@ -431,30 +453,18 @@ class GenreController(MediaControllerBase[Genre]):
             provider_filter=None,
             in_library_only=False,
         )
-        # Reproduce library_items' default-vs-empty / media-type filtering so
-        # the count matches what gets listed.
-        if media_type is not None:
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            query_parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
-                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
-                "AND gm_mt.media_type = :filter_media_type)"
-            )
-            query_params["filter_media_type"] = media_type.value
-        elif hide_empty is None:
-            query_parts.append(f"{self.db_table}.translation_key IS NOT NULL")
-        elif hide_empty:
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            query_parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
-            )
-        sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
-        if join_parts:
-            sql_query += f" {' '.join(join_parts)}"
-        if query_parts:
-            sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
-        sql_query += f" GROUP BY {self.db_table}.item_id"
-        return await self.mass.music.database.get_count_from_query(sql_query, query_params)
+        # Mirror library_items' search_raw + default-vs-empty / media-type filtering so
+        # the count matches what gets listed (and :search_raw is bound for the alias
+        # half of the overridden _search_filter_clause, which would otherwise error at
+        # execution with "no value for binding parameter :search_raw").
+        self._apply_genre_visibility_filter(
+            query_parts,
+            query_params,
+            search=search,
+            hide_empty=hide_empty,
+            media_type=media_type,
+        )
+        return await self._execute_count(query_parts, join_parts, query_params)
 
     async def radio_mode_base_tracks(
         self,

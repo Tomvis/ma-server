@@ -154,8 +154,7 @@ class AudioAnalysisController:
             if not provider_ids:
                 continue
             for provider_id in provider_ids:
-                provider = self.mass.get_provider(provider_id)
-                if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+                if provider := self._resolve_aa_provider(provider_id):
                     cancel_tasks.append(
                         asyncio.create_task(
                             asyncio.wait_for(provider.cancel(session_key), timeout=5)
@@ -185,6 +184,17 @@ class AudioAnalysisController:
             for prov in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS)
             if isinstance(prov, AudioAnalysisProvider) and prov.available
         ]
+
+    def _resolve_aa_provider(self, prov_id: str) -> AudioAnalysisProvider | None:
+        """
+        Return the available AudioAnalysisProvider for the given id, or None.
+
+        :param prov_id: Provider instance id to resolve.
+        """
+        provider = self.mass.get_provider(prov_id)
+        if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+            return provider
+        return None
 
     async def start_analysis(
         self,
@@ -1001,8 +1011,7 @@ class AudioAnalysisController:
         if not provider_ids:
             return
         for provider_id in provider_ids:
-            provider = self.mass.get_provider(provider_id)
-            if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+            if provider := self._resolve_aa_provider(provider_id):
                 self.mass.create_task(provider.finalize(session_key))
 
     def _cancel_providers(self, session_key: str) -> None:
@@ -1011,8 +1020,7 @@ class AudioAnalysisController:
         if not provider_ids:
             return
         for provider_id in provider_ids:
-            provider = self.mass.get_provider(provider_id)
-            if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+            if provider := self._resolve_aa_provider(provider_id):
                 self.mass.create_task(provider.cancel(session_key))
 
     async def _distribute_chunk(
@@ -1038,10 +1046,8 @@ class AudioAnalysisController:
 
         async def _process(prov_id: str) -> str | None:
             try:
-                provider = self.mass.get_provider(prov_id)
-                if not (
-                    provider and isinstance(provider, AudioAnalysisProvider) and provider.available
-                ):
+                provider = self._resolve_aa_provider(prov_id)
+                if provider is None:
                     return None
                 await asyncio.wait_for(
                     provider.process_pcm_chunk(session_key, pcm_data),
@@ -1064,8 +1070,7 @@ class AudioAnalysisController:
         if not evicted:
             return
         for prov_id in evicted:
-            provider = self.mass.get_provider(prov_id)
-            if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+            if provider := self._resolve_aa_provider(prov_id):
                 self.mass.create_task(provider.cancel(session_key))
         # Apply eviction against whatever the live entry holds *now*: another
         # concurrent task may have already added/removed providers since we

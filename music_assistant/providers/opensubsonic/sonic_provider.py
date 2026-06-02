@@ -373,10 +373,16 @@ class OpenSonicProvider(MusicProvider):
                 offset=offset,
             )
 
-    async def _enrich_album_with_critical_reception(self, album: Album, prov_album_id: str) -> None:
-        """Populate album CR + album-scope DR by ffprobing one track of the album."""
+    async def _enrich_album_with_critical_reception(
+        self, album: Album, prov_album_id: str, sonic_album: SonicAlbum | None = None
+    ) -> None:
+        """Populate album CR + album-scope DR by ffprobing one track of the album.
+
+        :param sonic_album: Pre-fetched album record forwarded to the CR fetch so callers
+            that already paid for ``conn.get_album`` skip a redundant round-trip on cache miss.
+        """
         try:
-            extracted = await self._get_album_critical_reception(prov_album_id)
+            extracted = await self._get_album_critical_reception(prov_album_id, sonic_album)
         except Exception as err:
             self.logger.debug(
                 "critical_reception extraction failed for album %s: %s", prov_album_id, err
@@ -594,21 +600,9 @@ class OpenSonicProvider(MusicProvider):
         # Route through the shared CR cache so library sync and direct get_album
         # don't both pay for ffprobe; the pre-fetched sonic_album skips a redundant
         # conn.get_album on cache miss.
-        try:
-            extracted = await self._get_album_critical_reception(
-                prov_album_id, sonic_album=sonic_album
-            )
-        except Exception as err:
-            self.logger.debug(
-                "critical_reception extraction failed for album %s: %s", prov_album_id, err
-            )
-        else:
-            if extracted is not None:
-                cr, album_dr = extracted
-                if cr is not None:
-                    album.metadata.critical_reception = cr
-                if album_dr is not None:
-                    album.metadata.dynamic_range = album_dr
+        await self._enrich_album_with_critical_reception(
+            album, prov_album_id, sonic_album=sonic_album
+        )
         return album
 
     @use_cache(3600 * 3)  # cache for 3 hours
