@@ -439,10 +439,15 @@ class OpenSonicProvider(MusicProvider):
         # observed (or probe budget is exhausted) so neither signal is lost.
         cr: CriticalReception | None = None
         album_dr: float | None = None
+        # Distinguish "probe ran cleanly and found nothing" from "every probe attempt
+        # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
+        # a transient failure returns bare None and is skipped below.
+        probed_clean = False
         for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
             probe = await self._extract_critical_reception_from_song(sonic_song.id)
             if probe is None:
                 continue
+            probed_clean = True
             probe_cr, probe_dr = probe
             if cr is None and probe_cr is not None:
                 cr = probe_cr
@@ -453,6 +458,11 @@ class OpenSonicProvider(MusicProvider):
         extracted: tuple[CriticalReception | None, float | None] | None = (
             (cr, album_dr) if (cr is not None or album_dr is not None) else None
         )
+        if extracted is None and not probed_clean:
+            # Every probe attempt errored transiently (stream/ffprobe failure) rather
+            # than cleanly finding no tags. Don't pin a 24h negative cache — mirror the
+            # "fetch failed" path above so the next sync re-probes once it recovers.
+            return None
         await self.mass.cache.set(
             key=cache_key,
             data=_serialize_cr_cache_entry(extracted),

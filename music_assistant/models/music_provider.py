@@ -1072,44 +1072,40 @@ class MusicProvider(Provider):
                         library_item.item_id, prov_item
                     )
                 elif (
-                    prov_item.metadata
-                    and prov_item.metadata.critical_reception is not None
-                    and _critical_reception_is_richer(
-                        prov_item.metadata.critical_reception,
-                        library_item.metadata.critical_reception if library_item.metadata else None,
-                    )
-                ):
-                    # Provider has surfaced fresher / more complete critical_reception
-                    # metadata (DR / AMG / TPS). MediaItemMetadata.update() only fills
-                    # None-valued fields and won't deep-merge CriticalReception, so we
-                    # overwrite the field directly on the library item and persist via
-                    # update_item_in_library — guarding the rest of the metadata by only
-                    # mutating critical_reception on the in-memory prov_item.
-                    if library_item.metadata is not None:
-                        library_item.metadata.critical_reception = (
-                            prov_item.metadata.critical_reception
+                    library_item.metadata is not None
+                    and prov_item.metadata is not None
+                    and (
+                        (
+                            prov_item.metadata.critical_reception is not None
+                            and _critical_reception_is_richer(
+                                prov_item.metadata.critical_reception,
+                                library_item.metadata.critical_reception,
+                            )
                         )
-                    library_item = await self.mass.music.albums.update_item_in_library(
-                        library_item.item_id, library_item
-                    )
-                elif (
-                    prov_item.metadata
-                    and prov_item.metadata.dynamic_range is not None
-                    and prov_item.metadata.dynamic_range
-                    != (
-                        library_item.metadata.dynamic_range
-                        if library_item.metadata is not None
-                        else None
+                        or (
+                            prov_item.metadata.dynamic_range is not None
+                            and prov_item.metadata.dynamic_range
+                            != library_item.metadata.dynamic_range
+                        )
                     )
                 ):
-                    # Provider has surfaced a refreshed measured DR (e.g. OpenSubsonic
-                    # just ffprobed an updated ALBUM_DYNAMIC_RANGE tag, or filesystem
-                    # re-scanned tracks). MediaItemMetadata.update() skips None values
-                    # but also skips populated non-None scalars on the cur side, so the
-                    # new DR would otherwise never overwrite an older one. Do the same
-                    # in-place override the CR arm above does.
-                    if library_item.metadata is not None:
-                        library_item.metadata.dynamic_range = prov_item.metadata.dynamic_range
+                    # Provider has surfaced fresher critical_reception (DR / AMG / TPS)
+                    # and/or a refreshed measured dynamic_range. The two fields are
+                    # independent, so apply whichever changed and persist once — keeping
+                    # them in separate elif arms meant a sync that refreshed both in the
+                    # same pass would only land one. The authoritative merge/override for
+                    # both fields lives in albums._update_library_item (critical_reception
+                    # via _critical_reception_is_richer, dynamic_range via a direct scalar
+                    # copy), so mutating them on the in-memory library_item and calling
+                    # update_item_in_library is what persists them.
+                    cr = prov_item.metadata.critical_reception
+                    if cr is not None and _critical_reception_is_richer(
+                        cr, library_item.metadata.critical_reception
+                    ):
+                        library_item.metadata.critical_reception = cr
+                    new_dr = prov_item.metadata.dynamic_range
+                    if new_dr is not None and new_dr != library_item.metadata.dynamic_range:
+                        library_item.metadata.dynamic_range = new_dr
                     library_item = await self.mass.music.albums.update_item_in_library(
                         library_item.item_id, library_item
                     )

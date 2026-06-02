@@ -120,22 +120,21 @@ class MusicRaterClient:
             params={"music_assistant_uri": music_assistant_uri, "limit": "1"}
         )
 
-    async def resolve_by_search(self, query: str) -> int | None:
-        """Free-text album search (artist + album). Returns the top hit's id."""
-        return await self._first_album_id(params={"search": query, "limit": "1"})
+    async def resolve_by_search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Free-text album search (artist + album). Return up to `limit` candidate dicts.
+
+        Unlike the exact URI resolve, a text search can surface a *different* album
+        (a remaster, a live version, a same-titled record), so the caller must verify
+        a candidate's artist/title against what was requested before queueing it.
+        """
+        return await self._get_album_items(params={"search": query, "limit": str(int(limit))})
 
     async def _first_album_id(self, *, params: dict[str, str]) -> int | None:
-        status, body = await self._request("GET", "albums", params=params)
-        if status >= 500:
-            raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
-        if status >= 400 or not isinstance(body, dict):
-            snippet = body if isinstance(body, str) else str(body)[:200]
-            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
-        items = body.get("items") or []
+        items = await self._get_album_items(params=params)
         if not items:
             return None
         first = items[0]
-        if not isinstance(first, dict) or "id" not in first:
+        if "id" not in first:
             raise MusicRaterError(f"music-rater returned malformed album item: {first!r}")
         try:
             return int(first["id"])
@@ -143,6 +142,17 @@ class MusicRaterClient:
             raise MusicRaterError(
                 f"music-rater returned non-numeric album id: {first['id']!r}"
             ) from err
+
+    async def _get_album_items(self, *, params: dict[str, str]) -> list[dict[str, Any]]:
+        """GET /albums and return the (dict) items list, mapping errors to MA error types."""
+        status, body = await self._request("GET", "albums", params=params)
+        if status >= 500:
+            raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
+        if status >= 400 or not isinstance(body, dict):
+            snippet = body if isinstance(body, str) else str(body)[:200]
+            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
+        items = body.get("items") or []
+        return [item for item in items if isinstance(item, dict)]
 
     async def queue_lidarr(self, album_id: int) -> dict[str, Any]:
         """POST /albums/{id}/lidarr/queue — flips lidarr_manual_add + inline sync.
@@ -155,9 +165,11 @@ class MusicRaterClient:
             f"albums/{int(album_id)}/lidarr/queue",
             timeout=_QUEUE_REQUEST_TIMEOUT,
         )
-        if status == 200:
+        if 200 <= status < 300:
             # The queue endpoint is documented to return a LidarrQueueResponse
-            # JSON object with counters. An empty body / non-dict shape means
+            # JSON object with counters. Accept any 2xx (e.g. a 201 Created on a
+            # POST that materialises a queue entry) so a successful sync isn't
+            # reported as a failure. An empty body / non-dict shape means
             # music-rater violated its own contract; surface that to the user
             # rather than silently treating it as a benign no-op (which
             # _build_result would then re-raise as a misleading error anyway).
@@ -165,7 +177,7 @@ class MusicRaterClient:
                 snippet = body if isinstance(body, str) else str(body)[:200]
                 raise MusicRaterError(
                     f"music-rater POST /albums/{album_id}/lidarr/queue returned "
-                    f"status=200 with no JSON body: {snippet[:200] or '(empty)'}"
+                    f"status={status} with no JSON body: {snippet[:200] or '(empty)'}"
                 )
             return body
         # Per music-rater's documented error surface.

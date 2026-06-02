@@ -432,6 +432,31 @@ def parse_utc_timestamp(datetime_string: str) -> datetime:
     return datetime.fromisoformat(datetime_string)
 
 
+def _parse_sequence(
+    name: str,
+    value: Any,
+    elem_type: Any,
+    concrete_type: type,
+    *,
+    allow_value_convert: bool,
+) -> Any:
+    """Parse a list/tuple/Sequence param into ``concrete_type``.
+
+    None elements are skipped unless the element type itself admits None (e.g.
+    ``list[int | None]``); for ``list[int]`` / ``list[str]`` a stray None is
+    dropped rather than tripping the required-value guard in :func:`parse_value`.
+    """
+    elem_origin = get_origin(elem_type)
+    elem_allows_none = elem_type is NoneType or (
+        elem_origin in (Union, UnionType) and NoneType in get_args(elem_type)
+    )
+    return concrete_type(
+        parse_value(name, subvalue, elem_type, allow_value_convert=allow_value_convert)
+        for subvalue in value
+        if subvalue is not None or elem_allows_none
+    )
+
+
 def parse_value(  # noqa: PLR0911
     name: str,
     value: Any,
@@ -469,11 +494,12 @@ def parse_value(  # noqa: PLR0911
     if origin in (tuple, list, Sequence, Iterable):
         # For abstract types like Sequence and Iterable, use list as the concrete type
         concrete_type = list if origin in (Sequence, Iterable) else origin
-        return concrete_type(
-            parse_value(
-                name, subvalue, get_args(value_type)[0], allow_value_convert=allow_value_convert
-            )
-            for subvalue in value
+        return _parse_sequence(
+            name,
+            value,
+            get_args(value_type)[0],
+            concrete_type,
+            allow_value_convert=allow_value_convert,
         )
     if origin is dict:
         subkey_type = get_args(value_type)[0]

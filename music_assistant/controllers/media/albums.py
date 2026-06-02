@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import AlbumType, EventType, MediaType, ProviderFeature
@@ -894,26 +895,33 @@ class AlbumsController(MediaControllerBase[Album]):
         """Update existing record in the database."""
         db_id = int(item_id)  # ensure integer
         cur_item = await self.get_library_item(db_id)
-        # Snapshot the stored CR before metadata.update() so the strict rule below
-        # decides authoritatively: model.update() also has a CR-replacement path
-        # (CriticalReception.is_richer_than), but its rule accepts "more sources"
-        # without rejecting an amg_dr regression — so it can swap stored_cr for a
-        # less-rich-by-our-rule payload. We re-decide afterwards using the strict
-        # check and either keep the incoming CR or restore stored_cr.
+        # Snapshot the stored CR before metadata.update() runs so we can re-decide
+        # authoritatively which CR to keep. On the merge branch (overwrite False)
+        # model.update() already deep-merges critical_reception into a superset (the
+        # stored amg_dr is kept when the incoming one is None, sources are unioned);
+        # we keep that merged value when it's at least as rich as the stored CR and
+        # only restore stored_cr when the strict rule says it regressed — so a purely
+        # additive update (e.g. a newly surfaced TPS source) survives instead of being
+        # reverted wholesale. On the wholesale branch (overwrite True, e.g. refresh_item)
+        # the payload's CR replaces stored CR even when it's empty / less rich, silently
+        # wiping filesystem-tag-derived CR, so we restore stored_cr there too when the
+        # incoming payload isn't richer.
         stored_cr = cur_item.metadata.critical_reception if cur_item.metadata else None
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
-        # Apply the strict CR rule on BOTH branches. On the merge branch (overwrite
-        # False) the lenient model rule may have already swapped CR; on the wholesale
-        # branch (overwrite True, e.g. refresh_item) the update payload's CR replaces
-        # stored CR wholesale even when it's empty / less rich, silently wiping
-        # filesystem-tag-derived CR. Either way, restore stored_cr when the strict
-        # rule says the incoming payload isn't richer.
         if update.metadata is not None:
-            incoming_cr = update.metadata.critical_reception
-            if _critical_reception_is_richer(incoming_cr, stored_cr):
-                metadata.critical_reception = incoming_cr
-            else:
+            # Judge the candidate CR: the deep-merged superset on the merge branch,
+            # the raw incoming CR on the wholesale branch.
+            candidate_cr = (
+                update.metadata.critical_reception if overwrite else metadata.critical_reception
+            )
+            if not _critical_reception_is_richer(candidate_cr, stored_cr):
                 metadata.critical_reception = stored_cr
+            # Provider-refreshed measured dynamic_range is a plain scalar: model.update()
+            # keeps a populated non-None cur value, so a refreshed incoming DR would never
+            # land on the merge branch. Copy it across explicitly (mirrors the in-memory
+            # override the album sync arm sets on the library_item before persisting).
+            if update.metadata.dynamic_range is not None:
+                metadata.dynamic_range = update.metadata.dynamic_range
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:
@@ -959,8 +967,11 @@ class AlbumsController(MediaControllerBase[Album]):
                 existing_pm = merged.get(key)
                 if existing_pm is None:
                     merged[key] = pm
-                elif pm.in_library:
-                    existing_pm.in_library = True
+                elif pm.in_library and not existing_pm.in_library:
+                    # Promote in_library without mutating the caller-supplied `update`
+                    # mapping in place (these objects are seeded by reference from
+                    # update.provider_mappings); replace with a copy instead.
+                    merged[key] = replace(existing_pm, in_library=True)
             provider_mappings = list(merged.values())
         await self.set_provider_mappings(db_id, provider_mappings, overwrite)
         # set album artist(s)

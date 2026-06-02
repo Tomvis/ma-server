@@ -1596,8 +1596,9 @@ class MetaDataController(CoreController):
 
         self.logger.debug("Updating metadata for Track %s", track.name)
 
-        # Track whether a LOCAL music provider contributed genres (see the matching
-        # comment in _update_artist_metadata for the rationale).
+        # Track whether a LOCAL (non-streaming) music provider contributed genres.
+        # Unlike artist/album (which count any provider's genres), streaming-provider
+        # genres are intentionally not treated as local for tracks.
         local_provided_genres = False
         # collect metadata from all [music] providers
         # note that we sort the providers by priority so that we always
@@ -1626,9 +1627,15 @@ class MetaDataController(CoreController):
                     local_provided_genres = True
                 track.metadata.update(prov_item.metadata)
 
-        # don't merge online genres on top of source-supplied ones
-        prefer_local_genres = (
-            self.config.get_value(CONF_PREFER_LOCAL_GENRES) and local_provided_genres
+        # don't merge online genres on top of source-supplied ones; a local music
+        # provider's genres or propagation-derived genres count as a local source and
+        # survive metadata refreshes (mirrors _update_album_metadata, except streaming-
+        # provider genres are intentionally not treated as local here)
+        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
+            local_provided_genres
+            or await self.mass.music.genres.has_derived_genre_mappings(
+                MediaType.TRACK, track.item_id
+            )
         )
 
         # collect metadata from all [metadata] providers

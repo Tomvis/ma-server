@@ -93,21 +93,48 @@ class ArtistsController(MediaControllerBase[Artist]):
         return []
 
     async def library_count(
-        self, favorite_only: bool = False, album_artists_only: bool = False
+        self,
+        favorite: bool | None = None,
+        search: str | None = None,
+        provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
+        favorite_only: bool = False,
+        album_artists_only: bool = False,
+        **kwargs: Any,
     ) -> int:
-        """Return the total number of items in the library."""
-        sql_query = f"SELECT item_id FROM {self.db_table}"
+        """Return the total number of (album) artists in the library matching the filters.
+
+        Mirrors :meth:`library_items` so count and list track each other 1-1 on
+        any filtered view.
+
+        :param favorite: Filter by favorite status (True / False / None).
+        :param search: Free-text search query.
+        :param provider: Filter by provider instance ID (single string or list).
+        :param genre: Filter by genre id(s).
+        :param favorite_only: Legacy alias for ``favorite=True``; kept for older clients.
+        :param album_artists_only: Only count artists that have albums.
+        """
+        if favorite_only and favorite is None:
+            favorite = True
+        query_params: dict[str, Any] = {}
         query_parts: list[str] = []
-        if favorite_only:
-            query_parts.append("favorite = 1")
+        join_parts: list[str] = []
+        self._apply_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            join_parts=join_parts,
+            favorite=favorite,
+            search=self._preprocess_search(search, query_params),
+            genre_ids=self._preprocess_genre_ids(genre),
+            provider_filter=self._ensure_provider_filter(provider),
+            in_library_only=True,
+        )
         if album_artists_only:
             query_parts.append(
-                f"item_id in (select {DB_TABLE_ALBUM_ARTISTS}.artist_id "
-                f"FROM {DB_TABLE_ALBUM_ARTISTS})"
+                f"{self.db_table}.item_id in "
+                f"(select {DB_TABLE_ALBUM_ARTISTS}.artist_id FROM {DB_TABLE_ALBUM_ARTISTS})"
             )
-        if query_parts:
-            sql_query += f" WHERE {' AND '.join(query_parts)}"
-        return await self.mass.music.database.get_count_from_query(sql_query)
+        return await self._execute_count(query_parts, join_parts, query_params)
 
     async def library_items(
         self,

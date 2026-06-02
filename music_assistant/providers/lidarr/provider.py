@@ -26,9 +26,15 @@ from urllib.parse import urlparse
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InvalidDataError
 
+from music_assistant.helpers.compare import compare_strings
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
 from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
+
+# How many search candidates to pull when the exact MA-URI resolve misses. The
+# top hit isn't trusted blindly (it can be a different edition / same-titled
+# record); we scan candidates and accept only one whose artist+title match.
+_SEARCH_CANDIDATE_LIMIT = 5
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,6 +44,31 @@ if TYPE_CHECKING:
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
+
+
+def _match_album_id(
+    candidates: list[dict[str, Any]], artist_name: str, album_name: str
+) -> int | None:
+    """Return the id of the first candidate whose artist AND title match the request.
+
+    music-rater's search items carry ``artist_name_raw`` / ``album_title_raw`` (always
+    populated). We require both to match the requested artist/album (normalized,
+    case-insensitive) so a fuzzy search hit for a different album is rejected rather
+    than silently queued to Lidarr.
+    """
+    for item in candidates:
+        cand_id = item.get("id")
+        cand_artist = item.get("artist_name_raw")
+        cand_album = item.get("album_title_raw")
+        if not isinstance(cand_id, int):
+            continue
+        if not isinstance(cand_artist, str) or not isinstance(cand_album, str):
+            continue
+        if compare_strings(artist_name, cand_artist, strict=True) and compare_strings(
+            album_name, cand_album, strict=True
+        ):
+            return cand_id
+    return None
 
 
 class LidarrProvider(PluginProvider):
@@ -165,19 +196,31 @@ class LidarrProvider(PluginProvider):
             return album_id
 
         # URI didn't hit. Music-rater hasn't synced this album to MA yet (likely
-        # added by hand). Best-effort text search.
+        # added by hand). Best-effort text search — but a free-text search ranks
+        # fuzzily and can return a different edition / same-titled record, so we
+        # only accept a candidate whose artist AND title match the request rather
+        # than blindly queueing the top hit (which would silently sync the wrong
+        # album while reporting success under the requested names).
         query = f"{artist_name} {album_name}".strip()
         self.logger.info(
             "music-rater URI lookup empty for %r — falling back to search %r",
             album_uri,
             query,
         )
-        album_id = await self._client.resolve_by_search(query)
+        candidates = await self._client.resolve_by_search(query, limit=_SEARCH_CANDIDATE_LIMIT)
+        album_id = _match_album_id(candidates, artist_name, album_name)
         if album_id is None:
             raise InvalidDataError(
                 f"music-rater doesn't know {artist_name!r} - {album_name!r}. "
                 "Sync it from music-rater to MA first, or add it to music-rater."
             )
+        self.logger.debug(
+            "music-rater search %r matched album_id=%d for %r - %r",
+            query,
+            album_id,
+            artist_name,
+            album_name,
+        )
         return album_id
 
     @staticmethod
