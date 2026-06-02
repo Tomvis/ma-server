@@ -3096,7 +3096,7 @@ class MusicController(CoreController):
                     raise
 
         if 40 <= prev_version <= 41:
-            # Recovery: an earlier rating-branch build bumped the schema version
+            # Recovery: an earlier enhanced-branch build bumped the schema version
             # past 39 without running the is_manual migration, leaving DBs at
             # version 40/41 without the column. Re-run the idempotent ADD COLUMN.
             # Bounded to 40/41 so clean upgrades from older schemas don't trip
@@ -3130,7 +3130,7 @@ class MusicController(CoreController):
                         raise
 
         if 42 <= prev_version <= 43:
-            # Earlier rating-branch builds stored album DR under
+            # Earlier enhanced-branch builds stored album DR under
             # `$.critical_reception.dr`. The new schema splits that into the
             # canonical (measured) `$.dynamic_range` and the AMG-review-reported
             # `$.critical_reception.amg_dr`. Move legacy values to
@@ -3138,7 +3138,7 @@ class MusicController(CoreController):
             # old payloads were dominated by measured DR. The old key is
             # dropped only when the destination either gets a value or already
             # has one, so a measured re-scan from the upstream tag writer
-            # always wins. Bounded to 42/43 because only those rating-branch
+            # always wins. Bounded to 42/43 because only those enhanced-branch
             # builds shipped the legacy `$.critical_reception.dr` shape.
             await self._database.execute(
                 f"UPDATE {DB_TABLE_ALBUMS} SET metadata = json_set("
