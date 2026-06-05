@@ -29,16 +29,17 @@ COPY models_overlay/ \
 COPY frontend_overlay/ \
      /app/venv/lib/python3.13/site-packages/music_assistant_frontend/
 
-# Replace upstream's released aiosendspin with the rating-branch local-wheel
-# build (5.2.0.dev2+trackfields). Adds StaticDelayChangedEvent and the
-# trackfields shape that the rating-branch sendspin/airplay/chromecast
-# providers import — without this overlay those providers fail to import.
+# Replace upstream's released aiosendspin with the enhanced-branch local-wheel
+# build (6.0.1+trackfields = upstream 6.0.1 plus the trackfields split). The
+# merged MA server expects the aiosendspin 6.x API, and the trackfields shape
+# (album_track / queue_track / total_tracks) is required by the enhanced
+# sendspin/airplay/chromecast providers — without this overlay they fail to import.
 RUN rm -rf /app/venv/lib/python3.13/site-packages/aiosendspin \
            /app/venv/lib/python3.13/site-packages/aiosendspin-*.dist-info
 COPY aiosendspin_overlay/ \
      /app/venv/lib/python3.13/site-packages/aiosendspin/
 COPY aiosendspin_dist_info_overlay/ \
-     /app/venv/lib/python3.13/site-packages/aiosendspin-5.2.0.dev2+trackfields.dist-info/
+     /app/venv/lib/python3.13/site-packages/aiosendspin-6.0.1+trackfields.dist-info/
 
 # local_audio's sendspin_bridge imports sounddevice unconditionally; that
 # loads libportaudio2.so at module init. Neither the Python package nor the
