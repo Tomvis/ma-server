@@ -12,6 +12,7 @@ can be configured with different names.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from collections.abc import Callable
@@ -152,7 +153,20 @@ class AirPlayReceiverProvider(PluginProvider):
         # Each instance gets a unique port: 7000, 7001, 7002, etc.
         self.airplay_port = 7000 + (hash(self.instance_id) % 1000)
         airplay_name = cast("str", self.config.get_value(CONF_AIRPLAY_NAME)) or self.name
+        # _audio_format describes the original AirPlay source (ALAC at 44.1/16,
+        # the protocol-native format AirPlay senders use) and is what we
+        # advertise to clients for source-format display.
         self._audio_format = AudioFormat(
+            content_type=ContentType.ALAC,
+            codec_type=ContentType.ALAC,
+            sample_rate=44100,
+            bit_depth=16,
+            channels=2,
+        )
+        # _decoded_audio_format is what shairport-sync actually pipes into MA
+        # after decoding the ALAC stream; the streams controller hands this to
+        # ffmpeg as the input format so it can read the FIFO correctly.
+        self._decoded_audio_format = AudioFormat(
             content_type=ContentType.PCM_S16LE,
             codec_type=ContentType.PCM_S16LE,
             sample_rate=44100,
@@ -259,6 +273,7 @@ class AirPlayReceiverProvider(PluginProvider):
             provider=self.instance_id,
             item_id=source_id,
             audio_format=self._audio_format,
+            decoded_audio_format=self._decoded_audio_format,
             media_type=MediaType.AUDIO_SOURCE,
             stream_type=StreamType.NAMED_PIPE,
             path=self.audio_pipe.path,
@@ -716,44 +731,50 @@ class AirPlayReceiverProvider(PluginProvider):
 
         :param metadata: Dictionary containing metadata updates.
         """
-        if "cover_art_timestamp" in metadata:
-            # Use timestamp as query parameter to create a unique URL for each cover art update
-            # This prevents browser caching issues when switching between tracks
-            timestamp = metadata["cover_art_timestamp"]
-            # Build image proxy URL for the cover art
-            # The actual image bytes are stored in the metadata reader
+        if (
+            "cover_art_timestamp" in metadata
+            and self._metadata_reader
+            and self._metadata_reader.cover_art_bytes
+        ):
+            # Use a content hash in the path so each unique image gets its own
+            # thumbnail cache entry (the thumbnail cache is keyed on provider+path).
+            img_hash = hashlib.md5(
+                self._metadata_reader.cover_art_bytes, usedforsecurity=False
+            ).hexdigest()[:8]
             image = MediaItemImage(
                 type=ImageType.THUMB,
-                path="cover_art",
+                path=f"cover_art_{img_hash}",
                 provider=self.instance_id,
                 remotely_accessible=False,
             )
-            base_url = self.mass.metadata.get_image_url(image)
-            # Append timestamp as query parameter for cache-busting
-            self._stream_metadata.image_url = f"{base_url}&t={timestamp}"
+            self._stream_metadata.image_url = self.mass.metadata.get_image_url(image)
         elif self._metadata_reader and self._metadata_reader.cover_art_bytes:
-            # Maintain image URL if we have cover art but didn't receive it in this update
-            # This ensures the image URL persists across metadata updates
             if not self._stream_metadata.image_url:
-                # Generate timestamp for cache-busting even in fallback case
-                timestamp = str(int(time.time() * 1000))
+                img_hash = hashlib.md5(
+                    self._metadata_reader.cover_art_bytes, usedforsecurity=False
+                ).hexdigest()[:8]
                 image = MediaItemImage(
                     type=ImageType.THUMB,
-                    path="cover_art",
+                    path=f"cover_art_{img_hash}",
                     provider=self.instance_id,
                     remotely_accessible=False,
                 )
-                base_url = self.mass.metadata.get_image_url(image)
-                self._stream_metadata.image_url = f"{base_url}&t={timestamp}"
+                self._stream_metadata.image_url = self.mass.metadata.get_image_url(image)
 
     async def resolve_image(self, path: str) -> bytes:
         """Resolve an image from an image path.
 
         This returns raw bytes of the cover art image received from AirPlay metadata.
 
-        :param path: The image path (should be "cover_art" for AirPlay cover art).
+        :param path: The image path including the current cover art content hash suffix.
         """
-        if path == "cover_art" and self._metadata_reader and self._metadata_reader.cover_art_bytes:
+        if not (self._metadata_reader and self._metadata_reader.cover_art_bytes):
+            return b""
+        current_hash = hashlib.md5(
+            self._metadata_reader.cover_art_bytes, usedforsecurity=False
+        ).hexdigest()[:8]
+        # Only serve when the suffix matches the current artwork's hash, so a
+        # stale request can't cache new bytes under an old hash key.
+        if path == f"cover_art_{current_hash}":
             return self._metadata_reader.cover_art_bytes
-        # Return empty bytes if no cover art is available
         return b""

@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -66,6 +67,7 @@ from music_assistant.constants import (
     MASS_LOGGER_NAME,
     VERBOSE_LOG_LEVEL,
 )
+from music_assistant.controllers.streams.audio_analysis import LOUDNESS_ANALYSIS_DOMAIN
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.constants import (
     CACHE_CATEGORY_RESOLVED_RADIO_URL,
@@ -77,6 +79,7 @@ from music_assistant.controllers.streams.constants import (
 )
 from music_assistant.controllers.streams.ogg_handler import get_chained_ogg_stream
 from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
+from music_assistant.controllers.streams.smart_fades.fades import SmartFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.helpers import ssl as ssl_util
 from music_assistant.helpers.audio import (
@@ -137,6 +140,8 @@ class CrossfadeData:
     pcm_format: AudioFormat  # Format of the 'data' bytes (current/previous track's format)
     fade_in_pcm_format: AudioFormat  # Format for 'fade_in_size' (next track's format)
     queue_item_id: str
+    # Offset for the fade_in track's elapsed time calculation, to account for crossfade duration and trim
+    elapsed_time_offset: float = 0.0
 
 
 def _snap_supported_rate_up(target: int, supported_sample_rates: list[int]) -> int:
@@ -264,7 +269,7 @@ class StreamsAudio:
             # reuse if the buffer can serve this seek position (fast seek path)
             (
                 queue_item.streamdetails.buffer
-                and queue_item.streamdetails.buffer.is_valid(seek_position * 1000)
+                and queue_item.streamdetails.buffer.is_valid(int(seek_position * 1000))
             )
             # or reuse if streamdetails hasn't expired yet (new buffer will be created)
             or (queue_item.streamdetails.created_at + queue_item.streamdetails.expiration)
@@ -288,6 +293,9 @@ class StreamsAudio:
                 preferred_providers = playback_user.provider_filter
             else:
                 preferred_providers = [x.provider_instance for x in media_item.provider_mappings]
+            # Remember the last AudioError so we can re-raise its (actionable)
+            # message instead of the generic MediaNotFoundError below.
+            last_audio_error: AudioError | None = None
             for allow_other_provider in (False, True):
                 if streamdetails:
                     break
@@ -323,6 +331,9 @@ class StreamsAudio:
                             streamdetails = await music_prov.get_stream_details(
                                 prov_media.item_id, media_item.media_type
                             )
+                    except AudioError as err:
+                        last_audio_error = err
+                        self.logger.warning(str(err))
                     except MusicAssistantError as err:
                         self.logger.warning(str(err))
                     else:
@@ -331,6 +342,8 @@ class StreamsAudio:
                         BYPASS_THROTTLER.set(False)
 
             if not streamdetails:
+                if last_audio_error is not None:
+                    raise last_audio_error
                 msg = f"Unable to retrieve streamdetails for {queue_item.name} ({queue_item.uri})"
                 raise MediaNotFoundError(msg)
 
@@ -448,9 +461,13 @@ class StreamsAudio:
             )
             seek_position = 0 if streamdetails.can_seek else seek_position
         elif stream_type == StreamType.ICY:
-            assert isinstance(streamdetails.path, str)  # for type checking
+            assert isinstance(streamdetails.path, str)
             audio_source = self.get_icy_radio_stream(streamdetails.path, streamdetails)
-            seek_position = 0  # seeking not possible on radio streams
+            seek_position = 0
+        elif stream_type == StreamType.SHOUTCAST:
+            assert isinstance(streamdetails.path, str)
+            audio_source = self.get_shoutcast_stream(streamdetails.path, streamdetails)
+            seek_position = 0
         elif stream_type == StreamType.IN_BAND:
             assert isinstance(streamdetails.path, str)  # for type checking
 
@@ -523,9 +540,14 @@ class StreamsAudio:
         cancelled = False
         first_chunk_received = False
         ffmpeg_loglevel = "debug" if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL) else "info"
+        # When a provider hands us already-decoded audio (e.g. Spotify Connect /
+        # AirPlay receivers piping PCM after their own decode), audio_format is
+        # the original source format meant for display while decoded_audio_format
+        # is what ffmpeg actually needs to read off the wire.
+        ffmpeg_input_format = streamdetails.decoded_audio_format or streamdetails.audio_format
         ffmpeg_proc = FFMpeg(
             audio_input=audio_source,
-            input_format=streamdetails.audio_format,
+            input_format=ffmpeg_input_format,
             output_format=pcm_format,
             filter_params=filter_params,
             extra_input_args=extra_input_args,
@@ -559,10 +581,15 @@ class StreamsAudio:
                     # At this point ffmpeg has started and should now know the codec used
                     # for encoding the audio.
                     # Note: ffmpeg_proc.input_format is the same object as
-                    # streamdetails.audio_format, so sample_rate / bit_depth / bit_rate
+                    # ffmpeg_input_format, so sample_rate / bit_depth / bit_rate
                     # parsed from the ffmpeg log already live on streamdetails too.
                     first_chunk_received = True
-                    streamdetails.audio_format.codec_type = ffmpeg_proc.input_format.codec_type
+                    # Skip the codec_type writeback when the provider declared a
+                    # decoded format: audio_format already holds the authoritative
+                    # source codec and the probed value would just be the
+                    # post-decode wire format (e.g. PCM for Spotify Connect).
+                    if streamdetails.decoded_audio_format is None:
+                        streamdetails.audio_format.codec_type = ffmpeg_proc.input_format.codec_type
                     # Some providers omit (or report 0 for) the item duration; ffmpeg can
                     # usually probe it from the source. Only apply when missing so we
                     # don't clobber an accurate provider value with a rounded one.
@@ -619,27 +646,80 @@ class StreamsAudio:
                 streamdetails.uri,
             )
 
+    async def _cache_radio_result(
+        self,
+        url: str,
+        stream_type: StreamType,
+        resolved_url: str | None = None,
+    ) -> tuple[str, StreamType]:
+        """Cache and return a radio stream resolution result."""
+        result = (resolved_url or url, stream_type)
+        await self.mass.cache.set(
+            url,
+            result,
+            expiration=3600 * 3,
+            provider=CACHE_PROVIDER,
+            category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+        )
+        return result
+
+    async def _handle_client_error_for_radio_stream(
+        self, url: str, err: aiohttp.ClientError, fallback_stream_type: StreamType
+    ) -> tuple[str, StreamType]:
+        """Handle aiohttp client errors during radio stream resolution."""
+        # Prefer the final post-redirect URL: aiohttp follows redirects before raising,
+        # but the original url may just point at a redirector rather than the ICY endpoint.
+        request_info = getattr(err, "request_info", None)
+        validate_url = str(request_info.url) if request_info is not None else url
+
+        # Check if this is a Shoutcast/ICY response that aiohttp can't parse
+        if isinstance(err, aiohttp.ClientResponseError) and "ICY" in str(err).upper():
+            self.logger.debug(
+                "ICY response detected for %s, validating Shoutcast stream", validate_url
+            )
+            if await self._validate_shoutcast_stream(validate_url):
+                return await self._cache_radio_result(
+                    url, StreamType.SHOUTCAST, resolved_url=validate_url
+                )
+            self.logger.warning(
+                "ICY response detected but Shoutcast validation failed for %s", validate_url
+            )
+            return await self._cache_radio_result(
+                url, fallback_stream_type, resolved_url=validate_url
+            )
+
+        # Other aiohttp errors - might still be Shoutcast, check it
+        self.logger.debug("aiohttp error for %s, checking if legacy Shoutcast stream", validate_url)
+        if await self._validate_shoutcast_stream(validate_url):
+            return await self._cache_radio_result(
+                url, StreamType.SHOUTCAST, resolved_url=validate_url
+            )
+
+        # Unknown error - still try to stream
+        self.logger.warning(
+            "Failed to parse radio URL %s: %s - attempting direct stream", validate_url, str(err)
+        )
+        return await self._cache_radio_result(url, fallback_stream_type, resolved_url=validate_url)
+
     async def resolve_radio_stream(self, url: str) -> tuple[str, StreamType]:
         """
         Resolve a streaming radio URL.
 
-        Unwraps any playlists if needed.
-        Determines if the stream supports ICY metadata or in-band metadata.
+        Unwraps playlists and determines stream type (ICY, HLS, SHOUTCAST, IN_BAND, HTTP).
 
-        Returns tuple;
-        - unfolded URL as string
-        - StreamType to determine ICY (radio), HLS, or IN_BAND stream.
+        :param url: Radio stream URL to resolve
         """
         mass = self.mass
         if cache := await mass.cache.get(
             key=url, provider=CACHE_PROVIDER, category=CACHE_CATEGORY_RESOLVED_RADIO_URL
         ):
-            if TYPE_CHECKING:  # for type checking
+            if TYPE_CHECKING:
                 cache = cast("tuple[str, str]", cache)
             return (cache[0], StreamType(cache[1]))
+
         stream_type = StreamType.HTTP
-        resolved_url = url
         timeout = ClientTimeout(total=None, connect=10, sock_read=5)
+
         try:
             async with self._connect_radio_stream(
                 url, headers=HTTP_HEADERS_ICY, allow_redirects=True, timeout=timeout
@@ -648,12 +728,13 @@ class StreamsAudio:
                 resp.raise_for_status()
                 if not resp.headers:
                     raise InvalidDataError("no headers found")
-            content_type = headers.get("content-type", "")
+
             if headers.get("icy-metaint") is not None:
                 stream_type = StreamType.ICY
-            elif content_type in ("application/ogg", "audio/ogg"):
+            elif headers.get("content-type", "") in ("application/ogg", "audio/ogg"):
                 # Ogg streams (Opus/Vorbis) have in-band metadata via Vorbis comments
                 stream_type = StreamType.IN_BAND
+
             if (
                 url.endswith((".m3u", ".m3u8", ".pls"))
                 or ".m3u?" in url
@@ -662,45 +743,61 @@ class StreamsAudio:
                 or "audio/x-mpegurl" in headers.get("content-type", "")
                 or "audio/x-scpls" in headers.get("content-type", "")
             ):
-                # url is playlist, we need to unfold it
                 try:
                     substreams = await fetch_playlist(mass, url)
                     if not any(x for x in substreams if x.length):
                         for line in substreams:
                             if not line.is_url:
                                 continue
-                            # unfold first url of playlist
                             return await self.resolve_radio_stream(line.path)
                         raise InvalidDataError("No content found in playlist")
                 except IsHLSPlaylist:
                     stream_type = StreamType.HLS
 
-        except Exception as err:
-            self.logger.warning("Error while parsing radio URL %s: %s", url, str(err))
-            return (url, stream_type)
+        except TimeoutError as err:
+            self.logger.warning("Timeout while parsing radio URL %s", url)
+            raise InvalidDataError(f"Timeout connecting to {url}") from err
 
-        result = (resolved_url, stream_type)
-        cache_expiration = 3600 * 3
-        await mass.cache.set(
-            url,
-            [resolved_url, stream_type],
-            expiration=cache_expiration,
-            provider=CACHE_PROVIDER,
-            category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
-        )
-        return result
+        except aiohttp.ClientResponseError as err:
+            if err.status == 404:
+                raise MediaNotFoundError(f"Radio stream not found: {url}") from err
+            if err.status == 403:
+                raise InvalidDataError(f"Access denied to radio stream: {url}") from err
+            if err.status >= 500:
+                raise InvalidDataError(
+                    f"Radio stream server error (HTTP {err.status}): {url}"
+                ) from err
+            if err.status == 400:
+                # 400 errors might be from legacy Shoutcast servers
+                return await self._handle_client_error_for_radio_stream(url, err, stream_type)
+            raise InvalidDataError(f"HTTP error {err.status} from {url}") from err
+
+        except aiohttp.ClientError as err:
+            return await self._handle_client_error_for_radio_stream(url, err, stream_type)
+
+        return await self._cache_radio_result(url, stream_type)
 
     async def get_icy_radio_stream(
         self, url: str, streamdetails: StreamDetails
     ) -> AsyncGenerator[bytes, None]:
-        """Get (radio) audio stream from HTTP, including ICY metadata retrieval."""
-        timeout = ClientTimeout(total=None, connect=30, sock_read=5 * 60)
+        """
+        Stream radio audio with ICY metadata support.
+
+        Requires icy-metaint header support. Stream type should be validated
+        by resolve_radio_stream() before calling this function.
+
+        :param url: Radio stream URL
+        :param streamdetails: StreamDetails to update with metadata
+        """
         self.logger.debug("Start streaming radio with ICY metadata from url %s", url)
+        timeout = ClientTimeout(total=0, connect=30, sock_read=5 * 60)
+
         async with self._connect_radio_stream(
             url, allow_redirects=True, headers=HTTP_HEADERS_ICY, timeout=timeout
         ) as resp:
             headers = resp.headers
             meta_int = int(headers["icy-metaint"])
+
             while True:
                 try:
                     yield await resp.content.readexactly(meta_int)
@@ -709,46 +806,9 @@ class StreamsAudio:
                         continue
                     meta_length = ord(meta_byte) * 16
                     meta_data = await resp.content.readexactly(meta_length)
+                    self._parse_icy_metadata(meta_data, streamdetails)
                 except asyncio.exceptions.IncompleteReadError:
                     break
-                if not meta_data:
-                    continue
-                meta_data = meta_data.rstrip(b"\0")
-                stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
-                if not stream_title_re:
-                    continue
-                try:
-                    # in 99% of the cases the stream title is utf-8 encoded
-                    stream_title = stream_title_re.group(1).decode("utf-8")
-                except UnicodeDecodeError:
-                    # fallback to iso-8859-1
-                    stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
-                cleaned_stream_title = clean_stream_title(stream_title)
-                if cleaned_stream_title and cleaned_stream_title != streamdetails.stream_title:
-                    self.logger.log(
-                        VERBOSE_LOG_LEVEL, "ICY Radio streamtitle original: %s", stream_title
-                    )
-                    self.logger.log(
-                        VERBOSE_LOG_LEVEL, "ICY Radio streamtitle cleaned: %s", cleaned_stream_title
-                    )
-                    streamdetails.stream_title = cleaned_stream_title
-
-                    if " - " in cleaned_stream_title:
-                        parts = cleaned_stream_title.split(" - ", 1)
-                        artist_name_raw = parts[0].strip()
-                        track_name = parts[1].strip()
-
-                        if artist_name_raw and track_name:
-                            self.logger.debug(
-                                "ICY metadata: artist='%s', track='%s'",
-                                artist_name_raw,
-                                track_name,
-                            )
-                            self._update_radio_stream_metadata(
-                                streamdetails,
-                                artist=artist_name_raw,
-                                title=track_name,
-                            )
 
     async def get_reconnecting_radio_stream(self, url: str) -> AsyncGenerator[bytes, None]:
         """
@@ -1428,6 +1488,8 @@ class StreamsAudio:
                 streamdetails.item_id,
                 streamdetails.provider,
                 media_type=streamdetails.media_type,
+                # use the authoritative EBU R128 value, not another provider's loudness proxy
+                priority=(LOUDNESS_ANALYSIS_DOMAIN,),
             ):
                 if analysis.loudness_integrated is not None:
                     streamdetails.loudness = round(analysis.loudness_integrated, 2)
@@ -1681,8 +1743,9 @@ class StreamsAudio:
         fade_out_data: bytes | None = None
 
         if crossfade_data:
-            # yield the second half of the crossfade from the previous track first
-            # (optionally resample if previous track's format doesn't match current track's format)
+            # reported media-time (TRIM + CF) is decoupled from the raw buffer seek below (X)
+            streamdetails.seek_position = crossfade_data.elapsed_time_offset
+            # yield the POST portion (resample if previous track's format differs)
             if crossfade_data.pcm_format != pcm_format:
                 async for _chunk in resample_pcm_audio(
                     crossfade_data.data, crossfade_data.pcm_format, pcm_format
@@ -1705,7 +1768,7 @@ class StreamsAudio:
             crossfade_data = None
             self._crossfade_data.pop(queue.queue_id, None)
         else:
-            discard_seconds = streamdetails.seek_position
+            discard_seconds = int(streamdetails.seek_position)
             discard_leftover = 0
 
         # Yield the first WARMUP_DURATION worth of audio immediately so playback starts
@@ -1827,34 +1890,54 @@ class StreamsAudio:
                         fade_in_bytes_consumed += len(chunk)
                         yield chunk
 
-                # yield first half of crossfade output directly to the player as chunks
-                # arrive from FFmpeg, keeping the stream alive during crossfade mixing.
-                # the second half is buffered for the next track's intro.
-                # the midpoint estimate is one buffer's worth (the fade-out contribution).
-                estimated_first_half = len(fade_out_data)
-                first_half_written = 0
-                second_half_buf = bytearray()
-                async for mix_chunk in self.smart_fades_mixer.mix(
-                    fade_in_part=_limited_fade_in(),
-                    fade_out_part=fade_out_data,
+                smart_fade = await self.smart_fades_mixer.build(
                     fade_in_streamdetails=cast("StreamDetails", next_queue_item.streamdetails),
                     fade_out_streamdetails=streamdetails,
                     pcm_format=pcm_format,
                     standard_crossfade_duration=standard_crossfade_duration,
                     mode=smart_fades_mode,
+                    fade_out_bytes_len=len(fade_out_data),
+                    fade_in_bytes_len=crossfade_buffer_size,
+                )
+                crossfade_timing = smart_fade.timing_info
+                # Split mix output at end-of-overlap: PRE+CF to A, POST to B's intro.
+                fadeout_share_bytes = int(
+                    (crossfade_timing.pre_crossfade_duration + crossfade_timing.crossfade_duration)
+                    * pcm_format.pcm_sample_size
+                )
+                fadeout_share_bytes = (fadeout_share_bytes // frame_size) * frame_size
+                first_part_written = 0
+                second_part_buf = bytearray()
+                async for mix_chunk in self.smart_fades_mixer.mix(
+                    smart_fade,
+                    fade_in_part=_limited_fade_in(),
+                    fade_out_part=fade_out_data,
+                    pcm_format=pcm_format,
                 ):
-                    if first_half_written < estimated_first_half:
-                        yield mix_chunk
-                        first_half_written += len(mix_chunk)
-                        bytes_written += len(mix_chunk)
+                    if first_part_written < fadeout_share_bytes:
+                        # split this chunk so A gets exactly fadeout_share_bytes
+                        remaining = fadeout_share_bytes - first_part_written
+                        if len(mix_chunk) > remaining:
+                            yield mix_chunk[:remaining]
+                            first_part_written += remaining
+                            bytes_written += remaining
+                            second_part_buf.extend(mix_chunk[remaining:])
+                        else:
+                            yield mix_chunk
+                            first_part_written += len(mix_chunk)
+                            bytes_written += len(mix_chunk)
                     else:
-                        second_half_buf.extend(mix_chunk)
+                        second_part_buf.extend(mix_chunk)
                 self._crossfade_data[queue_item.queue_id] = CrossfadeData(
-                    data=bytes(second_half_buf),
+                    data=bytes(second_part_buf),
                     fade_in_size=fade_in_bytes_consumed,
                     pcm_format=pcm_format,
                     fade_in_pcm_format=pcm_format,
                     queue_item_id=next_queue_item.queue_item_id,
+                    elapsed_time_offset=(
+                        crossfade_timing.fadein_trimmed_duration
+                        + crossfade_timing.crossfade_duration
+                    ),
                 )
                 crossfade_elapsed = asyncio.get_event_loop().time() - crossfade_start_time
                 self.logger.debug(
@@ -1865,6 +1948,9 @@ class StreamsAudio:
                     crossfade_elapsed,
                 )
             except Exception as err:
+                if first_part_written or second_part_buf:
+                    # partial mix already played — concat'd fade_out_data would duplicate audio
+                    raise
                 # crossfade failed, fall back to just yielding the fade_out_data
                 self.logger.warning(
                     "Crossfade failed for queue %s: %s",
@@ -1932,7 +2018,10 @@ class StreamsAudio:
             standard_crossfade_duration = 0
         else:
             smart_fades_mode = await self.mass.config.get_player_config_value(
-                queue.queue_id, CONF_SMART_FADES_MODE, return_type=SmartFadesMode
+                queue.queue_id,
+                CONF_SMART_FADES_MODE,
+                default=SmartFadesMode.DISABLED,
+                return_type=SmartFadesMode,
             )
             standard_crossfade_duration = self.mass.config.get_raw_player_config_value(
                 queue.queue_id, CONF_CROSSFADE_DURATION, 10
@@ -2024,12 +2113,9 @@ class StreamsAudio:
                     queue.display_name,
                 )
                 return
-            # append to play log so the queue controller can work out which track is playing
             track_playback_speed = cast(
                 "float", queue_track.extra_attributes.get("playback_speed", 1.0)
             )
-            play_log_entry = PlayLogEntry(queue_track.queue_item_id)
-            queue.flow_mode_stream_log.append(play_log_entry)
             # calculate crossfade buffer size
             crossfade_buffer_duration = (
                 SMART_CROSSFADE_DURATION
@@ -2059,6 +2145,37 @@ class StreamsAudio:
             if crossfade_buffer_size > 0:
                 warmup_size = min(warmup_size, crossfade_buffer_size)
 
+            # raw_seek_position feeds the PCM buffer; streamdetails.seek_position
+            # (overwritten below) only drives reported elapsed time.
+            raw_seek_position = queue_track.streamdetails.seek_position
+            # Build eagerly so seek_position is set before PlayLogEntry is appended —
+            # consumer-paced mix() would otherwise let the queue briefly report 0.
+            crossfade_smart_fade: SmartFade | None = None
+            if (
+                last_fadeout_part
+                and last_streamdetails
+                and crossfade_buffer_size > 0
+                and smart_fades_mode != SmartFadesMode.DISABLED
+            ):
+                crossfade_smart_fade = await self.smart_fades_mixer.build(
+                    fade_in_streamdetails=queue_track.streamdetails,
+                    fade_out_streamdetails=last_streamdetails,
+                    pcm_format=pcm_format,
+                    standard_crossfade_duration=standard_crossfade_duration,
+                    mode=smart_fades_mode,
+                    fade_out_bytes_len=len(last_fadeout_part),
+                    fade_in_bytes_len=crossfade_buffer_size,
+                )
+                timing_info = crossfade_smart_fade.timing_info
+                queue_track.streamdetails.seek_position = (
+                    raw_seek_position
+                    + timing_info.fadein_trimmed_duration
+                    + timing_info.crossfade_duration
+                )
+            # append to play log so the queue controller can work out which track is playing
+            play_log_entry = PlayLogEntry(queue_track.queue_item_id)
+            queue.flow_mode_stream_log.append(play_log_entry)
+
             bytes_written = 0
             crossfade_buffer = bytearray()
             warmup_bytes = 0
@@ -2067,7 +2184,7 @@ class StreamsAudio:
             async for chunk in self.get_queue_item_stream(
                 queue_track,
                 pcm_format=pcm_format,
-                seek_position=queue_track.streamdetails.seek_position,
+                seek_position=int(raw_seek_position),
                 playback_speed=cast(
                     "float", queue_track.extra_attributes.get("playback_speed", 1.0)
                 ),
@@ -2117,23 +2234,23 @@ class StreamsAudio:
                     continue
 
                 # handle crossfade of previous track and new track
-                if last_fadeout_part and last_streamdetails:
+                if last_fadeout_part and last_streamdetails and crossfade_smart_fade is not None:
                     fadein_part = bytes(crossfade_buffer[:crossfade_buffer_size])
                     remaining_bytes = bytes(crossfade_buffer[crossfade_buffer_size:])
                     try:
                         crossfade_bytes_written = 0
                         async for mix_chunk in self.smart_fades_mixer.mix(
+                            crossfade_smart_fade,
                             fade_in_part=fadein_part,
                             fade_out_part=last_fadeout_part,
-                            fade_in_streamdetails=queue_track.streamdetails,
-                            fade_out_streamdetails=last_streamdetails,
                             pcm_format=pcm_format,
-                            standard_crossfade_duration=standard_crossfade_duration,
-                            mode=smart_fades_mode,
                         ):
                             yield mix_chunk
                             crossfade_bytes_written += len(mix_chunk)
                     except Exception as mix_err:
+                        if crossfade_bytes_written:
+                            # partial mix already played — concat'd tail would duplicate audio
+                            raise
                         self.logger.warning(
                             "Crossfade mixer failed for %s, falling back to simple concat: %s",
                             queue_track.name,
@@ -2145,14 +2262,21 @@ class StreamsAudio:
                         # full tail was pre-counted and is now yielded as-is
                         crossfade_bytes_written = 0
                         remaining_bytes = bytes(crossfade_buffer)
+                        # mix failed — undo the eager seek_position
+                        queue_track.streamdetails.seek_position = raw_seek_position
                     if crossfade_bytes_written:
-                        # split crossfade output 50/50 between both tracks
-                        fadeout_share = crossfade_bytes_written // 2
+                        # Split mix output at end-of-overlap: PRE+CF to A, POST to B.
+                        fadeout_share_seconds = (
+                            timing_info.pre_crossfade_duration + timing_info.crossfade_duration
+                        )
+                        fadeout_share = int(fadeout_share_seconds * pcm_sample_size)
+                        fadeout_share = (fadeout_share // frame_size) * frame_size
+                        fadeout_share = min(fadeout_share, crossfade_bytes_written)
                         fadein_share = crossfade_bytes_written - fadeout_share
                         bytes_written += fadein_share
                         if last_play_log_entry:
                             assert last_play_log_entry.seconds_streamed is not None
-                            # Correct pre-counted full tail to actual half of crossfade output
+                            # correct pre-counted full tail to the timing-based share
                             last_play_log_entry.seconds_streamed += (
                                 fadeout_share - len(last_fadeout_part)
                             ) / pcm_sample_size
@@ -2191,6 +2315,8 @@ class StreamsAudio:
                 for pcm_slice in iter_pcm_slices(last_fadeout_part, pcm_format, 1000):
                     yield pcm_slice
                     await asyncio.sleep(0)
+                # no crossfade happened — undo the eager seek_position
+                queue_track.streamdetails.seek_position = raw_seek_position
                 # full tail was pre-counted and is now yielded as-is
                 last_fadeout_part = b""
             if self.crossfade_allowed(
@@ -2355,7 +2481,207 @@ class StreamsAudio:
             self.logger.debug("Clearing crossfade data for queue %s", queue_id)
             del self._crossfade_data[queue_id]
 
+    async def get_shoutcast_stream(
+        self, url: str, streamdetails: StreamDetails
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Yield audio from a legacy Shoutcast server, with ICY metadata parsed inline.
+
+        :param url: Shoutcast stream URL.
+        :param streamdetails: StreamDetails to update with ICY metadata as it arrives.
+        """
+        self.logger.debug("Start streaming from legacy Shoutcast server: %s", url)
+
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        try:
+            # Open raw socket connection
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=30)
+        except TimeoutError as err:
+            raise AudioError(f"Timeout connecting to Shoutcast stream {url}") from err
+        except (OSError, ConnectionError) as err:
+            raise AudioError(f"Failed to connect to Shoutcast stream {url}") from err
+
+        try:
+            # Send HTTP request with ICY metadata header
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {HTTP_HEADERS['User-Agent']}\r\n"
+                f"Icy-MetaData: 1\r\n\r\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            # Read and parse response line
+            try:
+                response_line = await asyncio.wait_for(reader.readline(), timeout=10)
+            except TimeoutError as err:
+                raise AudioError("Timeout reading Shoutcast response") from err
+
+            if not response_line.startswith(b"ICY"):
+                raise InvalidDataError("Invalid Shoutcast response")
+
+            # Read headers until empty line
+            headers: dict[str, str] = {}
+            while True:
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=5)
+                except TimeoutError as err:
+                    raise AudioError("Timeout reading Shoutcast headers") from err
+
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+                if b":" in line:
+                    try:
+                        key, value = line.decode("latin-1", errors="ignore").split(":", 1)
+                        headers[key.strip().lower()] = value.strip()
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+
+            # Get metadata interval
+            meta_int_str = headers.get("icy-metaint")
+            if not meta_int_str:
+                raise InvalidDataError("No icy-metaint header in Shoutcast response")
+
+            try:
+                meta_int = int(meta_int_str)
+            except ValueError as err:
+                raise InvalidDataError("Invalid icy-metaint value") from err
+
+            self.logger.debug("Connected to Shoutcast stream %s (icy-metaint: %s)", url, meta_int)
+
+            # Stream audio data with metadata parsing
+            while True:
+                try:
+                    # Read audio chunk
+                    audio_chunk = await reader.readexactly(meta_int)
+                    yield audio_chunk
+
+                    # Read metadata length
+                    meta_byte = await reader.readexactly(1)
+                    if meta_byte == b"\x00":
+                        continue
+
+                    meta_length = ord(meta_byte) * 16
+                    meta_data = await reader.readexactly(meta_length)
+                    self._parse_icy_metadata(meta_data, streamdetails)
+
+                except asyncio.exceptions.IncompleteReadError:
+                    # End of stream
+                    break
+
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     # --- Private methods ---
+
+    def _parse_icy_metadata(self, meta_data: bytes, streamdetails: StreamDetails) -> None:
+        """
+        Parse ICY metadata and update streamdetails.
+
+        Sets the cleaned stream title and, when the title parses as "Artist - Track",
+        triggers a radio-artwork metadata update.
+
+        :param meta_data: Raw metadata bytes from an ICY stream chunk.
+        :param streamdetails: StreamDetails to update with parsed title and metadata.
+        """
+        if not meta_data:
+            return
+
+        meta_data = meta_data.rstrip(b"\0")
+        # Match StreamTitle, handling apostrophes in titles
+        stream_title_re = re.search(rb"StreamTitle='(.*?)';", meta_data)
+
+        if not stream_title_re:
+            self.logger.log(
+                VERBOSE_LOG_LEVEL,
+                "ICY metadata does not contain StreamTitle field. Raw: %s",
+                meta_data.decode("utf-8", errors="replace")[:200],
+            )
+            return
+
+        try:
+            # in 99% of the cases the stream title is utf-8 encoded
+            stream_title = stream_title_re.group(1).decode("utf-8")
+        except UnicodeDecodeError:
+            # fallback to iso-8859-1
+            stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
+
+        cleaned_stream_title = clean_stream_title(stream_title)
+
+        if not cleaned_stream_title:
+            return
+
+        if cleaned_stream_title == streamdetails.stream_title:
+            return
+
+        self.logger.log(VERBOSE_LOG_LEVEL, "ICY Radio streamtitle original: %s", stream_title)
+        self.logger.log(
+            VERBOSE_LOG_LEVEL, "ICY Radio streamtitle cleaned: %s", cleaned_stream_title
+        )
+        streamdetails.stream_title = cleaned_stream_title
+
+        if " - " in cleaned_stream_title:
+            artist_name_raw, track_name = (
+                part.strip() for part in cleaned_stream_title.split(" - ", 1)
+            )
+            if artist_name_raw and track_name:
+                self.logger.debug(
+                    "ICY metadata: artist='%s', track='%s'", artist_name_raw, track_name
+                )
+                self._update_radio_stream_metadata(
+                    streamdetails, artist=artist_name_raw, title=track_name
+                )
+
+    async def _validate_shoutcast_stream(self, url: str) -> bool:
+        """
+        Return True if the URL responds with a legacy Shoutcast "ICY 200 OK" line.
+
+        :param url: The URL to validate.
+        """
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or 80
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+
+            # Open raw socket connection with timeout
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
+            try:
+                # Send minimal HTTP request with ICY metadata header
+                request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nIcy-MetaData: 1\r\n\r\n"
+                writer.write(request.encode())
+                await writer.drain()
+
+                # Read just the response line
+                response_line = await asyncio.wait_for(reader.readline(), timeout=5)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+            # Check if response starts with "ICY"
+            decoded_line = response_line.decode("latin-1", errors="ignore").strip()
+            return decoded_line.startswith("ICY")
+
+        except TimeoutError:
+            self.logger.debug("Timeout during Shoutcast validation for %s", url)
+            return False
+        except (OSError, ConnectionError):
+            self.logger.debug("Connection failed during Shoutcast validation for %s", url)
+            return False
+        except UnicodeDecodeError:
+            self.logger.debug("Invalid response encoding during Shoutcast validation for %s", url)
+            return False
 
     def _resolve_player_dsp_config(self, player: Player) -> DSPConfig:
         """

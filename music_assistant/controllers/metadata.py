@@ -87,6 +87,8 @@ from music_assistant.models.core_controller import CoreController
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from music_assistant_models.config_entries import CoreConfig
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -97,7 +99,8 @@ if TYPE_CHECKING:
 
 def _detect_image_format(path: str) -> str:
     """Detect image format from file path extension, defaulting to jpg."""
-    match pathlib.PurePath(path).suffix.lower():
+    # strip any query suffix (e.g. a cache-busting ?cs=) before extension detection
+    match pathlib.PurePath(path.split("?", 1)[0]).suffix.lower():
         case ".svg":
             return "svg"
         case ".png":
@@ -1461,6 +1464,14 @@ class MetaDataController(CoreController):
         self.logger.debug("Updating metadata for Artist %s", artist.name)
         unique_keys: set[str] = set()
 
+        # The bio is re-derived from the providers on every refresh. Each provider's
+        # description is collected as a (language, text) candidate and excluded from the
+        # field merge; _select_description picks the winner below. Candidates are appended
+        # in priority order: music providers first, then metadata providers (TADB, Wikipedia).
+        prev_description = artist.metadata.description
+        prev_description_language = artist.metadata.description_language
+        description_candidates: list[tuple[str | None, str]] = []
+
         # collect (local) metadata from all local providers
         local_provs = get_global_cache_value("non_streaming_providers")
         if TYPE_CHECKING:
@@ -1486,7 +1497,13 @@ class MetaDataController(CoreController):
                 prov_item = await self.mass.music.artists.get_provider_item(
                     prov_mapping.item_id, prov_mapping.provider_instance
                 )
-                artist.metadata.update(prov_item.metadata)
+                if prov_item.metadata.description:
+                    description_candidates.append(
+                        (prov_item.metadata.description_language, prov_item.metadata.description)
+                    )
+                artist.metadata.update(
+                    replace(prov_item.metadata, description=None, description_language=None)
+                )
 
         # The musicbrainz ID is mandatory for all metadata lookups
         if not artist.mbid:
@@ -1511,16 +1528,59 @@ class MetaDataController(CoreController):
                 if metadata := await provider.get_artist_metadata(artist):
                     if prefer_local_genres:
                         metadata = replace(metadata, genres=None)
+                    if metadata.description:
+                        description_candidates.append(
+                            (metadata.description_language, metadata.description)
+                        )
+                        metadata = replace(metadata, description=None, description_language=None)
                     artist.metadata.update(metadata)
                     self.logger.debug(
                         "Fetched metadata for Artist %s on provider %s",
                         artist.name,
                         provider.name,
                     )
+        artist.metadata.description, artist.metadata.description_language = (
+            self._select_description(
+                description_candidates, prev_description, prev_description_language
+            )
+        )
+
         # update final item in library database
         # set timestamp, used to determine when this function was last called
         artist.metadata.last_refresh = int(time())
         await self.mass.music.artists.update_item_in_library(artist.item_id, artist)
+
+    def _select_description(
+        self,
+        candidates: Sequence[tuple[str | None, str]],
+        prev_description: str | None,
+        prev_description_language: str | None,
+    ) -> tuple[str | None, str | None]:
+        """
+        Return the chosen ``(description, language)`` for the artist this refresh.
+
+        :param candidates: ``(language, text)`` tuples in provider-priority order
+            (music providers first, then TADB, then Wikipedia).
+        :param prev_description: Bio stored before this refresh.
+        :param prev_description_language: Language of the bio stored before this refresh.
+        """
+        pref = self.preferred_language
+        # 1. first candidate in the user's preferred language
+        for lang, text in candidates:
+            if lang == pref:
+                return text, lang
+        # 2. keep a stored preferred-language bio rather than downgrade
+        if prev_description is not None and prev_description_language == pref:
+            return prev_description, prev_description_language
+        # 3. English fallback, same priority order
+        for lang, text in candidates:
+            if lang == "en":
+                return text, lang
+        # 4. last resort: highest-priority bio in any (incl. unknown) language
+        if candidates:
+            lang, text = candidates[0]
+            return text, lang
+        return prev_description, prev_description_language
 
     async def _update_album_metadata(self, album: Album, force_refresh: bool = False) -> None:
         """Get/update rich metadata for an album."""
@@ -1753,6 +1813,7 @@ class MetaDataController(CoreController):
         # note that we sort the providers by priority so that we always
         # prefer local providers over online providers
         unique_keys: set[str] = set()
+        prov_images: UniqueList[MediaItemImage] | None = None
         for prov_mapping in sorted(
             audiobook.provider_mappings, key=lambda x: x.priority, reverse=True
         ):
@@ -1770,6 +1831,8 @@ class MetaDataController(CoreController):
                 prov_item = await self.mass.music.audiobooks.get_provider_item(
                     prov_mapping.item_id, prov_mapping.provider_instance
                 )
+                if prov_images is None and prov_item.metadata.images:
+                    prov_images = prov_item.metadata.images
                 audiobook.metadata.update(prov_item.metadata)
                 if audiobook.publisher is None and prov_item.publisher:
                     audiobook.publisher = prov_item.publisher
@@ -1779,6 +1842,11 @@ class MetaDataController(CoreController):
                     audiobook.narrators = prov_item.narrators
                 if not audiobook.duration and prov_item.duration:
                     audiobook.duration = prov_item.duration
+
+        # no way to select a cover for audiobooks, so replace rather than merge the
+        # images to keep it in sync with the provider; revisit if a picker is added
+        if prov_images is not None:
+            audiobook.metadata.images = prov_images
 
         # update final item in library database
         # set timestamp, used to determine when this function was last called
@@ -1799,6 +1867,7 @@ class MetaDataController(CoreController):
         # note that we sort the providers by priority so that we always
         # prefer local providers over online providers
         unique_keys: set[str] = set()
+        prov_images: UniqueList[MediaItemImage] | None = None
         for prov_mapping in sorted(
             podcast.provider_mappings, key=lambda x: x.priority, reverse=True
         ):
@@ -1816,11 +1885,18 @@ class MetaDataController(CoreController):
                 prov_item = await self.mass.music.podcasts.get_provider_item(
                     prov_mapping.item_id, prov_mapping.provider_instance
                 )
+                if prov_images is None and prov_item.metadata.images:
+                    prov_images = prov_item.metadata.images
                 podcast.metadata.update(prov_item.metadata)
                 if podcast.publisher is None and prov_item.publisher:
                     podcast.publisher = prov_item.publisher
                 if not podcast.total_episodes and prov_item.total_episodes:
                     podcast.total_episodes = prov_item.total_episodes
+
+        # no way to select a cover for podcasts, so replace rather than merge the
+        # images to keep it in sync with the provider; revisit if a picker is added
+        if prov_images is not None:
+            podcast.metadata.images = prov_images
 
         # update final item in library database
         # set timestamp, used to determine when this function was last called

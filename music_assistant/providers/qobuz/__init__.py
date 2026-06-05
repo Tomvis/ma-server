@@ -26,6 +26,7 @@ from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
+    RateLimited,
     ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
@@ -591,8 +592,9 @@ class QobuzProvider(MusicProvider):
                     remotely_accessible=True,
                 )
             )
-        if artist_obj.get("biography"):
-            artist.metadata.description = artist_obj["biography"].get("content")
+        if biography := artist_obj.get("biography"):
+            artist.metadata.description = biography.get("content")
+            artist.metadata.description_language = biography.get("language")
         if favorited_at := artist_obj.get("favorited_at"):
             artist.date_added = datetime.datetime.fromtimestamp(favorited_at, tz=datetime.UTC)
         return artist
@@ -897,7 +899,7 @@ class QobuzProvider(MusicProvider):
                     endpoint,
                     retry_after or "not provided",
                 )
-                raise ResourceTemporarilyUnavailable("Rate Limiter", backoff_time=backoff_time)
+                raise RateLimited("Rate Limiter", backoff_time=backoff_time)
             # handle temporary server error
             if response.status in (502, 503):
                 raise ResourceTemporarilyUnavailable(backoff_time=30)
@@ -949,7 +951,7 @@ class QobuzProvider(MusicProvider):
                     endpoint,
                     retry_after or "not provided",
                 )
-                raise ResourceTemporarilyUnavailable("Rate Limiter", backoff_time=backoff_time)
+                raise RateLimited("Rate Limiter", backoff_time=backoff_time)
             # handle temporary server error
             if response.status in (502, 503):
                 raise ResourceTemporarilyUnavailable(backoff_time=30)

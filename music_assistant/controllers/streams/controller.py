@@ -336,8 +336,8 @@ class StreamsController(CoreController):
             "Starting streamserver on  %s:%s\n"
             "This is the IP address that is communicated to players.\n"
             "If this is incorrect, audio will not play!\n"
-            "See the documentation how to configure the publish IP for the Streamserver\n"
-            "in Settings --> Core modules --> Streamserver\n"
+            "See the documentation for how to configure the publish IP for the Streamserver\n"
+            "in Settings --> System --> Streams\n"
             "################################################################################\n",
             self.publish_ip,
             self.publish_port,
@@ -419,7 +419,8 @@ class StreamsController(CoreController):
             # gapless playback, we need to enforce flow mode
             queue_id
             and (queue_player := self.mass.players.get_player(queue_id))
-            and queue_player.config.get_value(CONF_SMART_FADES_MODE) != SmartFadesMode.DISABLED
+            and queue_player.config.get_value(CONF_SMART_FADES_MODE, SmartFadesMode.DISABLED)
+            != SmartFadesMode.DISABLED
             and protocol_player
             and not protocol_player.supports_gapless
         )
@@ -684,7 +685,10 @@ class StreamsController(CoreController):
                 smart_fades_mode = SmartFadesMode.DISABLED
             else:
                 smart_fades_mode = await self.mass.config.get_player_config_value(
-                    queue.queue_id, CONF_SMART_FADES_MODE, return_type=SmartFadesMode
+                    queue.queue_id,
+                    CONF_SMART_FADES_MODE,
+                    default=SmartFadesMode.DISABLED,
+                    return_type=SmartFadesMode,
                 )
                 standard_crossfade_duration = self.mass.config.get_raw_player_config_value(
                     queue.queue_id, CONF_CROSSFADE_DURATION, 10
@@ -716,7 +720,7 @@ class StreamsController(CoreController):
                 audio_input = self.audio.get_queue_item_stream(
                     queue_item=queue_item,
                     pcm_format=pcm_format,
-                    seek_position=queue_item.streamdetails.seek_position,
+                    seek_position=int(queue_item.streamdetails.seek_position),
                     playback_speed=cast(
                         "float", queue_item.extra_attributes.get("playback_speed", 1.0)
                     ),
@@ -855,7 +859,10 @@ class StreamsController(CoreController):
         # select the PCM format for the flow stream, anchored on the first track
         smart_fades_mode = (
             await self.mass.config.get_player_config_value(
-                queue_id, CONF_SMART_FADES_MODE, return_type=SmartFadesMode
+                queue_id,
+                CONF_SMART_FADES_MODE,
+                default=SmartFadesMode.DISABLED,
+                return_type=SmartFadesMode,
             )
             if start_queue_item.media_type == MediaType.TRACK
             else SmartFadesMode.DISABLED
@@ -1120,7 +1127,8 @@ class StreamsController(CoreController):
                 # does not support gapless playback, we need to enforce flow mode
                 queue_id
                 and (queue_player := self.mass.players.get_player(queue_id))
-                and queue_player.config.get_value(CONF_SMART_FADES_MODE) != SmartFadesMode.DISABLED
+                and queue_player.config.get_value(CONF_SMART_FADES_MODE, SmartFadesMode.DISABLED)
+                != SmartFadesMode.DISABLED
                 and protocol_player
                 and not protocol_player.supports_gapless
             )

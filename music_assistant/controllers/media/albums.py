@@ -8,7 +8,13 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import AlbumType, EventType, MediaType, ProviderFeature
+from music_assistant_models.enums import (
+    AlbumType,
+    EventType,
+    ExternalID,
+    MediaType,
+    ProviderFeature,
+)
 from music_assistant_models.errors import InvalidDataError, MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
     Album,
@@ -724,6 +730,37 @@ class AlbumsController(MediaControllerBase[Album]):
         await self.mass.music.database.update(self.db_table, {"item_id": db_id}, update)
         library_item = await self.get_library_item(db_id)
         self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+
+    async def set_release_group(
+        self,
+        album_item_id: int,
+        release_group_mbid: str,
+    ) -> None:
+        """
+        Persist a MusicBrainz release-group ID on a library album, idempotently.
+
+        :param album_item_id: Library album item_id (database id).
+        :param release_group_mbid: MusicBrainz release-group UUID to set.
+        """
+        if not release_group_mbid:
+            return
+        try:
+            album = await self.get_library_item(album_item_id)
+        except MusicAssistantError as err:
+            self.logger.debug("set_release_group: cannot load album %s: %s", album_item_id, err)
+            return
+        # Refuse to overwrite — keeps tag-sourced or already-enriched IDs authoritative.
+        if album.get_external_id(ExternalID.MB_RELEASEGROUP):
+            self.logger.debug(
+                "set_release_group: album %s already has MB_RELEASEGROUP — keeping",
+                album_item_id,
+            )
+            return
+        album.add_external_id(ExternalID.MB_RELEASEGROUP, release_group_mbid)
+        await self.update_item_in_library(album_item_id, album)
+        self.logger.debug(
+            "set_release_group: wrote %s onto album %s", release_group_mbid, album_item_id
+        )
 
     async def tracks(
         self,
