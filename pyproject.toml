@@ -90,7 +90,7 @@ platforms = ["any"]
 zip-safe = false
 
 [tool.setuptools.package-data]
-music_assistant = ["py.typed"]
+music_assistant = ["py.typed", "helpers/resources/**/*"]
 
 [tool.ruff]
 fix = true
