@@ -294,5 +294,5 @@ music-assistant-frontend = { path = "../frontend", editable = true }
 music-assistant-models = { path = "../models", editable = true }
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=62.3"]
 build-backend = "setuptools.build_meta"
