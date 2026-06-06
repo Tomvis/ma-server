@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from collections.abc import Iterable
 from contextlib import suppress
@@ -18,6 +19,7 @@ from music_assistant_models.enums import AlbumType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
+    ReviewLink,
     ReviewSourceEntry,
 )
 from mutagen._vorbis import VCommentDict
@@ -97,27 +99,170 @@ def _parse_bool_tag(raw: str | list[str] | tuple[str, ...] | None) -> bool | Non
     return None
 
 
+# Prestige-ish ordering for the accolades synthesized from legacy tags; the
+# frontend re-sorts for display, this just keeps stored output stable/readable.
+_ACCOLADE_KIND_ORDER: tuple[str, ...] = (
+    "aoty",
+    "record_of_the_month",
+    "honorable_mention",
+    "score_revised",
+    "lit",
+    "rfu",
+    "tymhm",
+    "sitf",
+    "ymio",
+    "review",
+)
+
+_MONTH_ABBR: dict[int, str] = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
+# Undated legacy tokens (from either _TYPE or _LABELS) -> (kind, new display string).
+# Case-insensitive lookup; dated tokens (AOTY-YYYY, AOTM-YYYY-MM, HONORABLE_MENTION-YYYY)
+# are handled by regex below so the date can be folded into the display string.
+_LEGACY_ACCOLADE_TOKENS: dict[str, tuple[str, str]] = {
+    "REVIEW": ("review", "Review"),
+    "TYMHM": ("tymhm", "TYMHM"),
+    "SITF": ("sitf", "SITF"),
+    "YMIO": ("ymio", "YMIO"),
+    "RFU": ("rfu", "RFU"),
+    "LIT": ("lit", "Lost in Time"),
+    "LOST IN TIME": ("lit", "Lost in Time"),
+    "CONTRITE": ("score_revised", "Score Revised"),
+    "SCORE_REVISED": ("score_revised", "Score Revised"),
+    "AOTM": ("record_of_the_month", "Record of the Month"),
+    "RECORD_OF_THE_MONTH": ("record_of_the_month", "Record of the Month"),
+    "AOTY": ("aoty", "Album of the Year"),
+    "HONORABLE_MENTION": ("honorable_mention", "Honorable Mention"),
+}
+
+
+def _format_dated_accolade(name: str, year: int | None, month: int | None) -> str:
+    """Render an award name with its date inlined ("Record of the Month (Sep 2024)")."""
+    if year is None:
+        return name
+    if month is not None and month in _MONTH_ABBR:
+        return f"{name} ({_MONTH_ABBR[month]} {year})"
+    return f"{name} ({year})"
+
+
+def _classify_legacy_accolade(token: str) -> tuple[str, str] | None:
+    """Map one legacy _TYPE/_LABELS token to (kind, new display string), or None if unknown."""
+    text = token.strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper in _LEGACY_ACCOLADE_TOKENS:
+        return _LEGACY_ACCOLADE_TOKENS[upper]
+    if m := re.fullmatch(r"AOTY-(\d{4})", upper):
+        return "aoty", _format_dated_accolade("Album of the Year", int(m.group(1)), None)
+    if m := re.fullmatch(r"AOTM-(\d{4})-(\d{1,2})", upper):
+        return "record_of_the_month", _format_dated_accolade(
+            "Record of the Month", int(m.group(1)), int(m.group(2))
+        )
+    if m := re.fullmatch(r"HONORABLE_MENTION-(\d{4})", upper):
+        return "honorable_mention", _format_dated_accolade(
+            "Honorable Mention", int(m.group(1)), None
+        )
+    return None
+
+
+def legacy_accolades(types: Iterable[str] | None, labels: Iterable[str] | None) -> list[str]:
+    """
+    Fold the deprecated split ``types`` + ``labels`` tokens into the 3.2.0 ``accolades`` list.
+
+    Collapses the old triple-representation (e.g. type ``AOTM`` + labels
+    ``RECORD_OF_THE_MONTH`` and ``AOTM-2024-09``) to a single human-readable entry
+    per concept, preferring the dated variant when one is present. Unrecognized
+    tokens are passed through verbatim so nothing is silently dropped during the
+    transition.
+
+    :param types: Legacy ``_TYPE`` token list (review-kind column values).
+    :param labels: Legacy ``_LABELS`` token list (award tokens, possibly dated).
+    """
+    by_kind: dict[str, str] = {}
+    extras: list[str] = []
+    for token in (*(types or ()), *(labels or ())):
+        classified = _classify_legacy_accolade(token)
+        if classified is None:
+            passthrough = token.strip()
+            if passthrough and passthrough not in extras:
+                extras.append(passthrough)
+            continue
+        kind, display = classified
+        existing = by_kind.get(kind)
+        # The dated variant ("… (Sep 2024)") wins over the bare award name.
+        if existing is None or ("(" in display and "(" not in existing):
+            by_kind[kind] = display
+    ordered = [by_kind[kind] for kind in _ACCOLADE_KIND_ORDER if kind in by_kind]
+    return ordered + extras
+
+
+# Separator inside each <SRC>_LINKS entry: "<Label> — <URL>" (space, EM DASH, space).
+# Labels never contain it and URLs never contain spaces, so splitting on the first
+# occurrence is unambiguous.
+_LINK_SEPARATOR = " — "
+
+
+def _parse_review_links(raw: str | list[str] | tuple[str, ...] | None) -> list[ReviewLink]:
+    """Parse ``<SRC>_LINKS`` entries ("<Label> — <URL>") into ReviewLink objects."""
+    links: list[ReviewLink] = []
+    for entry in split_items(raw):
+        label, sep, url = entry.partition(_LINK_SEPARATOR)
+        label, url = label.strip(), url.strip()
+        # A well-formed entry has the separator and a non-empty URL; drop the rest.
+        if sep and url:
+            links.append(ReviewLink(label=label, url=url))
+    return links
+
+
 def _build_review_source_entry(
     tags: dict[str, Any], source_id: str, key_prefix: str
 ) -> ReviewSourceEntry | None:
-    """Build a single ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_TYPE/_LABELS/_AUTHOR.
+    """Build a single ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_ACCOLADES/_LINKS/_AUTHOR.
 
     Returns None when the source has no usable fields, so empty entries don't
-    pollute the album metadata.
+    pollute the album metadata. Pre-3.2.0 files carrying the split _TYPE/_LABELS
+    keys (instead of _ACCOLADES), or pre-3.3.0 files with a single _REVIEW_URL
+    (instead of _LINKS), are read through the legacy fallbacks.
     """
     rating = _parse_float_tag(tags.get(f"{key_prefix}rating"))
     favorite = _parse_bool_tag(tags.get(f"{key_prefix}favorite"))
-    types = list(split_items(tags.get(f"{key_prefix}type")))
-    labels = list(split_items(tags.get(f"{key_prefix}labels")))
+    accolades = list(split_items(tags.get(f"{key_prefix}accolades")))
+    if not accolades:
+        # Transitional fallback: fold the deprecated _TYPE/_LABELS keys into accolades.
+        legacy_types = split_items(tags.get(f"{key_prefix}type"))
+        legacy_labels = split_items(tags.get(f"{key_prefix}labels"))
+        if legacy_types or legacy_labels:
+            accolades = legacy_accolades(legacy_types, legacy_labels)
+    links = _parse_review_links(tags.get(f"{key_prefix}links"))
+    if not links:
+        # Transitional fallback: a single legacy _REVIEW_URL becomes the "Review" link.
+        if review_url := _first_tag_value(tags.get(f"{key_prefix}reviewurl")):
+            review_url = str(review_url).strip()
+            if review_url:
+                links = [ReviewLink(label="Review", url=review_url)]
     authors = list(split_items(tags.get(f"{key_prefix}author")))
-    if rating is None and favorite is None and not types and not labels and not authors:
+    if rating is None and favorite is None and not accolades and not links and not authors:
         return None
     return ReviewSourceEntry(
         source=source_id,
         rating=rating,
         favorite=favorite,
-        types=types or None,
-        labels=labels or None,
+        accolades=accolades or None,
+        links=links or None,
         authors=authors or None,
     )
 
@@ -666,10 +811,16 @@ class AudioTags:
           AMG_ALBUM_DYNAMIC_RANGE -> AMG-reported album DR (numeric, /5 source)
           AMG_RATING              -> /5 numeric review score
           AMG_FAVORITE            -> truthy when the album is an AMG list-pick without a score
-          AMG_TYPE                -> ;-separated review kind labels (Review, TYMHM, …)
-          AMG_LABELS              -> ;-separated accolade labels (AOTY-2024, RECORD_OF_THE_MONTH, …)
+          AMG_ACCOLADES           -> ;-separated editorial honors as display strings
+                                     (Review, TYMHM, "Album of the Year (2024)", …)
+          AMG_LINKS               -> ;-separated "<Label> — <URL>" post links (one per
+                                     post; label mirrors an AMG_ACCOLADES value)
           AMG_AUTHOR              -> ;-separated author names (canonical, secondary, list-pick)
-          TPS_RATING / TPS_FAVORITE / TPS_TYPE / TPS_LABELS / TPS_AUTHOR  (mirror of AMG, /10)
+          TPS_RATING / TPS_FAVORITE / TPS_ACCOLADES / TPS_LINKS / TPS_AUTHOR  (mirror of AMG, /10)
+
+        Pre-3.2.0 files carrying the split AMG_TYPE / AMG_LABELS keys, or pre-3.3.0 files
+        with a single AMG_REVIEW_URL (instead of AMG_LINKS), are still read via transitional
+        fallbacks that fold them into the merged accolades / links lists.
 
         The canonical (measured) DR lives on AudioTags.dynamic_range, not here.
         """

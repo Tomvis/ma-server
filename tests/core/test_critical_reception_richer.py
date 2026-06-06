@@ -80,7 +80,11 @@ def test_extra_source_added_is_richer() -> None:
 def test_same_source_gains_field_is_richer() -> None:
     """A refresh that fills in a previously-blank field counts as richer."""
     existing = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
-    new = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5, labels=["AOTY-2024"])])
+    new = _cr(
+        sources=[
+            ReviewSourceEntry(source="AMG", rating=4.5, accolades=["Album of the Year (2024)"])
+        ]
+    )
     assert _critical_reception_is_richer(new, existing) is True
 
 

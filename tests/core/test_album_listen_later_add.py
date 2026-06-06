@@ -23,6 +23,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
+    ReviewLink,
     ReviewSourceEntry,
 )
 from music_assistant_models.provider import ProviderManifest
@@ -176,7 +177,7 @@ def _sample_critical_reception() -> CriticalReception:
             ReviewSourceEntry(
                 source="AMG",
                 rating=4.5,
-                labels=["AOTY-2000"],
+                accolades=["Album of the Year (2000)"],
             ),
             ReviewSourceEntry(
                 source="TPS",
@@ -207,7 +208,7 @@ async def test_listen_later_add_by_artist_album_with_critical_reception(
     assert stored.sources is not None
     sources_by_id = {s.source: s for s in stored.sources}
     assert sources_by_id["AMG"].rating == 4.5
-    assert sources_by_id["AMG"].labels == ["AOTY-2000"]
+    assert sources_by_id["AMG"].accolades == ["Album of the Year (2000)"]
     assert sources_by_id["TPS"].rating == 8.5
     assert sources_by_id["TPS"].favorite is True
 
@@ -283,7 +284,7 @@ async def test_listen_later_add_persists_cr_on_already_library_candidate(
     richer_cr = CriticalReception(
         amg_dr=12.5,
         sources=[
-            ReviewSourceEntry(source="AMG", rating=4.0, labels=["AOTY-2000"]),
+            ReviewSourceEntry(source="AMG", rating=4.0, accolades=["Album of the Year (2000)"]),
             ReviewSourceEntry(source="TPS", rating=8.5, favorite=True),
         ],
     )
@@ -298,7 +299,92 @@ async def test_listen_later_add_persists_cr_on_already_library_candidate(
     assert "TPS" in sources_by_id
     assert sources_by_id["TPS"].rating == 8.5
     assert sources_by_id["TPS"].favorite is True
-    assert sources_by_id["AMG"].labels == ["AOTY-2000"]
+    assert sources_by_id["AMG"].accolades == ["Album of the Year (2000)"]
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_add_folds_legacy_types_labels_payload(
+    mass: MusicAssistant,
+) -> None:
+    """A pre-3.2.0 payload using the deprecated types/labels lists is normalized on ingest."""
+    legacy_cr = CriticalReception(
+        sources=[
+            ReviewSourceEntry(
+                source="AMG",
+                rating=4.5,
+                types=["Review", "AOTM"],
+                labels=["AOTY-2000", "RECORD_OF_THE_MONTH", "AOTM-2000-09"],
+            ),
+        ],
+    )
+    library_album = await mass.music.add_album_to_listen_later(
+        artist="Radiohead", album="Kid A", critical_reception=legacy_cr
+    )
+
+    assert library_album.metadata.critical_reception is not None
+    amg = {s.source: s for s in (library_album.metadata.critical_reception.sources or [])}["AMG"]
+    # AOTM (type) + RECORD_OF_THE_MONTH + AOTM-2000-09 collapse to one dated entry.
+    assert amg.accolades == [
+        "Album of the Year (2000)",
+        "Record of the Month (Sep 2000)",
+        "Review",
+    ]
+    # the deprecated split fields are cleared once folded.
+    assert amg.types is None
+    assert amg.labels is None
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_add_persists_links(mass: MusicAssistant) -> None:
+    """A payload's structured per-post links round-trip onto the stored album."""
+    cr = CriticalReception(
+        sources=[
+            ReviewSourceEntry(
+                source="AMG",
+                rating=4.5,
+                accolades=["Review", "Album of the Year (2024)"],
+                links=[
+                    ReviewLink(label="Review", url="https://amg/album-review/"),
+                    ReviewLink(label="Album of the Year (2024)", url="https://amg/druhm-top/"),
+                    ReviewLink(label="Album of the Year (2024)", url="https://amg/grier-top/"),
+                ],
+            ),
+        ],
+    )
+    library_album = await mass.music.add_album_to_listen_later(
+        artist="Radiohead", album="Kid A", critical_reception=cr
+    )
+    assert library_album.metadata.critical_reception is not None
+    amg = {s.source: s for s in (library_album.metadata.critical_reception.sources or [])}["AMG"]
+    assert amg.links is not None
+    assert [(lk.label, lk.url) for lk in amg.links] == [
+        ("Review", "https://amg/album-review/"),
+        ("Album of the Year (2024)", "https://amg/druhm-top/"),
+        ("Album of the Year (2024)", "https://amg/grier-top/"),
+    ]
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_add_folds_legacy_review_url_payload(
+    mass: MusicAssistant,
+) -> None:
+    """A pre-3.3.0 payload with a single review_url is folded into a "Review" link."""
+    legacy_cr = CriticalReception(
+        sources=[
+            ReviewSourceEntry(source="AMG", rating=4.0, review_url="https://amg/old-review/"),
+        ],
+    )
+    library_album = await mass.music.add_album_to_listen_later(
+        artist="Radiohead", album="Kid A", critical_reception=legacy_cr
+    )
+    assert library_album.metadata.critical_reception is not None
+    amg = {s.source: s for s in (library_album.metadata.critical_reception.sources or [])}["AMG"]
+    assert amg.links is not None
+    assert [(lk.label, lk.url) for lk in amg.links] == [
+        ("Review", "https://amg/old-review/"),
+    ]
+    # the deprecated single-URL field is cleared once folded.
+    assert amg.review_url is None
 
 
 @pytest.mark.usefixtures("fake_provider")

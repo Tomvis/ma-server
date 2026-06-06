@@ -65,7 +65,7 @@ def _source_filled_field_count(source: Any) -> int:
         count += 1
     if getattr(source, "favorite", None) is not None:
         count += 1
-    for field in ("types", "labels", "authors"):
+    for field in ("accolades", "links", "authors"):
         val = getattr(source, field, None)
         if val:
             count += len(val)
@@ -82,8 +82,8 @@ def _total_source_field_count(sources: Any) -> int:
 _REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
     "rating",
     "favorite",
-    "types",
-    "labels",
+    "accolades",
+    "links",
     "authors",
 )
 
@@ -122,10 +122,10 @@ def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
     """True when `new_source` keeps every populated field from `cur_source`.
 
     A field that's populated on the stored copy must still be populated on the
-    incoming one — losing a rating, an accolade label, etc. would erase data on
-    the caller's wholesale `metadata.critical_reception = new` assignment. For
-    list-valued fields (types, labels, authors) the new side must additionally
-    be a superset of cur's elements — losing a label X out of [X, Y] while
+    incoming one — losing a rating, an accolade, etc. would erase data on the
+    caller's wholesale `metadata.critical_reception = new` assignment. For
+    list-valued fields (accolades, links, authors) the new side must additionally
+    be a superset of cur's elements — losing an accolade X out of [X, Y] while
     keeping Y still drops data on the wholesale replace, even though the field
     technically stays "populated".
     """
@@ -191,7 +191,7 @@ def _critical_reception_is_richer(new: object, existing: object) -> bool:
     if new_total < cur_total:
         return False
     # Same field count and no field-level regression: accept when at least one
-    # value actually changed (refreshed rating, swapped label, new amg_dr) so
+    # value actually changed (refreshed rating, swapped accolade, new amg_dr) so
     # meaningful updates don't get stuck behind an equal-shape stored copy.
     if new_amg_dr != cur_amg_dr:
         return True
@@ -210,8 +210,8 @@ def _source_signature(source: Any) -> tuple[Any, ...]:
         getattr(source, "source", None),
         getattr(source, "rating", None),
         getattr(source, "favorite", None),
-        tuple(getattr(source, "types", None) or ()),
-        tuple(getattr(source, "labels", None) or ()),
+        tuple(getattr(source, "accolades", None) or ()),
+        tuple(getattr(source, "links", None) or ()),
         tuple(getattr(source, "authors", None) or ()),
     )
 

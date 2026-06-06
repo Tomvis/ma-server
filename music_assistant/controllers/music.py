@@ -50,7 +50,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     Track,
 )
-from music_assistant_models.media_items.metadata import MediaItemMetadata
+from music_assistant_models.media_items.metadata import MediaItemMetadata, ReviewLink
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
@@ -94,7 +94,7 @@ from music_assistant.helpers.datetime import (
     utc_timestamp,
 )
 from music_assistant.helpers.json import json_dumps, json_loads, serialize_to_json
-from music_assistant.helpers.tags import split_artists
+from music_assistant.helpers.tags import legacy_accolades, split_artists
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.helpers.util import TaskManager, parse_optional_bool, parse_title_and_version
 from music_assistant.models.core_controller import CoreController
@@ -126,7 +126,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 44
+DB_SCHEMA_VERSION: Final[int] = 45
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
 _DYNAMIC_RADIO_BASE_SAMPLE_SIZE: Final[int] = 5
@@ -139,6 +139,30 @@ MUSIC_SYNC_COMPLETION_CHECK_TASK_ID: Final[str] = "music_sync_completion_check"
 # Per-provider timeout for the listen-later resolver fan-out. A slow provider
 # would otherwise wedge the WS request for the full underlying search timeout.
 _LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT: Final[float] = 10.0
+
+
+def _normalize_review_entries(cr: CriticalReception | None) -> None:
+    """
+    Fold deprecated per-source fields into the current 3.3.0 shape (in place).
+
+    Each source ends up with only ``accolades`` + ``links``: the legacy ``types``/
+    ``labels`` lists collapse into ``accolades`` and a legacy single ``review_url``
+    becomes a ``{"Review", url}`` link, with the deprecated fields cleared. Keeps
+    everything downstream — storage, the richness merge, the SQL filters — from
+    having to reason about more than one encoding.
+
+    :param cr: The critical-reception object to normalize (no-op when None/empty).
+    """
+    if cr is None or not cr.sources:
+        return
+    for src in cr.sources:
+        if not src.accolades and (src.types or src.labels):
+            src.accolades = legacy_accolades(src.types, src.labels) or None
+        src.types = None
+        src.labels = None
+        if not src.links and src.review_url:
+            src.links = [ReviewLink(label="Review", url=src.review_url)]
+        src.review_url = None
 
 
 class MusicController(CoreController):
@@ -1136,9 +1160,12 @@ class MusicController(CoreController):
            remains playable.
 
         ``critical_reception`` is optional and accepts the same shape produced
-        by the file-tag parser (DR + per-source AMG/TPS ratings/labels). When
-        supplied, it lands on the album's metadata before the library insert
-        — i.e. the same way file-scan results carry it.
+        by the file-tag parser (DR + per-source AMG/TPS ratings/accolades/links).
+        When supplied, it lands on the album's metadata before the library insert
+        — i.e. the same way file-scan results carry it. Pre-3.2.0 payloads using
+        the deprecated per-source ``types``/``labels`` lists, and pre-3.3.0 payloads
+        with a single ``review_url``, are folded into the merged ``accolades`` /
+        ``links`` shape on the way in.
 
         Refuses to flip the flag if the resolved album already has a
         provider_mapping with ``in_library=True``: a real library album is
@@ -1185,6 +1212,10 @@ class MusicController(CoreController):
                 )
 
         if critical_reception is not None:
+            # Fold any deprecated per-source fields (types/labels -> accolades,
+            # review_url -> a "Review" link) so only the current shape is ever stored
+            # (mirrors the file-tag path).
+            _normalize_review_entries(critical_reception)
             # Land CR on the in-memory album so _add_library_item persists it on
             # the initial insert. For an existing listen-later row the merge
             # path in _update_library_item replaces CR when the new payload is
@@ -3312,6 +3343,40 @@ class MusicController(CoreController):
                 "metadata, '$.critical_reception.dr') "
                 "WHERE json_extract(metadata, '$.critical_reception.dr') IS NOT NULL"
             )
+
+        if prev_version <= 44:
+            # 3.2.0 merges each critical_reception source's split `types` + `labels`
+            # token lists into one human-readable `accolades` list. Rewrite stored album
+            # rows so the SQL filters (which now read $.accolades) keep matching; the same
+            # fold runs on freshly-scanned tags and ingested payloads at their own entry
+            # points. Done in Python — the token->display transform (date inlining, dedup
+            # across the two fields) is beyond what SQLite's json functions can express.
+            async for db_row in self._database.iter_items(DB_TABLE_ALBUMS):
+                raw_metadata = db_row["metadata"]
+                if not raw_metadata:
+                    continue
+                metadata = json_loads(raw_metadata)
+                sources = (metadata.get("critical_reception") or {}).get("sources")
+                if not sources:
+                    continue
+                changed = False
+                for source in sources:
+                    if not isinstance(source, dict):
+                        continue
+                    if "types" not in source and "labels" not in source:
+                        continue
+                    legacy_types = source.pop("types", None)
+                    legacy_labels = source.pop("labels", None)
+                    changed = True
+                    if not source.get("accolades"):
+                        if folded := legacy_accolades(legacy_types, legacy_labels):
+                            source["accolades"] = folded
+                if changed:
+                    await self._database.update(
+                        DB_TABLE_ALBUMS,
+                        {"item_id": db_row["item_id"]},
+                        {"metadata": serialize_to_json(metadata)},
+                    )
 
         # save changes
         await self.database.commit()

@@ -14,6 +14,7 @@ from music_assistant.helpers.tags import (
     _parse_id3_tags,
     _parse_mp4_tags,
     _parse_vorbis_tags,
+    legacy_accolades,
     parse_tags_mutagen,
     split_artists,
     write_replaygain_track_gain,
@@ -828,9 +829,7 @@ def test_critical_reception_legacy_amg_dr_tag_still_recognized() -> None:
     assert cr is not None
     assert cr.amg_dr == 11.0
     # New canonical key wins over the legacy alias.
-    cr = _make_audio_tags(
-        {"amgalbumdynamicrange": "12", "amgdr": "20"}
-    ).critical_reception
+    cr = _make_audio_tags({"amgalbumdynamicrange": "12", "amgdr": "20"}).critical_reception
     assert cr is not None
     assert cr.amg_dr == 12.0
 
@@ -840,8 +839,9 @@ def test_critical_reception_extracts_amg_full_entry() -> None:
     cr = _make_audio_tags(
         {
             "amgrating": "4.5",
-            "amgtype": "Review;TYMHM",
-            "amglabels": "AOTY-2024;RECORD_OF_THE_MONTH",
+            "amgaccolades": (
+                "Review;TYMHM;Album of the Year (2024);Record of the Month (Sep 2024)"
+            ),
             "amgauthor": "Steel Druhm;Dr. A.N. Grier",
         }
     ).critical_reception
@@ -850,22 +850,132 @@ def test_critical_reception_extracts_amg_full_entry() -> None:
     amg = cr.sources[0]
     assert amg.source == "AMG"
     assert amg.rating == 4.5
-    assert amg.types == ["Review", "TYMHM"]
-    assert amg.labels == ["AOTY-2024", "RECORD_OF_THE_MONTH"]
+    assert amg.accolades == [
+        "Review",
+        "TYMHM",
+        "Album of the Year (2024)",
+        "Record of the Month (Sep 2024)",
+    ]
     assert amg.authors == ["Steel Druhm", "Dr. A.N. Grier"]
     assert amg.favorite is None
+    # the merged field supersedes the deprecated split fields
+    assert amg.types is None
+    assert amg.labels is None
+
+
+def test_critical_reception_legacy_type_labels_folded_into_accolades() -> None:
+    """Pre-3.2.0 AMG_TYPE / AMG_LABELS tags fold into the merged accolades list."""
+    cr = _make_audio_tags(
+        {
+            "amgrating": "4.5",
+            "amgtype": "Review;TYMHM;AOTM",
+            "amglabels": "AOTY-2024;RECORD_OF_THE_MONTH;AOTM-2024-09",
+            "amgauthor": "Steel Druhm",
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    amg = cr.sources[0]
+    # AOTM (type) + RECORD_OF_THE_MONTH + AOTM-2024-09 (labels) collapse to ONE dated
+    # "Record of the Month (Sep 2024)"; AOTY-2024 -> "Album of the Year (2024)".
+    assert amg.accolades == [
+        "Album of the Year (2024)",
+        "Record of the Month (Sep 2024)",
+        "TYMHM",
+        "Review",
+    ]
+    assert amg.types is None
+    assert amg.labels is None
+
+
+def test_critical_reception_prefers_accolades_over_legacy_tags() -> None:
+    """When both the new and deprecated tags are present, accolades wins."""
+    cr = _make_audio_tags(
+        {
+            "amgaccolades": "Album of the Year (2024)",
+            "amgtype": "Review",
+            "amglabels": "RECORD_OF_THE_MONTH",
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    assert cr.sources[0].accolades == ["Album of the Year (2024)"]
+
+
+def test_critical_reception_parses_links() -> None:
+    """AMG_LINKS entries ("<Label> — <URL>") become structured ReviewLink objects."""
+    cr = _make_audio_tags(
+        {
+            "amgrating": "4.5",
+            "amgaccolades": "Review;Album of the Year (2024)",
+            "amglinks": (
+                "Review — https://amg/album-review/;"
+                "Album of the Year (2024) — https://amg/amg-top-2024/;"
+                "Album of the Year (2024) — https://amg/grier-top-2024/"
+            ),
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    amg = cr.sources[0]
+    assert amg.links is not None
+    # one entry per post; the AOTY honor maps to two distinct posts
+    assert [(lk.label, lk.url) for lk in amg.links] == [
+        ("Review", "https://amg/album-review/"),
+        ("Album of the Year (2024)", "https://amg/amg-top-2024/"),
+        ("Album of the Year (2024)", "https://amg/grier-top-2024/"),
+    ]
+
+
+def test_critical_reception_legacy_review_url_becomes_review_link() -> None:
+    """A pre-3.3.0 AMG_REVIEW_URL (no AMG_LINKS) folds into a single "Review" link."""
+    cr = _make_audio_tags(
+        {"amgrating": "4", "amgreviewurl": "https://amg/old-review/"}
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    amg = cr.sources[0]
+    assert amg.links is not None
+    assert len(amg.links) == 1
+    assert amg.links[0].label == "Review"
+    assert amg.links[0].url == "https://amg/old-review/"
+
+
+def test_critical_reception_links_prefer_new_over_legacy_review_url() -> None:
+    """When both AMG_LINKS and the legacy AMG_REVIEW_URL exist, links wins."""
+    cr = _make_audio_tags(
+        {
+            "amgrating": "4",
+            "amglinks": "Review — https://amg/new/",
+            "amgreviewurl": "https://amg/old/",
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    assert [lk.url for lk in (cr.sources[0].links or [])] == ["https://amg/new/"]
+
+
+def test_critical_reception_malformed_link_entries_dropped() -> None:
+    """Entries without the ' — ' separator (or no URL) are skipped, not stored raw."""
+    cr = _make_audio_tags(
+        {
+            "amgrating": "4",
+            "amglinks": "no separator here;Review — https://amg/ok/",
+        }
+    ).critical_reception
+    assert cr is not None and cr.sources is not None
+    assert [lk.url for lk in (cr.sources[0].links or [])] == ["https://amg/ok/"]
 
 
 def test_critical_reception_favorite_only_entry() -> None:
     """A list-pick (favorite without rating) is a valid TPS entry."""
     cr = _make_audio_tags(
-        {"tpsfavorite": "true", "tpslabels": "AOTM-2024-03", "tpsauthor": "Dolphin Whisperer"}
+        {
+            "tpsfavorite": "true",
+            "tpsaccolades": "Record of the Month (Mar 2024)",
+            "tpsauthor": "Dolphin Whisperer",
+        }
     ).critical_reception
     assert cr is not None and cr.sources is not None
     tps = next(s for s in cr.sources if s.source == "TPS")
     assert tps.rating is None
     assert tps.favorite is True
-    assert tps.labels == ["AOTM-2024-03"]
+    assert tps.accolades == ["Record of the Month (Mar 2024)"]
 
 
 def test_critical_reception_amg_and_tps_coexist() -> None:
@@ -882,10 +992,41 @@ def test_critical_reception_amg_and_tps_coexist() -> None:
 def test_critical_reception_drops_empty_source_entries() -> None:
     """A source with all-empty fields is omitted, not added as a hollow entry."""
     cr = _make_audio_tags(
-        {"amgalbumdynamicrange": "10", "amgtype": "", "amgrating": "  "}
+        {"amgalbumdynamicrange": "10", "amgaccolades": "", "amgrating": "  "}
     ).critical_reception
     assert cr is not None
     assert cr.sources is None
+
+
+def test_legacy_accolades_folds_and_dedupes() -> None:
+    """The shared legacy transform collapses the old triple-encoding to one entry/concept."""
+    # AOTM (type) + RECORD_OF_THE_MONTH + AOTM-2024-09 (labels) -> one dated entry;
+    # the dated variant beats the bare one. AOTY-2024 -> a dated Album of the Year.
+    assert legacy_accolades(
+        ["Review", "TYMHM", "AOTM"],
+        ["AOTY-2024", "RECORD_OF_THE_MONTH", "AOTM-2024-09"],
+    ) == [
+        "Album of the Year (2024)",
+        "Record of the Month (Sep 2024)",
+        "TYMHM",
+        "Review",
+    ]
+
+
+def test_legacy_accolades_maps_individual_tokens() -> None:
+    """Each legacy token maps to its 3.2.0 display string."""
+    assert legacy_accolades([], ["AOTY-2024"]) == ["Album of the Year (2024)"]
+    assert legacy_accolades([], ["HONORABLE_MENTION-2023"]) == ["Honorable Mention (2023)"]
+    assert legacy_accolades(["Contrite"], ["SCORE_REVISED"]) == ["Score Revised"]
+    assert legacy_accolades(["Lost in Time"], ["LIT"]) == ["Lost in Time"]
+    # an undated Record of the Month (no AOTM-Y-M) keeps the bare name
+    assert legacy_accolades(["AOTM"], ["RECORD_OF_THE_MONTH"]) == ["Record of the Month"]
+
+
+def test_legacy_accolades_passes_unknown_tokens_through() -> None:
+    """Unrecognized tokens are preserved verbatim (deduped) rather than dropped."""
+    assert legacy_accolades(["Mystery"], ["Mystery", "Other"]) == ["Mystery", "Other"]
+    assert legacy_accolades(None, None) == []
 
 
 def test_critical_reception_invalid_numerics_dropped() -> None:
