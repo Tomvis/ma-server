@@ -23,10 +23,12 @@ def _build(**kwargs: object) -> tuple[list[str], dict[str, object]]:
         "amg_ratings": None,
         "amg_favorite": None,
         "amg_labels": None,
+        "amg_types": None,
         "amg_untagged": None,
         "tps_ratings": None,
         "tps_favorite": None,
         "tps_labels": None,
+        "tps_types": None,
         "tps_untagged": None,
     }
     base.update(kwargs)
@@ -50,14 +52,19 @@ def _make_db() -> sqlite3.Connection:
     # DR values now live at metadata.dynamic_range (the canonical, measured value).
     # critical_reception holds only review-derived data (AMG/TPS sources + amg_dr).
     rows = [
-        # 1: AMG 4.5 + AOTY-2024 + DR 16 (excellent)
+        # 1: AMG 4.5 + AOTY-2024 + YMIO/Lost in Time columns + DR 16 (excellent)
         (
             1,
             {
                 "dynamic_range": 16.0,
                 "critical_reception": {
                     "sources": [
-                        {"source": "AMG", "rating": 4.5, "labels": ["AOTY-2024"]},
+                        {
+                            "source": "AMG",
+                            "rating": 4.5,
+                            "labels": ["AOTY-2024"],
+                            "types": ["YMIO", "Lost in Time"],
+                        },
                     ],
                 },
             },
@@ -78,13 +85,13 @@ def _make_db() -> sqlite3.Connection:
                 },
             },
         ),
-        # 3: AMG list-pick (favorite) only, DR 6 (poor)
+        # 3: AMG list-pick (favorite) + TYMHM column, DR 6 (poor)
         (
             3,
             {
                 "dynamic_range": 6.0,
                 "critical_reception": {
-                    "sources": [{"source": "AMG", "favorite": True}],
+                    "sources": [{"source": "AMG", "favorite": True, "types": ["TYMHM"]}],
                 },
             },
         ),
@@ -175,6 +182,39 @@ def test_label_filter_matches_year_suffixed_kinds() -> None:
     assert _exec_with_filters(con, amg_labels=["aoty"]) == [1]
     assert _exec_with_filters(con, tps_labels=["aotm"]) == [2]
     assert _exec_with_filters(con, tps_labels=["record_of_the_month"]) == [4]
+
+
+def test_type_filter_matches_exact_review_column() -> None:
+    """Review-column types match exactly (no LIKE), scoped to their own source."""
+    con = _make_db()
+    assert _exec_with_filters(con, amg_types=["TYMHM"]) == [3]
+    assert _exec_with_filters(con, amg_types=["YMIO"]) == [1]
+
+
+def test_type_filter_matches_value_with_spaces() -> None:
+    """A multi-word column like 'Lost in Time' must match its exact stored string."""
+    con = _make_db()
+    assert _exec_with_filters(con, amg_types=["Lost in Time"]) == [1]
+
+
+def test_types_combine_with_or_within_source() -> None:
+    """Multiple requested types OR together: TYMHM (3) and YMIO (1) both surface."""
+    con = _make_db()
+    assert _exec_with_filters(con, amg_types=["TYMHM", "YMIO"]) == [1, 3]
+
+
+def test_type_filter_is_source_scoped() -> None:
+    """AMG-only columns must not match via the TPS source (albums 2 and 4 are TPS)."""
+    con = _make_db()
+    assert _exec_with_filters(con, tps_types=["TYMHM"]) == []
+    assert _exec_with_filters(con, tps_types=["YMIO"]) == []
+
+
+def test_empty_type_list_emits_nothing() -> None:
+    """An all-falsy type list produces no SQL nor params; it's simply ignored."""
+    parts, params = _build(amg_types=[""])
+    assert parts == []
+    assert params == {}
 
 
 def test_amg_untagged_matches_albums_without_amg_entry() -> None:

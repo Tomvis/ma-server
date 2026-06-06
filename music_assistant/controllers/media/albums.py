@@ -162,6 +162,35 @@ def _source_labels_clause(
     return sub, params
 
 
+def _source_types_clause(
+    source: str, types: list[str], param_prefix: str
+) -> tuple[str, dict[str, Any]]:
+    """Match albums where the given source carries one of the requested review types.
+
+    Unlike accolade labels (matched with LIKE so a kind covers every year suffix),
+    review-column types are stored as exact strings in the JSON ``types[]`` array
+    (``TYMHM``, ``YMIO``, ``Lost in Time``, …), so they're matched with an IN list.
+    """
+    cleaned = [t for t in types if t]
+    if not cleaned:
+        return "", {}
+    src_key = f"{param_prefix}_src"
+    params: dict[str, Any] = {src_key: source}
+    type_keys: list[str] = []
+    for i, t in enumerate(cleaned):
+        k = f"{param_prefix}_{i}"
+        params[k] = t
+        type_keys.append(k)
+    type_in = ", ".join(f":{k}" for k in type_keys)
+    sub = (
+        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') src "
+        f"WHERE json_extract(src.value, '$.source') = :{src_key} "
+        "AND EXISTS(SELECT 1 FROM json_each(json_extract(src.value, '$.types')) type_each "
+        f"WHERE type_each.value IN ({type_in})))"
+    )
+    return sub, params
+
+
 def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Match albums that do not carry an entry for the given source."""
     src_key = f"{param_prefix}_src"
@@ -180,10 +209,12 @@ def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
     amg_ratings: list[int] | None,
     amg_favorite: bool | None,
     amg_labels: list[str] | None,
+    amg_types: list[str] | None,
     amg_untagged: bool | None,
     tps_ratings: list[int] | None,
     tps_favorite: bool | None,
     tps_labels: list[str] | None,
+    tps_types: list[str] | None,
     tps_untagged: bool | None,
     match_mode: str = "all",
 ) -> None:
@@ -266,6 +297,17 @@ def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
     ):
         if labels_list:
             clause, params = _source_labels_clause(source, list(labels_list), prefix)
+            if clause:
+                local_parts.append(clause)
+                query_params.update(params)
+
+    # AMG / TPS review-type (column) filters — e.g. TYMHM / YMIO on AMG.
+    for source, types_list, prefix in (
+        ("AMG", amg_types, "amg_typ"),
+        ("TPS", tps_types, "tps_typ"),
+    ):
+        if types_list:
+            clause, params = _source_types_clause(source, list(types_list), prefix)
             if clause:
                 local_parts.append(clause)
                 query_params.update(params)
@@ -409,10 +451,12 @@ class AlbumsController(MediaControllerBase[Album]):
         amg_ratings: list[int] | None = None,
         amg_favorite: bool | None = None,
         amg_labels: list[str] | None = None,
+        amg_types: list[str] | None = None,
         amg_untagged: bool | None = None,
         tps_ratings: list[int] | None = None,
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
+        tps_types: list[str] | None = None,
         tps_untagged: bool | None = None,
         critical_reception_match: str = "all",
         **kwargs: Any,
@@ -431,6 +475,7 @@ class AlbumsController(MediaControllerBase[Album]):
         :param amg_ratings / tps_ratings: Filter by review-source rating buckets.
         :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
         :param amg_labels / tps_labels: Filter by accolade label kind.
+        :param amg_types / tps_types: Filter by review-column type (e.g. TYMHM, YMIO).
         :param amg_untagged / tps_untagged: Keep only albums missing that source.
         :param critical_reception_match: ``"all"`` (default) ANDs all DR/AMG/TPS clauses;
             ``"any"`` ORs them so an album matches if it satisfies at least one.
@@ -455,10 +500,12 @@ class AlbumsController(MediaControllerBase[Album]):
             amg_ratings=amg_ratings,
             amg_favorite=amg_favorite,
             amg_labels=amg_labels,
+            amg_types=amg_types,
             amg_untagged=amg_untagged,
             tps_ratings=tps_ratings,
             tps_favorite=tps_favorite,
             tps_labels=tps_labels,
+            tps_types=tps_types,
             tps_untagged=tps_untagged,
             match_mode=critical_reception_match,
         )
@@ -557,10 +604,12 @@ class AlbumsController(MediaControllerBase[Album]):
         amg_ratings: list[int] | None = None,
         amg_favorite: bool | None = None,
         amg_labels: list[str] | None = None,
+        amg_types: list[str] | None = None,
         amg_untagged: bool | None = None,
         tps_ratings: list[int] | None = None,
         tps_favorite: bool | None = None,
         tps_labels: list[str] | None = None,
+        tps_types: list[str] | None = None,
         tps_untagged: bool | None = None,
         critical_reception_match: str = "all",
         # Caller's effective page-size hint. library_items's artist top-up only
@@ -617,10 +666,12 @@ class AlbumsController(MediaControllerBase[Album]):
             amg_ratings=amg_ratings,
             amg_favorite=amg_favorite,
             amg_labels=amg_labels,
+            amg_types=amg_types,
             amg_untagged=amg_untagged,
             tps_ratings=tps_ratings,
             tps_favorite=tps_favorite,
             tps_labels=tps_labels,
+            tps_types=tps_types,
             tps_untagged=tps_untagged,
             match_mode=critical_reception_match,
         )
