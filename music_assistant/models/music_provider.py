@@ -119,15 +119,20 @@ def _sources_by_name(sources: Any) -> dict[str, Any]:
 
 
 def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
-    """True when `new_source` keeps every populated field from `cur_source`.
+    """True when `new_source` keeps every populated field from `cur_source` populated.
 
     A field that's populated on the stored copy must still be populated on the
-    incoming one — losing a rating, an accolade, etc. would erase data on the
-    caller's wholesale `metadata.critical_reception = new` assignment. For
-    list-valued fields (accolades, links, authors) the new side must additionally
-    be a superset of cur's elements — losing an accolade X out of [X, Y] while
-    keeping Y still drops data on the wholesale replace, even though the field
-    technically stays "populated".
+    incoming one — losing a rating, dropping all accolades, etc. would erase data
+    on the caller's wholesale `metadata.critical_reception = new` assignment.
+
+    List-valued fields (accolades, links, authors) only have to stay non-empty,
+    not stay a superset. For file-tag-derived CR the provider re-probe is
+    authoritative: an accolade set that legitimately changes over time (an award
+    revised, a new honorable mention added in a later year, a stale one dropped)
+    is a valid refresh, not a regression — and gating it behind a strict superset
+    would also block an additive refresh (e.g. one that adds review links) whenever
+    the set happened to change. Net data loss across the whole CR is still guarded
+    by the aggregate field-count check in `_critical_reception_is_richer`.
     """
     if cur_source is None:
         return True
@@ -140,11 +145,6 @@ def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
             continue
         if not _field_is_populated(new_val):
             return False
-        # List-valued fields: cur's element set must survive on new.
-        if isinstance(cur_val, list | tuple | set):
-            new_elements = set(new_val) if isinstance(new_val, list | tuple | set) else set()
-            if not set(cur_val).issubset(new_elements):
-                return False
     return True
 
 

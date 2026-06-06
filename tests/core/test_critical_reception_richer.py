@@ -8,7 +8,11 @@ must reject any change that loses data on either dimension (amg_dr or sources)
 
 from __future__ import annotations
 
-from music_assistant_models.media_items.metadata import CriticalReception, ReviewSourceEntry
+from music_assistant_models.media_items.metadata import (
+    CriticalReception,
+    ReviewLink,
+    ReviewSourceEntry,
+)
 
 from music_assistant.models.music_provider import _critical_reception_is_richer
 
@@ -103,4 +107,77 @@ def test_same_source_count_but_field_swap_is_not_richer() -> None:
     """
     existing = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     new = _cr(sources=[ReviewSourceEntry(source="AMG", favorite=True)])
+    assert _critical_reception_is_richer(new, existing) is False
+
+
+def test_changed_accolade_set_plus_added_links_is_richer() -> None:
+    """A file-tag re-probe that swaps an accolade AND adds review links is richer.
+
+    The accolade set legitimately changes over time (an award revised, a stale one
+    dropped, a new honorable mention added in a later year). Such a re-tag is no
+    longer a subset of the stored set, but it grows the total field count (it adds
+    links), so it must win — not get blocked by the old strict-superset rule.
+    """
+    existing = _cr(
+        sources=[
+            ReviewSourceEntry(
+                source="AMG",
+                rating=4.5,
+                accolades=["Record of the Month (Mar 2021)", "Honorable Mention (2021)"],
+            )
+        ]
+    )
+    new = _cr(
+        sources=[
+            ReviewSourceEntry(
+                source="AMG",
+                rating=4.5,
+                accolades=["Honorable Mention (2021)", "Honorable Mention (2022)"],
+                links=[ReviewLink(label="Honorable Mention", url="https://example.com/post")],
+            )
+        ]
+    )
+    assert _critical_reception_is_richer(new, existing) is True
+
+
+def test_changed_accolade_set_with_net_loss_is_not_richer() -> None:
+    """A re-tag that swaps an accolade but shrinks the total field count is rejected.
+
+    Even with the superset rule relaxed, the aggregate field-count guard still
+    protects against net data loss: dropping two accolades for one, with nothing
+    added to compensate, lowers the total and must keep the stored copy.
+    """
+    existing = _cr(
+        sources=[
+            ReviewSourceEntry(
+                source="AMG",
+                rating=4.5,
+                accolades=[
+                    "Record of the Month (Mar 2021)",
+                    "Honorable Mention (2021)",
+                    "Album of the Year (2021)",
+                ],
+            )
+        ]
+    )
+    new = _cr(
+        sources=[
+            ReviewSourceEntry(source="AMG", rating=4.5, accolades=["Honorable Mention (2022)"])
+        ]
+    )
+    assert _critical_reception_is_richer(new, existing) is False
+
+
+def test_dropping_all_accolades_is_not_richer() -> None:
+    """A new source that keeps the rating but blanks a populated accolades list regresses.
+
+    The populated-stays-populated guard is independent of the superset relaxation:
+    going from accolades=[...] to no accolades erases data on the wholesale replace.
+    """
+    existing = _cr(
+        sources=[
+            ReviewSourceEntry(source="AMG", rating=4.5, accolades=["Album of the Year (2024)"])
+        ]
+    )
+    new = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     assert _critical_reception_is_richer(new, existing) is False
