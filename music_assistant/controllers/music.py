@@ -126,7 +126,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
-DB_SCHEMA_VERSION: Final[int] = 45
+DB_SCHEMA_VERSION: Final[int] = 46
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
 _DYNAMIC_RADIO_BASE_SAMPLE_SIZE: Final[int] = 5
@@ -3377,6 +3377,18 @@ class MusicController(CoreController):
                         {"item_id": db_row["item_id"]},
                         {"metadata": serialize_to_json(metadata)},
                     )
+
+        if prev_version <= 45:
+            # listen_later and library membership are mutually exclusive (enforced
+            # going forward in AlbumsController._update_library_item). Clean up any
+            # album that landed in both before that enforcement by clearing the
+            # listen_later flag on rows that also carry an in_library mapping.
+            await self._database.execute(
+                f"UPDATE {DB_TABLE_ALBUMS} SET listen_later = 0, listen_later_added_at = NULL "
+                "WHERE listen_later = 1 AND item_id IN ("
+                f"SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS} "
+                "WHERE media_type = 'album' AND in_library = 1)"
+            )
 
         # save changes
         await self.database.commit()

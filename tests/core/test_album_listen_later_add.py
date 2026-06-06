@@ -242,6 +242,29 @@ async def test_listen_later_add_rejects_when_album_already_in_library(
         await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
 
 
+@pytest.mark.usefixtures("fake_provider")
+async def test_adding_to_library_graduates_album_out_of_listen_later(
+    mass: MusicAssistant,
+) -> None:
+    """An album moved into the library proper is cleared from the listen-later pile.
+
+    Library membership and listen-later are mutually exclusive; once the album gains
+    an in_library mapping it must leave listen-later instead of lingering in both.
+    """
+    uri = f"{_PROVIDER_INSTANCE}://album/alb-1"
+    # save it for later first (listen_later=1, no in_library mapping)
+    saved = await mass.music.add_album_to_listen_later(item=uri)
+    db_id = saved.item_id
+    assert saved.listen_later is True
+    assert not any(pm.in_library for pm in saved.provider_mappings)
+    # now add the same album to the library proper
+    await mass.music.add_item_to_library(uri)
+    # it should now be a library item and no longer on listen-later
+    refreshed = await mass.music.albums.get_library_item(db_id)
+    assert any(pm.in_library for pm in refreshed.provider_mappings)
+    assert refreshed.listen_later is False
+
+
 async def test_listen_later_add_requires_item_or_artist_album(
     mass: MusicAssistant,
 ) -> None:

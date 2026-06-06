@@ -1044,6 +1044,14 @@ class AlbumsController(MediaControllerBase[Album]):
                     merged[key] = replace(existing_pm, in_library=True)
             provider_mappings = list(merged.values())
         await self.set_provider_mappings(db_id, provider_mappings, overwrite)
+        # Library membership and listen-later are mutually exclusive: once an album
+        # gains an in_library mapping it graduates out of the listen-later pile, so a
+        # saved album that's later added to the library (or synced in) never lingers in
+        # both. New rows default listen_later=0, so this only matters on update.
+        if getattr(cur_item, "listen_later", False) and any(
+            pm.in_library for pm in provider_mappings
+        ):
+            await self.set_listen_later(db_id, False)
         # set album artist(s)
         artists = update.artists if overwrite else cur_item.artists + update.artists
         await self._set_album_artists(db_id, artists, overwrite=overwrite)
