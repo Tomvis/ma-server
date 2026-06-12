@@ -329,7 +329,7 @@ class OpenSonicProvider(MusicProvider):
         else:
             await self.conn.unstar(sids=track_ids, album_ids=album_ids, artist_ids=artist_ids)
 
-    async def get_library_artists(self) -> AsyncGenerator[Artist, None]:
+    async def get_library_artists(self) -> AsyncGenerator[Artist]:
         """Provide a generator for reading all artists."""
         artists = await self.conn.get_artists()
 
@@ -343,7 +343,7 @@ class OpenSonicProvider(MusicProvider):
             for artist in index.artist:
                 yield parse_artist(self.instance_id, artist)
 
-    async def get_library_albums(self) -> AsyncGenerator[Album, None]:
+    async def get_library_albums(self) -> AsyncGenerator[Album]:
         """
         Provide a generator for reading all artists.
 
@@ -545,13 +545,13 @@ class OpenSonicProvider(MusicProvider):
             if tmp_path is not None:
                 await asyncio.to_thread(_silent_unlink, tmp_path)
 
-    async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
+    async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
         """Provide a generator for library playlists."""
         results = await self.conn.get_playlists()
         for entry in results:
             yield parse_playlist(self.instance_id, entry)
 
-    async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
+    async def get_library_tracks(self) -> AsyncGenerator[Track]:
         """
         Provide a generator for library tracks.
 
@@ -728,7 +728,7 @@ class OpenSonicProvider(MusicProvider):
     async def get_podcast_episodes(
         self,
         prov_podcast_id: str,
-    ) -> AsyncGenerator[PodcastEpisode, None]:
+    ) -> AsyncGenerator[PodcastEpisode]:
         """Get all Episodes for given podcast id."""
         if not self._enable_podcasts:
             return
@@ -752,7 +752,7 @@ class OpenSonicProvider(MusicProvider):
 
         return parse_podcast(self.instance_id, channels[0])
 
-    async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
+    async def get_library_podcasts(self) -> AsyncGenerator[Podcast]:
         """Retrieve library/subscribed podcasts from the provider."""
         if self._enable_podcasts:
             channels = await self.conn.get_podcasts(inc_episodes=True)
@@ -1019,7 +1019,7 @@ class OpenSonicProvider(MusicProvider):
 
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
-    ) -> AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[bytes]:
         """Provide a generator for the stream data."""
         # ignore seek position if the server does not support it
         # in that case we let the core handle seeking
@@ -1068,6 +1068,7 @@ class OpenSonicProvider(MusicProvider):
             item_id="subsonic_newest_podcasts",
             provider=self.domain,
             name="Newest Podcast Episodes",
+            translation_key="recommendations.episodes_recently_added",
         )
         sonic_episodes = await self.conn.get_newest_podcasts(count=self._reco_limit)
         for ep in sonic_episodes:
@@ -1078,7 +1079,10 @@ class OpenSonicProvider(MusicProvider):
 
     async def _favorites_recommendation(self) -> RecommendationFolder:
         faves: RecommendationFolder = RecommendationFolder(
-            item_id="subsonic_starred_albums", provider=self.domain, name="Starred Items"
+            item_id="subsonic_starred_albums",
+            provider=self.domain,
+            name="Starred Items",
+            translation_key="provider.opensubsonic.starred_items",
         )
         starred = await self.conn.get_starred2()
         if starred.album:
@@ -1098,7 +1102,10 @@ class OpenSonicProvider(MusicProvider):
 
     async def _new_recommendations(self) -> RecommendationFolder:
         new_stuff: RecommendationFolder = RecommendationFolder(
-            item_id="subsonic_new_albums", provider=self.domain, name="New Albums"
+            item_id="subsonic_new_albums",
+            provider=self.domain,
+            name="New Albums",
+            translation_key="recommendations.recently_added_albums",
         )
         new_albums = await self.conn.get_album_list2(ltype="newest", size=self._reco_limit)
         for sonic_album in new_albums:
@@ -1107,7 +1114,10 @@ class OpenSonicProvider(MusicProvider):
 
     async def _played_recommendations(self) -> RecommendationFolder:
         recent: RecommendationFolder = RecommendationFolder(
-            item_id="subsonic_most_played", provider=self.domain, name="Most Played Albums"
+            item_id="subsonic_most_played",
+            provider=self.domain,
+            name="Most Played Albums",
+            translation_key="recommendations.most_played_albums",
         )
         albums = await self.conn.get_album_list2(ltype="frequent", size=self._reco_limit)
         for sonic_album in albums:
