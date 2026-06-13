@@ -563,9 +563,11 @@ def loose_compare_strings(base: str, alt: str) -> bool:
         return compare_strings(base, alt, False)
     base_comp = create_safe_string(base)
     alt_comp = create_safe_string(alt)
-    if base_comp in alt_comp:
-        return True
-    return alt_comp in base_comp
+    # one-directional containment (base ⊆ alt) only: matching alt ⊆ base too would
+    # over-group, e.g. a short reissue title "Song" matching a more specific stored
+    # "Song (Remastered Live Bonus)". See upstream "fix album versions comparison
+    # match too flexible".
+    return base_comp in alt_comp
 
 
 def compare_strings(str1: str, str2: str, strict: bool = True) -> bool:

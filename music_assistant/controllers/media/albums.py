@@ -340,6 +340,51 @@ def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
         query_parts.extend(local_parts)
 
 
+def _apply_album_specific_filters(  # noqa: PLR0913
+    *,
+    query_parts: list[str],
+    query_params: dict[str, Any],
+    album_types: list[AlbumType] | None,
+    listen_later: bool | None,
+    dr_buckets: list[str] | None,
+    amg_ratings: list[int] | None,
+    amg_favorite: bool | None,
+    amg_accolades: list[str] | None,
+    amg_untagged: bool | None,
+    tps_ratings: list[int] | None,
+    tps_favorite: bool | None,
+    tps_accolades: list[str] | None,
+    tps_untagged: bool | None,
+    match_mode: str,
+) -> None:
+    """Append the album-specific (album_type / listen_later / critical-reception) clauses.
+
+    Shared by :meth:`AlbumsController.library_items` and
+    :meth:`AlbumsController.library_count` so the listed rows and the displayed count
+    apply identical album filters; only the search clause is handled per-method.
+    """
+    if album_types:
+        query_parts.append("albums.album_type IN :album_types")
+        query_params["album_types"] = [x.value for x in album_types]
+    if listen_later is not None:
+        query_parts.append("albums.listen_later = :listen_later_flag")
+        query_params["listen_later_flag"] = listen_later
+    _apply_critical_reception_filters(
+        query_parts=query_parts,
+        query_params=query_params,
+        dr_buckets=dr_buckets,
+        amg_ratings=amg_ratings,
+        amg_favorite=amg_favorite,
+        amg_accolades=amg_accolades,
+        amg_untagged=amg_untagged,
+        tps_ratings=tps_ratings,
+        tps_favorite=tps_favorite,
+        tps_accolades=tps_accolades,
+        tps_untagged=tps_untagged,
+        match_mode=match_mode,
+    )
+
+
 class AlbumsController(MediaControllerBase[Album]):
     """Controller managing MediaItems of type Album."""
 
@@ -475,18 +520,13 @@ class AlbumsController(MediaControllerBase[Album]):
         extra_query_parts: list[str] = []
         extra_join_parts: list[str] = []
         artist_table_joined = False
-        # optional album type filter
-        if album_types:
-            extra_query_parts.append("albums.album_type IN :album_types")
-            extra_query_params["album_types"] = [x.value for x in album_types]
-        # listen_later filter — bool, applies to albums.listen_later directly
-        if listen_later is not None:
-            extra_query_parts.append("albums.listen_later = :listen_later_flag")
-            extra_query_params["listen_later_flag"] = listen_later
-        # optional critical_reception filters (DR + AMG/TPS source entries)
-        _apply_critical_reception_filters(
+        # album-specific filters (album_type / listen_later / critical_reception),
+        # shared with library_count so count and list stay in sync.
+        _apply_album_specific_filters(
             query_parts=extra_query_parts,
             query_params=extra_query_params,
+            album_types=album_types,
+            listen_later=listen_later,
             dr_buckets=dr_buckets,
             amg_ratings=amg_ratings,
             amg_favorite=amg_favorite,
@@ -640,15 +680,11 @@ class AlbumsController(MediaControllerBase[Album]):
             provider_filter=self._ensure_provider_filter(provider),
             in_library_only=in_library_only,
         )
-        if album_types:
-            base_parts.append("albums.album_type IN :album_types")
-            base_params["album_types"] = [x.value for x in album_types]
-        if listen_later is not None:
-            base_parts.append("albums.listen_later = :listen_later_flag")
-            base_params["listen_later_flag"] = listen_later
-        _apply_critical_reception_filters(
+        _apply_album_specific_filters(
             query_parts=base_parts,
             query_params=base_params,
+            album_types=album_types,
+            listen_later=listen_later,
             dr_buckets=dr_buckets,
             amg_ratings=amg_ratings,
             amg_favorite=amg_favorite,
@@ -989,12 +1025,6 @@ class AlbumsController(MediaControllerBase[Album]):
             )
             if not _critical_reception_is_richer(candidate_cr, stored_cr):
                 metadata.critical_reception = stored_cr
-            # Provider-refreshed measured dynamic_range is a plain scalar: model.update()
-            # keeps a populated non-None cur value, so a refreshed incoming DR would never
-            # land on the merge branch. Copy it across explicitly (mirrors the in-memory
-            # override the album sync arm sets on the library_item before persisting).
-            if update.metadata.dynamic_range is not None:
-                metadata.dynamic_range = update.metadata.dynamic_range
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:
@@ -1052,7 +1082,16 @@ class AlbumsController(MediaControllerBase[Album]):
         # saved album that's later added to the library (or synced in) never lingers in
         # both. New rows default listen_later=0, so this only matters on update.
         if cur_item.listen_later and any(pm.in_library for pm in provider_mappings):
-            await self.set_listen_later(db_id, False)
+            # Clear listen-later inline rather than via set_listen_later(): the
+            # surrounding update_item_in_library/add_item_to_library re-reads the row
+            # and emits a single MEDIA_ITEM_UPDATED once the whole update (incl. the
+            # artists set below) has landed. Calling set_listen_later here would add
+            # two redundant re-reads plus a premature event for a half-updated row.
+            await self.mass.music.database.update(
+                self.db_table,
+                {"item_id": db_id},
+                {"listen_later": False, "listen_later_added_at": None},
+            )
         # set album artist(s)
         artists = update.artists if overwrite else cur_item.artists + update.artists
         await self._set_album_artists(db_id, artists, overwrite=overwrite)
