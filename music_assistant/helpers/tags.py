@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -81,7 +82,7 @@ def _parse_float_tag(raw: str | list[str] | tuple[str, ...] | None) -> float | N
     except ValueError:
         return None
     # Reject NaN/inf so they don't poison downstream comparisons / JSON.
-    if value != value or value in (float("inf"), float("-inf")):  # noqa: PLR0124
+    if not math.isfinite(value):
         return None
     return value
 
@@ -210,6 +211,35 @@ def legacy_accolades(types: Iterable[str] | None, labels: Iterable[str] | None) 
     return ordered + extras
 
 
+def review_url_to_links(url: str) -> list[ReviewLink]:
+    """Wrap a legacy single review URL into the equivalent ``links`` list."""
+    return [ReviewLink(label="Review", url=url)]
+
+
+def normalize_review_entries(cr: CriticalReception | None) -> None:
+    """
+    Fold deprecated per-source fields into the current 3.3.0 shape (in place).
+
+    Each source ends up with only ``accolades`` + ``links``: the legacy ``types``/
+    ``labels`` lists collapse into ``accolades`` and a legacy single ``review_url``
+    becomes a ``{"Review", url}`` link, with the deprecated fields cleared. Keeps
+    everything downstream — storage, the richness merge, the SQL filters — from
+    having to reason about more than one encoding.
+
+    :param cr: The critical-reception object to normalize (no-op when None/empty).
+    """
+    if cr is None or not cr.sources:
+        return
+    for src in cr.sources:
+        if not src.accolades and (src.types or src.labels):
+            src.accolades = legacy_accolades(src.types, src.labels) or None
+        src.types = None
+        src.labels = None
+        if not src.links and src.review_url:
+            src.links = review_url_to_links(src.review_url)
+        src.review_url = None
+
+
 # Separator inside each <SRC>_LINKS entry: "<Label> — <URL>" (space, EM DASH, space).
 # Labels never contain it and URLs never contain spaces, so splitting on the first
 # occurrence is unambiguous.
@@ -253,7 +283,7 @@ def _build_review_source_entry(
         if review_url := _first_tag_value(tags.get(f"{key_prefix}reviewurl")):
             review_url = str(review_url).strip()
             if review_url:
-                links = [ReviewLink(label="Review", url=review_url)]
+                links = review_url_to_links(review_url)
     authors = list(split_items(tags.get(f"{key_prefix}author")))
     if rating is None and favorite is None and not accolades and not links and not authors:
         return None

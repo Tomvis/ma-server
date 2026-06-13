@@ -172,6 +172,20 @@ def _pcm_formats_match(a: AudioFormat, b: AudioFormat) -> bool:
     )
 
 
+def _clamped_warmup_size(pcm_format: AudioFormat, crossfade_buffer_size: int) -> int:
+    """Bytes of PCM to yield directly before the crossfade holdback starts buffering.
+
+    Clamp to crossfade_buffer_size: on short tracks (or aggressive smart_fades
+    clamping) the crossfade buffer wants less than WARMUP_DURATION seconds, and the
+    warmup would otherwise starve fade_out_data, producing a misaligned
+    end-of-track crossfade.
+    """
+    warmup_size = int(pcm_format.pcm_sample_size * WARMUP_DURATION)
+    if crossfade_buffer_size > 0:
+        warmup_size = min(warmup_size, crossfade_buffer_size)
+    return warmup_size
+
+
 class StreamsAudio:
     """Audio stream acquisition and processing for the streams controller."""
 
@@ -1788,12 +1802,7 @@ class StreamsAudio:
 
         # Yield the first WARMUP_DURATION worth of audio immediately so playback starts
         # right away. After that, start accumulating the crossfade holdback buffer.
-        # Clamp to crossfade_buffer_size: on short tracks the crossfade buffer wants
-        # less than 8s and the warmup would otherwise starve fade_out_data, producing
-        # a misaligned end-of-track crossfade.
-        warmup_size = int(pcm_format.pcm_sample_size * WARMUP_DURATION)
-        if crossfade_buffer_size > 0:
-            warmup_size = min(warmup_size, crossfade_buffer_size)
+        warmup_size = _clamped_warmup_size(pcm_format, crossfade_buffer_size)
         warmup_bytes = 0
         total_chunks_received = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
@@ -2157,12 +2166,7 @@ class StreamsAudio:
             crossfade_buffer_size = int(pcm_format.pcm_sample_size * crossfade_buffer_duration)
             # Round down to nearest frame boundary
             crossfade_buffer_size = (crossfade_buffer_size // frame_size) * frame_size
-            # Clamp warmup to crossfade_buffer_size so short tracks (or aggressive
-            # smart_fades clamping) still have enough audio left to fill the
-            # crossfade buffer at end-of-track.
-            warmup_size = int(pcm_format.pcm_sample_size * WARMUP_DURATION)
-            if crossfade_buffer_size > 0:
-                warmup_size = min(warmup_size, crossfade_buffer_size)
+            warmup_size = _clamped_warmup_size(pcm_format, crossfade_buffer_size)
 
             # raw_seek_position feeds the PCM buffer; streamdetails.seek_position
             # (overwritten below) only drives reported elapsed time.

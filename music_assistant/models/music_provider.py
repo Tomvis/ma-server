@@ -905,9 +905,8 @@ class MusicProvider(Provider):
                         # play_count/last_played for that user.
                         has_user_anchor = (
                             library_item.favorite
-                            or getattr(library_item, "listen_later", False)
-                            or bool(getattr(library_item, "play_count", 0))
-                            or bool(getattr(library_item, "last_played", 0))
+                            or library_item.listen_later
+                            or await controller.has_play_history(db_id)
                         )
                         if (
                             not remaining_providers_in_library
@@ -1111,7 +1110,7 @@ class MusicProvider(Provider):
                 # doesn't show up in both views. The pre-flight check in
                 # add_album_to_listen_later guards the write path; this guards
                 # the read-back path where streaming-library sync wins the race.
-                if getattr(library_item, "listen_later", False) and any(
+                if library_item.listen_later and any(
                     pm.in_library for pm in library_item.provider_mappings
                 ):
                     await self.mass.music.albums.set_listen_later(library_item.item_id, False)

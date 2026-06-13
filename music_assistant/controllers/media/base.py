@@ -43,7 +43,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import get_cu
 from music_assistant.helpers.compare import compare_media_item, create_safe_string
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.json import json_loads, serialize_to_json
-from music_assistant.helpers.util import guard_single_request, parse_optional_bool
+from music_assistant.helpers.util import guard_single_request, parse_optional_bool, try_parse_int
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
@@ -621,6 +621,18 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         await self.mass.music.database.update(self.db_table, match, {"favorite": favorite})
         library_item = await self.get_library_item(db_id)
         self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+
+    @final
+    async def has_play_history(self, item_id: str | int) -> bool:
+        """Return whether the library item has any recorded play history."""
+        # play_count/last_played live on the DB row but not on the dataclass
+        # (mashumaro drops unknown keys on from_dict), so query the row directly.
+        db_row = await self.mass.music.database.get_row(self.db_table, {"item_id": int(item_id)})
+        if not db_row:
+            return False
+        return (try_parse_int(db_row["play_count"], 0) or 0) > 0 or (
+            try_parse_int(db_row["last_played"], 0) or 0
+        ) > 0
 
     @guard_single_request
     @final

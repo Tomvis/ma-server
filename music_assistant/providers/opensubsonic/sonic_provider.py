@@ -111,6 +111,10 @@ CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
 # when later tracks carry them; sampling a few covers this without blowing up
 # sync cost.
 _CR_PROBE_SONG_ATTEMPTS = 3
+# Max albums enriched concurrently per library-sync page. Bounds simultaneous
+# conn.get_album round-trips and ffprobe subprocesses so a page of cache misses
+# overlaps latency without saturating the network or the default thread pool.
+_CR_ENRICH_CONCURRENCY = 4
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
@@ -358,13 +362,20 @@ class OpenSonicProvider(MusicProvider):
             offset=offset,
         )
         while albums:
-            for album in albums:
-                parsed = parse_album(self.logger, self.instance_id, album)
-                # Pull AMG/TPS/DR custom tags out of one track per album.
-                # These don't ride on the OpenSubsonic schema, so we ffprobe a
-                # short prefix of the audio. Failures are non-fatal — the album
-                # still syncs, just without critical_reception.
-                await self._enrich_album_with_critical_reception(parsed, album.id)
+            # Pull AMG/TPS/DR custom tags out of one track per album. These don't
+            # ride on the OpenSubsonic schema, so we ffprobe a short prefix of the
+            # audio. Enrich the whole page with bounded concurrency before yielding
+            # so cache-miss albums overlap their network/ffprobe latency instead of
+            # serializing. _enrich_album_with_critical_reception swallows its own
+            # failures (non-fatal — the album still syncs, just without
+            # critical_reception), so one album can't abort the page.
+            parsed_page = [parse_album(self.logger, self.instance_id, album) for album in albums]
+            semaphore = asyncio.Semaphore(_CR_ENRICH_CONCURRENCY)
+            async with TaskGroup() as tg:
+                for parsed, album in zip(parsed_page, albums, strict=True):
+                    tg.create_task(self._enrich_cr_guarded(semaphore, parsed, album.id))
+            # Yield in the original page order after enrichment.
+            for parsed in parsed_page:
                 yield parsed
             offset += size
             albums = await self.conn.get_album_list2(
@@ -395,6 +406,16 @@ class OpenSonicProvider(MusicProvider):
             album.metadata.critical_reception = cr
         if album_dr is not None:
             album.metadata.dynamic_range = album_dr
+
+    async def _enrich_cr_guarded(
+        self, semaphore: asyncio.Semaphore, album: Album, prov_album_id: str
+    ) -> None:
+        """Semaphore-bounded CR enrichment for one album within a TaskGroup.
+
+        :param semaphore: Caps how many albums on the page enrich concurrently.
+        """
+        async with semaphore:
+            await self._enrich_album_with_critical_reception(album, prov_album_id)
 
     async def _get_album_critical_reception(
         self,
@@ -504,35 +525,32 @@ class OpenSonicProvider(MusicProvider):
         except (ParameterError, DataNotFoundError):
             return None
         # mkstemp is synchronous (single syscall; not worth the executor hop) and
-        # importantly leaves no cancellation hole: awaiting `asyncio.to_thread`
-        # here would orphan a freshly-created file whenever the caller's task is
-        # cancelled mid-await, because the executor keeps running but the
-        # outer try/finally hasn't been entered yet.
-        #
-        # The aiohttp ClientResponse must be released even if mkstemp raises
-        # (OSError on tmpdir EACCES / ENFILE / disk full). Wrap the whole flow
+        # creates the temp file before any await, so the outer try/finally that
+        # owns the cleanup is entered without a cancellation hole. We close the fd
+        # right away — the prefix is buffered in memory and persisted in one write
+        # below. The aiohttp ClientResponse must be released even if mkstemp raises
+        # (OSError on tmpdir EACCES / ENFILE / disk full), so wrap the whole flow
         # in `async with resp:` so a mkstemp failure still triggers __aexit__.
         tmp_path: str | None = None
         try:
             async with resp:
                 tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
-                bytes_read = 0
-                try:
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        if not chunk:
-                            break
-                        remaining = CRITICAL_RECEPTION_PROBE_BYTES - bytes_read
-                        if remaining <= 0:
-                            break
-                        write_chunk = chunk[:remaining] if len(chunk) > remaining else chunk
-                        await asyncio.to_thread(os.write, tmp_fd, write_chunk)
-                        bytes_read += len(write_chunk)
-                        if bytes_read >= CRITICAL_RECEPTION_PROBE_BYTES:
-                            break
-                finally:
-                    await asyncio.to_thread(os.close, tmp_fd)
-            if bytes_read == 0:
+                os.close(tmp_fd)
+                # Accumulate the capped prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
+                # resident), then persist it in a single executor hop.
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    if not chunk:
+                        break
+                    remaining = CRITICAL_RECEPTION_PROBE_BYTES - len(buf)
+                    if remaining <= 0:
+                        break
+                    buf += chunk[:remaining] if len(chunk) > remaining else chunk
+                    if len(buf) >= CRITICAL_RECEPTION_PROBE_BYTES:
+                        break
+            if not buf:
                 return None
+            await asyncio.to_thread(Path(tmp_path).write_bytes, bytes(buf))
             try:
                 tags = await asyncio.wait_for(
                     async_parse_tags(tmp_path),

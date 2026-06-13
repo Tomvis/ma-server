@@ -292,11 +292,7 @@ class StreamsController(CoreController):
                 description="Log level for the Smart Fades mixer and analyzer.",
                 options=CONF_ENTRY_LOG_LEVEL.options,
                 default_value="GLOBAL",
-                # The frontend's settings.category translation dict has no
-                # "audio_analysis" key, so vue-i18n would render the literal
-                # string. Use "advanced" until/unless the frontend gains an
-                # audio_analysis translation.
-                category="advanced",
+                category="audio_analysis",
                 advanced=True,
             ),
             ConfigEntry(
@@ -308,8 +304,7 @@ class StreamsController(CoreController):
                 description="Maximum number of tracks analyzed concurrently during the nightly "
                 "background scan. Default 1 (serial). Increase only if your hardware can handle "
                 "concurrent torch/ffmpeg work.",
-                category="advanced",
-                advanced=True,
+                category="audio_analysis",
             ),
         )
 

@@ -77,6 +77,33 @@ _ACCOLADE_KIND_MATCH: dict[str, tuple[str, str]] = {
 }
 
 
+# Table-valued scan of the album's critical-reception sources array; every CR
+# filter clause and rating sort key below builds on this one fragment so a
+# future schema move only needs a single edit.
+_CR_SOURCES_EACH = "json_each(albums.metadata, '$.critical_reception.sources')"
+
+
+def _cr_source_exists(source_sql: str, extra_sql: str = "") -> str:
+    """EXISTS clause over the CR sources array, filtered to one source.
+
+    :param source_sql: SQL fragment the source must equal (literal or bound param).
+    :param extra_sql: Optional extra condition, including its leading `` AND ``.
+    """
+    return (
+        f"EXISTS(SELECT 1 FROM {_CR_SOURCES_EACH} "
+        f"WHERE json_extract(value, '$.source') = {source_sql}{extra_sql})"
+    )
+
+
+def _cr_rating_sort_key(source: str, direction: str) -> str:
+    """ORDER BY fragment sorting on the given CR source's rating."""
+    return (
+        "(SELECT json_extract(value, '$.rating') "
+        f"FROM {_CR_SOURCES_EACH} "
+        f"WHERE json_extract(value, '$.source') = '{source}' LIMIT 1) {direction} NULLS LAST"
+    )
+
+
 def _like_prefix(value: str) -> str:
     """Escape LIKE wildcards in a literal, then append % for a prefix match.
 
@@ -112,10 +139,9 @@ def _amg_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str
         return "", {}
     params = {f"{param_prefix}_{i}": v for i, v in enumerate(int_values)}
     bind_list = ", ".join(f":{k}" for k in params)
-    sub = (
-        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        "WHERE json_extract(value, '$.source') = 'AMG' "
-        f"AND CAST(json_extract(value, '$.rating') AS INTEGER) IN ({bind_list}))"
+    sub = _cr_source_exists(
+        "'AMG'",
+        f" AND CAST(json_extract(value, '$.rating') AS INTEGER) IN ({bind_list})",
     )
     return sub, params
 
@@ -136,21 +162,14 @@ def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str
             f"AND json_extract(value, '$.rating') < :{hi_key})"
         )
     inner = " OR ".join(bucket_clauses)
-    sub = (
-        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        f"WHERE json_extract(value, '$.source') = 'TPS' AND ({inner}))"
-    )
+    sub = _cr_source_exists("'TPS'", f" AND ({inner})")
     return sub, params
 
 
 def _source_favorite_clause(source: str, param_prefix: str) -> tuple[str, dict[str, Any]]:
     """Match albums where the given source has favorite=true."""
     src_key = f"{param_prefix}_src"
-    sub = (
-        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
-        f"WHERE json_extract(value, '$.source') = :{src_key} "
-        "AND json_extract(value, '$.favorite') = 1)"
-    )
+    sub = _cr_source_exists(f":{src_key}", " AND json_extract(value, '$.favorite') = 1")
     return sub, {src_key: source}
 
 
@@ -184,7 +203,7 @@ def _source_accolades_clause(
         return "", {}
     cond_or = " OR ".join(conditions)
     sub = (
-        "EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') src "
+        f"EXISTS(SELECT 1 FROM {_CR_SOURCES_EACH} src "
         f"WHERE json_extract(src.value, '$.source') = :{src_key} "
         "AND EXISTS(SELECT 1 FROM "
         "json_each(json_extract(src.value, '$.accolades')) accolade_each "
@@ -197,7 +216,7 @@ def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[s
     """Match albums that do not carry an entry for the given source."""
     src_key = f"{param_prefix}_src"
     sub = (
-        "NOT EXISTS(SELECT 1 FROM json_each(albums.metadata, '$.critical_reception.sources') "
+        f"NOT EXISTS(SELECT 1 FROM {_CR_SOURCES_EACH} "
         f"WHERE json_extract(value, '$.source') = :{src_key})"
     )
     return sub, {src_key: source}
@@ -340,26 +359,10 @@ class AlbumsController(MediaControllerBase[Album]):
         # the entries the user actually wants to see).
         "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC NULLS LAST",
         "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC NULLS LAST",
-        "amg_rating": (
-            "(SELECT json_extract(value, '$.rating') "
-            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) ASC NULLS LAST"
-        ),
-        "amg_rating_desc": (
-            "(SELECT json_extract(value, '$.rating') "
-            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'AMG' LIMIT 1) DESC NULLS LAST"
-        ),
-        "tps_rating": (
-            "(SELECT json_extract(value, '$.rating') "
-            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) ASC NULLS LAST"
-        ),
-        "tps_rating_desc": (
-            "(SELECT json_extract(value, '$.rating') "
-            "FROM json_each(albums.metadata, '$.critical_reception.sources') "
-            "WHERE json_extract(value, '$.source') = 'TPS' LIMIT 1) DESC NULLS LAST"
-        ),
+        "amg_rating": _cr_rating_sort_key("AMG", "ASC"),
+        "amg_rating_desc": _cr_rating_sort_key("AMG", "DESC"),
+        "tps_rating": _cr_rating_sort_key("TPS", "ASC"),
+        "tps_rating_desc": _cr_rating_sort_key("TPS", "DESC"),
     }
 
     def __init__(self, mass: MusicAssistant) -> None:
@@ -1048,9 +1051,7 @@ class AlbumsController(MediaControllerBase[Album]):
         # gains an in_library mapping it graduates out of the listen-later pile, so a
         # saved album that's later added to the library (or synced in) never lingers in
         # both. New rows default listen_later=0, so this only matters on update.
-        if getattr(cur_item, "listen_later", False) and any(
-            pm.in_library for pm in provider_mappings
-        ):
+        if cur_item.listen_later and any(pm.in_library for pm in provider_mappings):
             await self.set_listen_later(db_id, False)
         # set album artist(s)
         artists = update.artists if overwrite else cur_item.artists + update.artists

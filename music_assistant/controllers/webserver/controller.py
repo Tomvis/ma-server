@@ -27,20 +27,7 @@ from music_assistant_models.api import CommandMessage
 from music_assistant_models.auth import UserRole
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
-from music_assistant_models.errors import (
-    AlreadyInLibraryError,
-    AlreadyInListenLaterError,
-    AuthenticationFailed,
-    AuthenticationRequired,
-    InsufficientPermissions,
-    InvalidToken,
-    MediaNotFoundError,
-    MusicAssistantError,
-    PlayerUnavailableError,
-    ProviderPermissionDenied,
-    ProviderUnavailableError,
-    ResourceTemporarilyUnavailable,
-)
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items.metadata import IMAGE_PROXY_ID_RESOLVER
 
 from music_assistant.constants import (
@@ -533,19 +520,7 @@ class WebserverController(CoreController):
 
     def _jsonrpc_error_response(self, command: str, err: MusicAssistantError) -> web.Response:
         """Map a MusicAssistantError to a JSON-RPC 4xx/5xx response."""
-        if isinstance(err, MediaNotFoundError | PlayerUnavailableError | ProviderUnavailableError):
-            status = 404
-        elif isinstance(err, AuthenticationRequired | AuthenticationFailed | InvalidToken):
-            status = 401
-        elif isinstance(err, InsufficientPermissions | ProviderPermissionDenied):
-            status = 403
-        elif isinstance(err, AlreadyInLibraryError | AlreadyInListenLaterError):
-            # Both are 409, but the `code` field in the body differentiates them.
-            status = 409
-        elif isinstance(err, ResourceTemporarilyUnavailable):
-            status = 503
-        else:
-            status = 400
+        status = err.http_status
         self.logger.warning("%s: %s: %s", command, type(err).__name__, err)
         return web.json_response(
             {"error": type(err).__name__, "message": str(err), "code": err.error_code},

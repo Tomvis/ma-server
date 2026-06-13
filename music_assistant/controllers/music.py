@@ -51,7 +51,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     Track,
 )
-from music_assistant_models.media_items.metadata import MediaItemMetadata, ReviewLink
+from music_assistant_models.media_items.metadata import MediaItemMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
@@ -96,7 +96,7 @@ from music_assistant.helpers.datetime import (
     utc_timestamp,
 )
 from music_assistant.helpers.json import json_dumps, json_loads, serialize_to_json
-from music_assistant.helpers.tags import legacy_accolades, split_artists
+from music_assistant.helpers.tags import legacy_accolades, normalize_review_entries, split_artists
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.helpers.util import TaskManager, parse_optional_bool, parse_title_and_version
 from music_assistant.models.core_controller import CoreController
@@ -143,30 +143,6 @@ MUSIC_SYNC_COMPLETION_CHECK_TASK_ID: Final[str] = "music_sync_completion_check"
 # Per-provider timeout for the listen-later resolver fan-out. A slow provider
 # would otherwise wedge the WS request for the full underlying search timeout.
 _LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT: Final[float] = 10.0
-
-
-def _normalize_review_entries(cr: CriticalReception | None) -> None:
-    """
-    Fold deprecated per-source fields into the current 3.3.0 shape (in place).
-
-    Each source ends up with only ``accolades`` + ``links``: the legacy ``types``/
-    ``labels`` lists collapse into ``accolades`` and a legacy single ``review_url``
-    becomes a ``{"Review", url}`` link, with the deprecated fields cleared. Keeps
-    everything downstream — storage, the richness merge, the SQL filters — from
-    having to reason about more than one encoding.
-
-    :param cr: The critical-reception object to normalize (no-op when None/empty).
-    """
-    if cr is None or not cr.sources:
-        return
-    for src in cr.sources:
-        if not src.accolades and (src.types or src.labels):
-            src.accolades = legacy_accolades(src.types, src.labels) or None
-        src.types = None
-        src.labels = None
-        if not src.links and src.review_url:
-            src.links = [ReviewLink(label="Review", url=src.review_url)]
-        src.review_url = None
 
 
 class MusicController(CoreController):
@@ -1235,7 +1211,7 @@ class MusicController(CoreController):
             # Fold any deprecated per-source fields (types/labels -> accolades,
             # review_url -> a "Review" link) so only the current shape is ever stored
             # (mirrors the file-tag path).
-            _normalize_review_entries(critical_reception)
+            normalize_review_entries(critical_reception)
             # Land CR on the in-memory album so _add_library_item persists it on
             # the initial insert. For an existing listen-later row the merge
             # path in _update_library_item replaces CR when the new payload is
@@ -1319,9 +1295,9 @@ class MusicController(CoreController):
             if isinstance(p, MusicProvider) and ProviderFeature.SEARCH in p.supported_features
         ]
 
-        async def _search_one(prov: MusicProvider) -> tuple[MusicProvider, Any] | None:
+        async def _search_one(prov: MusicProvider) -> SearchResults | None:
             try:
-                results = await asyncio.wait_for(
+                return await asyncio.wait_for(
                     self._search_provider(
                         search_query, prov.instance_id, [MediaType.ALBUM], limit=10
                     ),
@@ -1332,7 +1308,6 @@ class MusicController(CoreController):
                 # anything else from _search_provider is treated identically.
                 self.logger.debug("Album search failed on %s: %s", prov.instance_id, err)
                 return None
-            return prov, results
 
         # Fan out so one hung provider can't block the resolver. `self.providers`
         # is stable for the lifetime of this call, so the gathered order is
@@ -1342,10 +1317,9 @@ class MusicController(CoreController):
 
         candidates: list[Album] = []
         seen: set[tuple[str, str]] = set()
-        for entry in search_results:
-            if entry is None:
+        for results in search_results:
+            if results is None:
                 continue
-            _prov, results = entry
             for result_album in results.albums:
                 # SearchResults.albums is typed Sequence[Album | ItemMapping];
                 # ItemMapping has no `.artists` field, so accessing it below would
@@ -1414,7 +1388,7 @@ class MusicController(CoreController):
         # (e.g. left over from a streaming-library deletion) — the endpoint's
         # contract is "clear the flag", not "garbage-collect orphan albums".
         library_item = await self.albums.get_library_item(library_item_id)
-        if not getattr(library_item, "listen_later", False):
+        if not library_item.listen_later:
             return
         await self.albums.set_listen_later(library_item_id, False)
         # Re-fetch *after* the flag write so the anchor check sees any state
@@ -1425,31 +1399,14 @@ class MusicController(CoreController):
         # True between our set_listen_later(False) and this re-fetch, respect
         # that — deleting the row would silently destroy the concurrent add and
         # its user-supplied CR payload.
-        if getattr(library_item, "listen_later", False):
+        if library_item.listen_later:
             return
-        # `play_count` and `last_played` are on the albums DB row but not on the
-        # Album dataclass (mashumaro drops unknown keys on from_dict). Query the
-        # row directly so play history actually anchors the album as documented.
-        # database.get_row returns an sqlite3.Row which is dict-subscriptable
-        # but lacks .get(), so wrap each lookup defensively.
-        playlog_row = await self.mass.music.database.get_row(
-            DB_TABLE_ALBUMS,
-            {"item_id": int(library_item_id)},
-        )
-
-        def _row_int(row: Any, column: str) -> int:
-            try:
-                return int(row[column] or 0)
-            except (KeyError, IndexError, TypeError, ValueError):
-                return 0
-
-        has_play_history = bool(playlog_row) and (
-            _row_int(playlog_row, "play_count") > 0 or _row_int(playlog_row, "last_played") > 0
-        )
+        # Query the DB row for play history (via the shared helper) so it
+        # actually anchors the album as documented.
         has_anchor = (
             library_item.favorite
             or any(pm.in_library for pm in library_item.provider_mappings)
-            or has_play_history
+            or await self.albums.has_play_history(library_item_id)
         )
         if not has_anchor:
             await self.albums.remove_item_from_library(library_item_id)
@@ -3453,7 +3410,16 @@ class MusicController(CoreController):
             # fold runs on freshly-scanned tags and ingested payloads at their own entry
             # points. Done in Python — the token->display transform (date inlining, dedup
             # across the two fields) is beyond what SQLite's json functions can express.
-            async for db_row in self._database.iter_items(DB_TABLE_ALBUMS):
+            # Pre-filter candidates in SQL: only rows whose metadata text carries a
+            # quoted "types"/"labels" key can be touched by the fold (any matching
+            # source dict serializes with that exact substring), so the Python pass
+            # doesn't have to JSON-parse every album in the library.
+            candidate_rows = await self._database.get_rows_from_query(
+                f"SELECT item_id, metadata FROM {DB_TABLE_ALBUMS} "
+                "WHERE metadata LIKE '%\"types\"%' OR metadata LIKE '%\"labels\"%'",
+                limit=0,
+            )
+            for db_row in candidate_rows:
                 raw_metadata = db_row["metadata"]
                 if not raw_metadata:
                     continue

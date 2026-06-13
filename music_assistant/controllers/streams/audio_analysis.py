@@ -452,8 +452,8 @@ class AudioAnalysisController:
         # Use the live loudness provider's current analysis_version so a future
         # provider-side bump correctly invalidates tag-derived rows. Default to 1
         # when the provider isn't loaded yet (boot-order edge case).
-        loudness_provider = self.mass.get_provider(LOUDNESS_ANALYSIS_DOMAIN)
-        analysis_version = getattr(loudness_provider, "analysis_version", 1) or 1
+        provider = self._resolve_aa_provider(LOUDNESS_ANALYSIS_DOMAIN)
+        analysis_version = provider.analysis_version if provider else 1
         await self.set_audio_analysis(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
