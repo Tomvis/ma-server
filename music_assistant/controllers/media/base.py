@@ -7,6 +7,7 @@ import logging
 from abc import ABCMeta, abstractmethod
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar, cast, final
@@ -26,9 +27,11 @@ from music_assistant_models.errors import (
 from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
+    MediaItemMetadata,
     MediaItemType,
     ProviderMapping,
     Track,
+    UniqueList,
 )
 
 from music_assistant.constants import (
@@ -66,6 +69,13 @@ JSON_KEYS = (
     "authors",
     "genre_aliases",
     "supported_mediatypes",
+)
+
+# When set (task-local), per-item MEDIA_ITEM_UPDATED events are suppressed.
+# Used by bulk operations such as provider cleanup, where emitting an event for every
+# touched item would flood subscribers; consumers refresh in bulk afterwards instead.
+SUPPRESS_MEDIA_ITEM_UPDATES: ContextVar[bool] = ContextVar(
+    "SUPPRESS_MEDIA_ITEM_UPDATES", default=False
 )
 
 SORT_KEYS = {
@@ -112,23 +122,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize class."""
         self.mass = mass
-        self.base_query = f"""
-        SELECT
-            {self.db_table}.*,
-            (SELECT JSON_GROUP_ARRAY(
-                json_object(
-                'item_id', provider_mappings.provider_item_id,
-                    'provider_domain', provider_mappings.provider_domain,
-                        'provider_instance', provider_mappings.provider_instance,
-                        'available', provider_mappings.available,
-                        'audio_format', json(provider_mappings.audio_format),
-                        'url', provider_mappings.url,
-                        'details', provider_mappings.details,
-                        'in_library', provider_mappings.in_library,
-                        'is_unique', provider_mappings.is_unique
-                )) FROM provider_mappings WHERE provider_mappings.item_id = {self.db_table}.item_id
-                    AND provider_mappings.media_type = '{self.media_type.value}') AS provider_mappings
-            FROM {self.db_table} """
         self.logger = logging.getLogger(f"{MASS_LOGGER_NAME}.music.{self.media_type.value}")
         # register (base) api handlers
         self.api_base = api_base = f"{self.media_type}s"
@@ -146,6 +139,33 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             f"music/{api_base}/remove", self.remove_item_from_library, required_role="admin"
         )
         self._db_add_lock = asyncio.Lock()
+
+    @property
+    def base_query(self) -> tuple[str, dict[str, Any]]:
+        """
+        Return the base SELECT query for this media type and its bound query params.
+
+        Override in a subclass to customize the query (extra joins/columns) and/or to
+        inject dynamic, parameterized filters.
+        """
+        query = f"""
+        SELECT
+            {self.db_table}.*,
+            (SELECT JSON_GROUP_ARRAY(
+                json_object(
+                'item_id', provider_mappings.provider_item_id,
+                    'provider_domain', provider_mappings.provider_domain,
+                        'provider_instance', provider_mappings.provider_instance,
+                        'available', provider_mappings.available,
+                        'audio_format', json(provider_mappings.audio_format),
+                        'url', provider_mappings.url,
+                        'details', provider_mappings.details,
+                        'in_library', provider_mappings.in_library,
+                        'is_unique', provider_mappings.is_unique
+                )) FROM provider_mappings WHERE provider_mappings.item_id = {self.db_table}.item_id
+                    AND provider_mappings.media_type = '{self.media_type.value}') AS provider_mappings
+            FROM {self.db_table} """
+        return query, {}
 
     @final
     async def add_item_to_library(
@@ -860,13 +880,23 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             if not (x.provider_instance == provider_instance_id and x.item_id == provider_item_id)
         }
         if library_item.provider_mappings:
+            # if this was the last mapping for the provider instance, strip any artwork
+            # that belonged to it (e.g. local file paths that are no longer resolvable)
+            images_changed = not any(
+                x.provider_instance == provider_instance_id for x in library_item.provider_mappings
+            ) and await self._remove_provider_images(db_id, provider_instance_id)
             self.logger.debug(
                 "removed provider_mapping %s/%s from item id %s",
                 provider_instance_id,
                 provider_item_id,
                 db_id,
             )
-            self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+            # the removed provider mapping is itself a change to the item, so always notify
+            # (unless suppressed during a bulk cleanup); re-fetch first when images were
+            # stripped so the event payload stays accurate
+            if not SUPPRESS_MEDIA_ITEM_UPDATES.get():
+                event_item = await self.get_library_item(db_id) if images_changed else library_item
+                self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, event_item.uri, event_item)
         else:
             # remove item if it has no more providers
             with suppress(AssertionError):
@@ -897,12 +927,21 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             x for x in library_item.provider_mappings if x.provider_instance != provider_instance_id
         }
         if library_item.provider_mappings:
+            # the item is kept (it still has other providers), but it may carry artwork
+            # that belonged to the removed provider (e.g. local file paths that are no
+            # longer resolvable), so strip those images from the stored metadata
+            images_changed = await self._remove_provider_images(db_id, provider_instance_id)
             self.logger.debug(
                 "removed all provider mappings for provider %s from item id %s",
                 provider_instance_id,
                 db_id,
             )
-            self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+            # the removed provider mapping(s) are themselves a change to the item, so
+            # always notify (unless suppressed during a bulk cleanup); re-fetch first when
+            # images were stripped so the event payload stays accurate
+            if not SUPPRESS_MEDIA_ITEM_UPDATES.get():
+                event_item = await self.get_library_item(db_id) if images_changed else library_item
+                self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, event_item.uri, event_item)
         else:
             # remove item if it has no more providers
             with suppress(AssertionError):
@@ -1025,7 +1064,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 in_library_only=in_library_only,
             )
         # build and execute final query
-        sql_query = self._build_final_query(query_parts, join_parts, order_by)
+        sql_query, base_query_params = self._build_final_query(query_parts, join_parts, order_by)
+        query_params.update(base_query_params)
 
         return [
             cast("ItemCls", self.item_cls.from_dict(self._parse_db_row(db_row)))
@@ -1194,9 +1234,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         query_parts: list[str],
         join_parts: list[str],
         order_by: str | None,
-    ) -> str:
-        """Build the final SQL query string."""
-        sql_query = self.base_query
+    ) -> tuple[str, dict[str, Any]]:
+        """Build the final SQL query string and its (base) bound query params."""
+        sql_query, base_query_params = self.base_query
 
         # Add joins
         if join_parts:
@@ -1215,7 +1255,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             if sort_key:
                 sql_query += f" ORDER BY {sort_key}"
 
-        return sql_query
+        return sql_query, base_query_params
 
     @final
     @staticmethod
@@ -1336,3 +1376,34 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         # fallback to first mapping
         mapping = next(iter(library_item.provider_mappings))
         return (mapping.provider_instance, mapping.item_id)
+
+    async def _remove_provider_images(self, db_id: int, provider_instance_id: str) -> bool:
+        """
+        Remove images belonging to a provider from a library item's stored metadata.
+
+        :param db_id: The library (database) id of the item.
+        :param provider_instance_id: The provider instance whose images should be removed.
+        :return: True if any images were removed and the db record was updated.
+        """
+        # read the raw metadata straight from the db (instead of via get_library_item)
+        # to avoid persisting any images that are only injected at read time (such as
+        # the album thumb that gets merged into a track's images)
+        db_row = await self.mass.music.database.get_row(self.db_table, {"item_id": db_id})
+        if not db_row or not (raw_metadata := db_row["metadata"]):
+            return False
+        metadata = MediaItemMetadata.from_dict(json_loads(raw_metadata))
+        if not metadata.images:
+            return False
+        remaining = UniqueList(
+            img for img in metadata.images if img.provider != provider_instance_id
+        )
+        if len(remaining) == len(metadata.images):
+            # nothing belonged to this provider
+            return False
+        metadata.images = remaining or None
+        await self.mass.music.database.update(
+            self.db_table,
+            {"item_id": db_id},
+            {"metadata": serialize_to_json(metadata)},
+        )
+        return True

@@ -12,7 +12,6 @@ from collections.abc import AsyncGenerator, Iterable, Mapping
 from math import inf
 from typing import TYPE_CHECKING, Any
 
-import torch
 from music_assistant_models.audio_analysis import AudioAnalysisCoverage
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import ContentType, MediaType, ProviderType, StreamType
@@ -29,6 +28,7 @@ from music_assistant.constants import (
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.datetime import local_clock_time_to_utc
 from music_assistant.helpers.json import json_dumps, json_loads
+from music_assistant.helpers.util import is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 from music_assistant.models.music_provider import MusicProvider
@@ -151,10 +151,13 @@ class AudioAnalysisController:
         # concurrent live + background start from both reserving the same URI
         # and double-firing chunk callbacks at every provider.
         self._starting_sessions: set[str] = set()
+        self._inference_runtime_configured = False
+        # Kept alive to persist the process-wide native BLAS thread cap (set in
+        # ensure_inference_runtime_configured); never used as a context manager.
+        self._blas_limiter: object | None = None
 
     def setup(self) -> None:
-        """Register the nightly background scan task and apply CPU caps."""
-        self._configure_thread_caps()
+        """Register the nightly background scan task."""
         utc_hour, utc_minute = local_clock_time_to_utc(0, 0)
         self.mass.tasks.register_scheduled_task(
             task_id=BACKGROUND_SCAN_TASK_ID,
@@ -193,18 +196,49 @@ class AudioAnalysisController:
         if cancel_tasks:
             await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
-    def _configure_thread_caps(self) -> None:
-        """Cap PyTorch threading so Audio Analysis inference stays around a quarter of cpu_count."""
+    def ensure_inference_runtime_configured(self) -> None:
+        """
+        Configure the on-device inference runtime for analysis (process-wide, applied once).
+
+        Torch-backed analysis providers call this at the start of their handle_async_init,
+        before loading their models.
+        """
+        if self._inference_runtime_configured:
+            return
+        # Lazy imports: only torch-backed providers call this, so a host running no such
+        # provider never imports torch/threadpoolctl. Running before the first model load
+        # also lets set_num_interop_threads take effect (only settable before the first op).
+        import threadpoolctl  # noqa: PLC0415
+        import torch  # noqa: PLC0415
+
         budget = self._aa_thread_budget()
         torch.set_num_threads(budget)
         with contextlib.suppress(RuntimeError):
             # set_num_interop_threads can only be called before the first torch op
             torch.set_num_interop_threads(1)
+        # torch.set_num_threads only governs torch's own ops. The per-block librosa/numpy
+        # feature extraction runs through the native BLAS pool (OpenBLAS), which otherwise
+        # spawns a thread per core per worker and, across concurrent sessions, saturates
+        # every core and starves playback. Cap it to the same budget; the limiter is kept
+        # alive on the controller so the cap persists for the process.
+        self._blas_limiter = threadpoolctl.threadpool_limits(limits=budget, user_api="blas")
+        arm = is_arm()
+        if arm:
+            # NNPACK frequently fails to initialize on ARM SBCs (e.g. Raspberry Pi); torch
+            # then re-logs "Could not initialize NNPACK" to stderr on every conv op. The fp32
+            # conv fallback is used on those hosts regardless, so disabling it only removes
+            # the log spam.
+            with contextlib.suppress(Exception):
+                torch.backends.nnpack.set_flags(False)  # type: ignore[no-untyped-call]
         self.logger.info(
-            "AudioAnalysis thread caps: torch intra=%d, torch interop=%d",
+            "AudioAnalysis runtime: torch intra=%d interop=%d, blas<=%d, nnpack=%s",
             torch.get_num_threads(),
             torch.get_num_interop_threads(),
+            budget,
+            "off" if arm else "on",
         )
+        # Only mark done once configuration actually succeeded, so a failure retries.
+        self._inference_runtime_configured = True
 
     @property
     def providers(self) -> list[AudioAnalysisProvider]:
