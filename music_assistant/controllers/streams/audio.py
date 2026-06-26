@@ -85,9 +85,11 @@ from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.fades import SmartFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.helpers import ssl as ssl_util
+from music_assistant.helpers.aiohttp_client import encoded_request_url
 from music_assistant.helpers.audio import (
     HTTP_HEADERS,
     HTTP_HEADERS_ICY,
+    build_concat_filelist,
     calculate_content_length,
     get_bit_rate,
     get_normalization_mode,
@@ -800,7 +802,7 @@ class StreamsAudio:
         self, url: str, streamdetails: StreamDetails
     ) -> AsyncGenerator[bytes]:
         """
-        Stream radio audio with ICY metadata support.
+        Stream radio audio with ICY metadata support, reconnecting on disconnect.
 
         Requires icy-metaint header support. Stream type should be validated
         by resolve_radio_stream() before calling this function.
@@ -810,24 +812,80 @@ class StreamsAudio:
         """
         self.logger.debug("Start streaming radio with ICY metadata from url %s", url)
         timeout = ClientTimeout(total=0, connect=30, sock_read=5 * 60)
+        # Budget for *consecutive* reconnects that delivered no audio. A connection
+        # that actually streamed data resets it, so a healthy long-running stream can
+        # reconnect indefinitely while a dead/looping one bails out instead of spinning.
+        failed_reconnects = 0
+        max_failed_reconnects = 25
 
-        async with self._connect_radio_stream(
-            url, allow_redirects=True, headers=HTTP_HEADERS_ICY, timeout=timeout
-        ) as resp:
-            headers = resp.headers
-            meta_int = int(headers["icy-metaint"])
-
-            while True:
-                try:
-                    yield await resp.content.readexactly(meta_int)
-                    meta_byte = await resp.content.readexactly(1)
-                    if meta_byte == b"\x00":
-                        continue
-                    meta_length = ord(meta_byte) * 16
-                    meta_data = await resp.content.readexactly(meta_length)
-                    self._parse_icy_metadata(meta_data, streamdetails)
-                except asyncio.exceptions.IncompleteReadError:
-                    break
+        while True:
+            streamed_data = False
+            try:
+                async with self._connect_radio_stream(
+                    url, allow_redirects=True, headers=HTTP_HEADERS_ICY, timeout=timeout
+                ) as resp:
+                    # surface a non-200 (e.g. on reconnect) as a ClientResponseError so the
+                    # terminal/HTTP handling below applies instead of failing on the header
+                    resp.raise_for_status()
+                    meta_int_str = resp.headers.get("icy-metaint")
+                    if not meta_int_str:
+                        raise InvalidDataError(f"No icy-metaint header for radio stream: {url}")
+                    try:
+                        meta_int = int(meta_int_str)
+                    except ValueError as err:
+                        raise InvalidDataError(
+                            f"Invalid icy-metaint value for radio stream: {url}"
+                        ) from err
+                    if meta_int <= 0:
+                        raise InvalidDataError(f"Invalid icy-metaint value for radio stream: {url}")
+                    # readexactly raises IncompleteReadError when the server closes the
+                    # connection mid-frame; that (and the network errors below) drops us
+                    # out to the reconnect handler so a live stream survives the blip.
+                    while True:
+                        chunk = await resp.content.readexactly(meta_int)
+                        streamed_data = True
+                        yield chunk
+                        meta_byte = await resp.content.readexactly(1)
+                        if meta_byte == b"\x00":
+                            continue
+                        meta_length = ord(meta_byte) * 16
+                        meta_data = await resp.content.readexactly(meta_length)
+                        self._parse_icy_metadata(meta_data, streamdetails)
+            except asyncio.CancelledError:
+                self.logger.debug("ICY radio stream cancelled for %s", url)
+                raise
+            except aiohttp.ClientResponseError as err:
+                if err.status == 404:
+                    raise MediaNotFoundError(f"Radio stream not found: {url}") from err
+                if err.status == 403:
+                    raise ProviderPermissionDenied(f"Radio stream access denied: {url}") from err
+                raise ProviderUnavailableError(
+                    f"Radio stream returned HTTP {err.status}: {err}"
+                ) from err
+            except (
+                asyncio.IncompleteReadError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                aiohttp.ServerDisconnectedError,
+            ) as err:
+                if streamed_data:
+                    # a healthy session that dropped - reconnect without spending budget
+                    failed_reconnects = 0
+                    self.logger.debug("ICY radio stream dropped, reconnecting: %s", err)
+                else:
+                    failed_reconnects += 1
+                    if failed_reconnects > max_failed_reconnects:
+                        raise RetriesExhausted(
+                            f"ICY radio stream failed after {max_failed_reconnects} "
+                            f"reconnects without data: {err}"
+                        ) from err
+                    self.logger.warning(
+                        "ICY radio stream reconnect produced no data (%d/%d): %s",
+                        failed_reconnects,
+                        max_failed_reconnects,
+                        err,
+                    )
+                await asyncio.sleep(0.5)
 
     async def get_reconnecting_radio_stream(self, url: str) -> AsyncGenerator[bytes]:
         """
@@ -894,7 +952,7 @@ class StreamsAudio:
         # fetch master playlist and select (best) child playlist
         # https://datatracker.ietf.org/doc/html/draft-pantos-http-live-streaming-19#section-10
         async with mass.http_session_no_ssl.get(
-            url, allow_redirects=True, headers=HTTP_HEADERS, timeout=timeout
+            encoded_request_url(url), allow_redirects=True, headers=HTTP_HEADERS, timeout=timeout
         ) as resp:
             resp.raise_for_status()
             raw_data = await resp.read()
@@ -945,7 +1003,9 @@ class StreamsAudio:
         # try to get filesize with a head request
         seek_supported = streamdetails.can_seek
         if seek_position or not streamdetails.size:
-            async with http_session.head(url, allow_redirects=True, headers=HTTP_HEADERS) as resp:
+            async with http_session.head(
+                encoded_request_url(url), allow_redirects=True, headers=HTTP_HEADERS
+            ) as resp:
                 resp.raise_for_status()
                 if size := resp.headers.get("Content-Length"):
                     streamdetails.size = int(size)
@@ -976,7 +1036,7 @@ class StreamsAudio:
         # start the streaming from http
         bytes_received = 0
         async with http_session.get(
-            url, allow_redirects=True, headers=headers, timeout=timeout
+            encoded_request_url(url), allow_redirects=True, headers=headers, timeout=timeout
         ) as resp:
             is_partial = resp.status == 206
             if seek_position and not is_partial:
@@ -1054,8 +1114,7 @@ class StreamsAudio:
         # concat input files
         temp_file = f"/tmp/{shortuuid.random(20)}.txt"  # noqa: S108
         async with aiofiles.open(temp_file, "w") as f:
-            for path in files_list:
-                await f.write(f"file '{path}'\n")
+            await f.write(build_concat_filelist(files_list))
 
         try:
             async for chunk in get_ffmpeg_stream(
@@ -1404,7 +1463,9 @@ class StreamsAudio:
                 yield chunk
         except AudioError as err:
             streamdetails.stream_error = True
-            queue_item.available = False
+            # revoke availability when the stream never produced any audio
+            if bytes_received == 0:
+                queue_item.available = False
             if raise_on_error:
                 raise
             logger.error(
@@ -1646,7 +1707,9 @@ class StreamsAudio:
             finished = True
         except AudioError as err:
             streamdetails.stream_error = True
-            queue_item.available = False
+            # revoke availability when the stream never produced any audio
+            if bytes_received == 0:
+                queue_item.available = False
             if raise_on_error:
                 raise
             logger.error(
@@ -2894,8 +2957,9 @@ class StreamsAudio:
         :param url: The radio stream URL to connect to.
         :param kwargs: Additional keyword arguments passed to aiohttp get().
         """
+        request_url = encoded_request_url(url)
         try:
-            async with self.mass.http_session_no_ssl.get(url, **kwargs) as resp:
+            async with self.mass.http_session_no_ssl.get(request_url, **kwargs) as resp:
                 yield resp
         except ClientConnectorSSLError:
             self.logger.info(
@@ -2905,7 +2969,7 @@ class StreamsAudio:
                 ssl_util.SSLCipherList.INSECURE
             )
             async with self.mass.http_session_no_ssl.get(
-                url, ssl=insecure_ssl_context, **kwargs
+                request_url, ssl=insecure_ssl_context, **kwargs
             ) as resp:
                 yield resp
 
@@ -2945,7 +3009,7 @@ class StreamsAudio:
             timeout = ClientTimeout(total=0, connect=10, sock_read=30)
             try:
                 async with mass.http_session_no_ssl.get(
-                    media_playlist_url, timeout=timeout
+                    encoded_request_url(media_playlist_url), timeout=timeout
                 ) as resp:
                     resp.raise_for_status()
                     playlist_content = await resp.text()
