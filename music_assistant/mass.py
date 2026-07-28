@@ -35,6 +35,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.cache import CacheController
 from music_assistant.controllers.config import ConfigController
+from music_assistant.controllers.diagnostics import DiagnosticsController
 from music_assistant.controllers.discovery import DiscoveryController
 from music_assistant.controllers.metadata import MetaDataController
 from music_assistant.controllers.music import MusicController
@@ -46,6 +47,7 @@ from music_assistant.controllers.webserver import WebserverController
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.aiohttp_client import create_clientsession
 from music_assistant.helpers.api import APICommandHandler, api_command
+from music_assistant.helpers.diagnostics import install_diagnostics_log_handler
 from music_assistant.helpers.images import get_icon_string
 from music_assistant.helpers.util import (
     TaskManager,
@@ -120,6 +122,7 @@ class MusicAssistant:
     player_queues: PlayerQueuesController
     discovery: DiscoveryController
     streams: StreamsController
+    diagnostics: DiagnosticsController
 
     def __init__(self, storage_path: str, cache_path: str, safe_mode: bool = False) -> None:
         """Initialize the MusicAssistant Server."""
@@ -152,6 +155,10 @@ class MusicAssistant:
         """Start running the Music Assistant server."""
         self.loop = asyncio.get_running_loop()
         self.loop_thread_id = getattr(self.loop, "_thread_id")  # noqa: B009
+        # ensure the always-on diagnostics capture handler is installed as early as
+        # possible so boot-time errors are captured (idempotent, also installed by
+        # __main__ but embedded usage boots the server directly)
+        install_diagnostics_log_handler()
         self.running_as_hass_addon = await is_hass_supervisor()
         self.version = await get_package_version("music_assistant") or "0.0.0"
         # setup config controller first and fetch important config values
@@ -171,6 +178,7 @@ class MusicAssistant:
         )
         await warn_if_missing_x86_64_v2(LOGGER)
         # setup other core controllers
+        self.diagnostics = DiagnosticsController(self)
         self.cache = CacheController(self)
         self.tasks = TasksController(self)
         self.webserver = WebserverController(self)
@@ -197,6 +205,7 @@ class MusicAssistant:
             tg.create_task(setup_controller(self.metadata))
             tg.create_task(setup_controller(self.players))
             tg.create_task(setup_controller(self.player_queues))
+            tg.create_task(setup_controller(self.diagnostics))
 
         for controller_name in (
             "cache",
@@ -246,6 +255,7 @@ class MusicAssistant:
         await self.music.close()
         await self.player_queues.close()
         await self.players.close()
+        await self.diagnostics.close()
         # cleanup cache and config
         await self.config.close()
         await self.cache.close()
@@ -751,7 +761,7 @@ class MusicAssistant:
                 self.config.remove(f"{CONF_PROVIDERS}/{instance_id}")
                 return
             prov_conf.last_error = str(exc)
-            self.config.set(f"{CONF_PROVIDERS}/{instance_id}/last_error", str(exc))
+            self.config.update_provider_last_error(instance_id, str(exc))
             LOGGER.warning(
                 "Provider(instance) %s can not run on this system: %s",
                 prov_conf.name or prov_conf.instance_id,
@@ -762,7 +772,7 @@ class MusicAssistant:
             # if loading failed, we store the error in the config object
             # so we can show something useful to the user
             prov_conf.last_error = str(exc)
-            self.config.set(f"{CONF_PROVIDERS}/{instance_id}/last_error", str(exc))
+            self.config.update_provider_last_error(instance_id, str(exc))
 
             # auto schedule a retry if the (re)load failed with a handled exception
             # unhandled exceptions (e.g. ValueError) are likely bugs that won't resolve themselves
@@ -824,7 +834,7 @@ class MusicAssistant:
 
     async def unload_provider_with_error(self, instance_id: str, error: str) -> None:
         """Unload a provider when it got into trouble which needs user interaction."""
-        self.config.set(f"{CONF_PROVIDERS}/{instance_id}/last_error", error)
+        self.config.update_provider_last_error(instance_id, error)
         await self.unload_provider(instance_id)
 
     async def run_provider_discovery(self, instance_id: str) -> None:
@@ -860,6 +870,7 @@ class MusicAssistant:
             self.webserver,
             self.webserver.auth,
             self.streams.audio_analysis,
+            self.diagnostics,
         ):
             for attr_name in dir(cls):
                 if attr_name.startswith("__"):

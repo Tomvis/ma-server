@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import html
 import importlib
 import logging
 import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import sys
 import unicodedata
@@ -29,6 +31,7 @@ from urllib.parse import urlparse
 
 import chardet
 import ifaddr
+from markdownify import markdownify
 from music_assistant_models.enums import AlbumType, IdentifierType
 from music_assistant_models.errors import SetupFailedError
 from zeroconf import InterfaceChoice, IPVersion
@@ -54,8 +57,6 @@ if TYPE_CHECKING:
 from dataclasses import fields, is_dataclass
 
 LOGGER = logging.getLogger(__name__)
-
-HA_WHEELS = "https://wheels.home-assistant.io/musllinux/"
 
 T = TypeVar("T")
 CALLBACK_TYPE = Callable[[], None]
@@ -275,7 +276,7 @@ def is_arm() -> bool:
     return platform.machine().lower() in ("arm64", "aarch64", "armv8l", "armv7l")
 
 
-def verify_system_meets_requirements(
+async def verify_system_meets_requirements(
     *,
     feature_name: str,
     min_memory_gb: float = 0.0,
@@ -289,7 +290,7 @@ def verify_system_meets_requirements(
     :param min_memory_gb: Minimum total system RAM in GB (0 disables the check).
     :param min_cpu_cores: Minimum CPU core count (0 disables the check).
     :param require_ml_inference: When True, also verify the CPU can run on-device
-        torch inference (AVX2 on x86). Checked last, as it imports torch.
+        torch inference. Checked last, as it spawns a probe subprocess.
     :raises UnsupportedSystemError: If the system does not meet the requirements.
     """
     if shortfall := _resource_shortfall(min_memory_gb=min_memory_gb, min_cpu_cores=min_cpu_cores):
@@ -297,7 +298,7 @@ def verify_system_meets_requirements(
             f"This system does not meet the minimal requirements for {feature_name}: {shortfall}"
         )
     if require_ml_inference:
-        verify_cpu_supports_ml_inference()
+        await verify_cpu_supports_ml_inference()
 
 
 def system_meets_requirements(
@@ -360,25 +361,91 @@ def _resource_shortfall(*, min_memory_gb: float, min_cpu_cores: int) -> str | No
     return None
 
 
-def verify_cpu_supports_ml_inference() -> None:
-    """
-    Verify the CPU can run on-device ML (torch) inference.
+# How long to wait for the out-of-process inference probe before treating it as
+# inconclusive. The probe only imports torch and runs a few tiny tensors, but a cold,
+# heavily loaded VM can be slow to start the interpreter, so keep this generous.
+_ML_INFERENCE_PROBE_TIMEOUT = 60.0
+# POSIX signals that mean the CPU could not execute the inference (the probe exits with the
+# negated signal number). Any of these disables the feature; other exits fail open.
+_ML_INFERENCE_FAULT_SIGNALS = frozenset(
+    {signal.SIGILL, signal.SIGSEGV, signal.SIGABRT, signal.SIGFPE}
+)
 
-    :raises UnsupportedSystemError: If this is an x86 CPU without AVX2 support, which
-        torch's FBGEMM quantized backend requires.
+
+async def verify_cpu_supports_ml_inference() -> None:
+    """
+    Verify the CPU can actually execute on-device ML (torch) inference.
+
+    Runs a representative inference in a throwaway subprocess, so a CPU that reports a
+    capability it cannot actually execute (common on virtual machines without host CPU
+    passthrough) crashes the probe instead of the server. Inconclusive probe results fail
+    open, so a probe malfunction never blocks a capable host.
+
+    :raises UnsupportedSystemError: If the CPU lacks AVX2, or reports it but cannot execute
+        the required instructions.
     """
     if platform.machine().lower() not in ("x86_64", "amd64", "i386", "i686", "x86"):
         # non-x86 (ARM) machines run quantized inference via QNNPACK instead of FBGEMM
         return
-    import torch  # noqa: PLC0415
+    from music_assistant.helpers import _ml_inference_probe  # noqa: PLC0415
 
-    if torch.backends.cpu.get_cpu_capability() in ("DEFAULT", "NO AVX"):
+    returncode = await _run_ml_inference_probe()
+    if returncode == _ml_inference_probe.PROBE_CAPABLE:
+        return
+    if returncode == _ml_inference_probe.PROBE_NO_AVX2:
         raise UnsupportedSystemError(
             "On-device audio analysis requires a CPU with AVX2 support "
             "(Intel Haswell / AMD Zen or newer). This CPU does not support AVX2. "
             "If you are running in a virtual machine (e.g. Proxmox), changing the "
             "CPU type to 'host' may expose AVX2 to the guest."
         )
+    if returncode is not None and returncode < 0 and -returncode in _ML_INFERENCE_FAULT_SIGNALS:
+        raise UnsupportedSystemError(
+            "On-device audio analysis cannot run on this CPU: it reports AVX2 support but "
+            "fails to execute the required instructions. This is common on virtual machines "
+            "without host CPU passthrough -- if you are running in a VM (e.g. Proxmox or "
+            "TrueNAS), set the CPU type to 'host'."
+        )
+    # Inconclusive: the probe could not be spawned, timed out, was OOM-killed, or exited for
+    # an unexpected reason. Assume the host is capable rather than block a working setup.
+    LOGGER.warning(
+        "On-device ML inference capability probe was inconclusive (exit code %s); "
+        "assuming this CPU is capable",
+        returncode,
+    )
+
+
+async def _run_ml_inference_probe() -> int | None:
+    """
+    Run the inference probe subprocess and return its exit code.
+
+    Returns None when the probe could not be started or did not finish in time; otherwise
+    the process return code (negative if a signal killed it).
+    """
+    from music_assistant.helpers import _ml_inference_probe  # noqa: PLC0415
+
+    try:
+        # Run with -m, not by file path: a path run puts the probe's own directory on
+        # sys.path, which would shadow the stdlib (e.g. helpers/logging.py over logging).
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            _ml_inference_probe.__name__,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as err:
+        LOGGER.warning("Could not start the ML inference capability probe: %s", err)
+        return None
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_ML_INFERENCE_PROBE_TIMEOUT)
+    except TimeoutError:
+        proc.kill()
+        with suppress(ProcessLookupError):
+            await proc.wait()
+        LOGGER.warning("The ML inference capability probe timed out")
+        return None
+    return proc.returncode
 
 
 keyword_pattern = re.compile("title=|artist=")
@@ -391,6 +458,27 @@ title_artist_order_pattern = re.compile(r"(?P<title>.+)\sBy:\s(?P<artist>.+)", f
 german_von_pattern = re.compile(r'^"(?P<title>[^"]+)"\s+von\s+(?P<artist>.+)$', flags=re.IGNORECASE)
 multi_space_pattern = re.compile(r"\s{2,}")
 end_junk_pattern = re.compile(r"(.+?)(\s\W+)$")
+
+# HTML tags worth preserving as markdown; any other tag is stripped (text kept)
+MARKDOWN_SAFE_TAGS = [
+    "a",
+    "b",
+    "blockquote",
+    "br",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "strong",
+    "ul",
+]
 
 VERSION_PARTS = (
     # list of common version strings
@@ -690,6 +778,18 @@ def strip_multi_space(line: str) -> str:
     return multi_space_pattern.sub(" ", line)
 
 
+def html_to_markdown(line: str) -> str:
+    """Convert the safe subset of HTML in a string to markdown, stripping other tags."""
+    # unescape first so entity-encoded markup (e.g. "&lt;p&gt;") is handled too
+    return markdownify(
+        html.unescape(line),
+        convert=MARKDOWN_SAFE_TAGS,
+        escape_asterisks=False,
+        escape_underscores=False,
+        escape_misc=False,
+    ).strip()
+
+
 def multi_strip(line: str) -> str:
     """Strip assorted junk from line."""
     return strip_multi_space(
@@ -794,6 +894,24 @@ async def get_ip_addresses(include_ipv6: bool = False) -> tuple[str, ...]:
         return tuple(ip[1] for ip in result)
 
     return await asyncio.to_thread(call)
+
+
+def interface_name_for_ip(ip: str) -> str | None:
+    """
+    Return the name of the network interface that holds the given IP, or None.
+
+    Used to map a bind/publish IP to its interface name for components that select
+    their mDNS/zeroconf advertisement interface by name (e.g. shairport-sync and
+    go-librespot), so the advertisement stays on the intended network.
+
+    :param ip: The IPv4/IPv6 address to look up.
+    """
+    for adapter in ifaddr.get_adapters():
+        for ip_config in adapter.ips:
+            addr = ip_config.ip if isinstance(ip_config.ip, str) else ip_config.ip[0]
+            if addr == ip:
+                return adapter.name
+    return None
 
 
 async def get_primary_ip_address() -> str | None:
@@ -963,7 +1081,7 @@ def empty_queue[T](q: asyncio.Queue[T]) -> None:
 async def install_package(package: str) -> None:
     """Install package with pip, raise when install failed."""
     LOGGER.debug("Installing python package %s", package)
-    args = ["uv", "pip", "install", "--no-cache", "--find-links", HA_WHEELS, package]
+    args = ["uv", "pip", "install", "--no-cache", package]
     return_code, output = await check_output(*args)
     if return_code != 0:
         msg = f"Failed to install package {package}\n{output.decode()}"

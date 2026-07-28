@@ -17,7 +17,10 @@ from torchaudio.transforms import SpectralCentroid
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.util import is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData
-from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
+from music_assistant.models.audio_analysis_provider import (
+    ACCUMULATING_ANALYSIS_MAX_DURATION_SECONDS,
+    AudioAnalysisProvider,
+)
 
 from .dbn_postprocessor import DBNDownBeatTracker
 from .feature_extractor import AdvancedBeatFeatureExtractor
@@ -58,6 +61,8 @@ class SmartFadesData:
 
 class SmartFadesProvider(AudioAnalysisProvider):
     """Smart fades audio analysis provider using Beat This for beat tracking."""
+
+    max_analysis_duration = ACCUMULATING_ANALYSIS_MAX_DURATION_SECONDS
 
     def __init__(
         self,
@@ -318,6 +323,9 @@ class SmartFadesProvider(AudioAnalysisProvider):
         if len(pcm_22k) >= self._spectral_centroid.n_fft:
             pcm_tensor = torch.from_numpy(pcm_22k)
             centroid_frames = self._spectral_centroid(pcm_tensor.unsqueeze(0)).squeeze(0).numpy()
+            # digitally-silent frames divide 0/0 into NaN; treat them as 0 Hz like
+            # other negligible-energy frames so no non-finite value is ever stored
+            np.nan_to_num(centroid_frames, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             if len(centroid_frames) > 0:
                 data.centroid_chunks.append(centroid_frames.astype(np.float32))
 

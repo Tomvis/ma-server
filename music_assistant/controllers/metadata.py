@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 import os
 import pathlib
 import random
+import sqlite3
 import threading
-import urllib.parse
 from base64 import b64encode
 from collections import OrderedDict
 from contextlib import suppress
@@ -93,6 +92,7 @@ if TYPE_CHECKING:
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant import MusicAssistant
+    from music_assistant.controllers.media.base import MediaControllerBase
     from music_assistant.models.metadata_provider import MetadataProvider
     from music_assistant.providers.musicbrainz import MusicbrainzProvider, MusicBrainzReleaseGroup
 
@@ -128,43 +128,6 @@ def _normalize_imageproxy_format(value: str | None) -> str | None:
     if normalized in _IMAGEPROXY_CONTENT_TYPES:
         return normalized
     return None
-
-
-# Schemes accepted from a client on the legacy /imageproxy?path= endpoint.
-# Allowlist (not blacklist) so a leading-whitespace or unknown-scheme value
-# cannot sneak through. Provider-supplied paths resolved internally via
-# `resolve_image` are not subject to this — only inbound client paths are.
-_ALLOWED_IMAGEPROXY_REQUEST_SCHEMES: frozenset[str] = frozenset({"", "http", "https"})
-
-
-def _is_safe_imageproxy_request_path(path: str) -> bool:
-    r"""
-    Return True if `path` is safe to fetch on behalf of an imageproxy client.
-
-    Rejects any input containing control characters or surrounding whitespace
-    (so a leading `\t`, ` `, or `\x00` cannot mask an otherwise-forbidden
-    scheme), restricts the scheme to http, https, or empty (local / relative
-    path), and for http(s) targets rejects IP-literal hosts that resolve to
-    loopback, private, link-local or multicast ranges. DNS-resolved hostnames
-    are trusted; full DNS-rebinding mitigation is out of scope here.
-    """
-    if any(ord(c) < 0x20 for c in path) or path != path.strip():
-        return False
-    parsed = urllib.parse.urlparse(path)
-    scheme = parsed.scheme.lower()
-    if scheme not in _ALLOWED_IMAGEPROXY_REQUEST_SCHEMES:
-        return False
-    if scheme in ("http", "https"):
-        host = parsed.hostname  # already lowercased; brackets stripped for IPv6
-        if not host or host == "localhost":
-            return False
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            return True
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast:
-            return False
-    return True
 
 
 LOCALES = {
@@ -243,10 +206,6 @@ _ALLOWED_IMAGEPROXY_SIZES = frozenset({0, 80, 160, 256, 512, 1024})
 
 _IMAGEPROXY_PATH_PREFIX = "/imageproxy/"
 
-# Deprecation logging for the legacy /imageproxy query-string endpoint.
-_LEGACY_DEPRECATION_LOG_INTERVAL = 60  # seconds between log lines per IP
-_LEGACY_DEPRECATION_PRUNE_AFTER = 300  # drop tracking entries idle this long
-
 
 class MetaDataController(CoreController):
     """Several helpers to search and store metadata for mediaitems."""
@@ -272,8 +231,8 @@ class MetaDataController(CoreController):
         # thread during outbound websocket serialization.
         self._image_id_lru: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._image_id_lock = threading.Lock()
-        # per-IP throttle for the legacy /imageproxy deprecation warning
-        self._legacy_imageproxy_warn_at: dict[str, float] = {}
+        # corrupt metadata rows found by the last scan pass, per table, for diagnostics
+        self._corrupt_metadata_rows: dict[str, list[dict[str, str | int]]] = {}
 
     async def get_config_entries(
         self,
@@ -360,15 +319,18 @@ class MetaDataController(CoreController):
         # and the streams server (the latter is what player metadata URLs hit)
         self.mass.streams.register_dynamic_route("/imageproxy/*", self.handle_imageproxy)
         self.mass.webserver.register_dynamic_route("/imageproxy/*", self.handle_imageproxy)
-        # deprecated /imageproxy?provider=&path=&size=&fmt= form (kept for back-compat)
-        self.mass.streams.register_dynamic_route("/imageproxy", self.handle_legacy_imageproxy)
         self._register_maintenance_tasks()
 
     async def close(self) -> None:
         """Handle logic on server stop."""
         self.mass.streams.unregister_dynamic_route("/imageproxy/*")
         self.mass.webserver.unregister_dynamic_route("/imageproxy/*")
-        self.mass.streams.unregister_dynamic_route("/imageproxy")
+
+    async def get_diagnostics(self) -> dict[str, Any] | None:
+        """Return diagnostics info for this controller to include in diagnostics reports."""
+        if not self._corrupt_metadata_rows:
+            return None
+        return {"corrupt_metadata_rows": self._corrupt_metadata_rows}
 
     @property
     def providers(self) -> list[MetadataProvider]:
@@ -698,50 +660,6 @@ class MetaDataController(CoreController):
         ) or _detect_image_format(path)
         return await self._serve_thumbnail(path, provider, size, image_format)
 
-    async def handle_legacy_imageproxy(self, request: web.Request) -> web.Response:
-        """
-        Serve an image for a legacy `/imageproxy?provider=&path=&size=&fmt=` request.
-
-        DEPRECATED: this form requires the client to carry the full provider id
-        and (often URL-shaped) path on the query string, which produces
-        unwieldy double-encoded URLs and an open surface for arbitrary path
-        injection. New clients must use the `proxy_id` field on
-        `MediaItemImage` and hit `handle_imageproxy` instead. Each remote IP
-        gets a throttled deprecation `warning` log per minute.
-        """
-        self._maybe_log_legacy_imageproxy(request)
-        try:
-            path = request.query["path"]
-        except KeyError:
-            return web.Response(status=400)
-        provider = request.query.get("provider", "builtin")
-        if provider in ("url", "file", "http"):
-            # legacy aliases kept for backwards compatibility with old clients
-            provider = "builtin"
-        try:
-            size = int(request.query.get("size", "0"))
-        except ValueError:
-            return web.Response(status=400)
-        if size not in _ALLOWED_IMAGEPROXY_SIZES:
-            return web.Response(status=400)
-        image_format = _normalize_imageproxy_format(
-            request.query.get("fmt")
-        ) or _detect_image_format(path)
-        # path was double-encoded by old get_image_url(); decode iteratively
-        # until stable so we cope with any extra wrapping clients may have done
-        for _ in range(3):
-            if "%" not in path:
-                break
-            decoded = urllib.parse.unquote_plus(path)
-            if decoded == path:
-                break
-            path = decoded
-        if not _is_safe_imageproxy_request_path(path):
-            return web.Response(status=400)
-        if not self.mass.get_provider(provider) and not path.startswith("http"):
-            return web.Response(status=404)
-        return await self._serve_thumbnail(path, provider, size, image_format)
-
     async def _resolve_thumbnail(
         self,
         path: str,
@@ -823,30 +741,6 @@ class MetaDataController(CoreController):
             body=image_data,
             headers=response_headers,
             content_type=_IMAGEPROXY_CONTENT_TYPES[content_format],
-        )
-
-    def _maybe_log_legacy_imageproxy(self, request: web.Request) -> None:
-        """Emit a throttled deprecation warning for the legacy /imageproxy form."""
-        remote = request.remote or "unknown"
-        now = time()
-        if len(self._legacy_imageproxy_warn_at) > 100:
-            self._legacy_imageproxy_warn_at = {
-                ip: ts
-                for ip, ts in self._legacy_imageproxy_warn_at.items()
-                if now - ts < _LEGACY_DEPRECATION_PRUNE_AFTER
-            }
-        if (
-            now - self._legacy_imageproxy_warn_at.get(remote, 0.0)
-            < _LEGACY_DEPRECATION_LOG_INTERVAL
-        ):
-            return
-        self._legacy_imageproxy_warn_at[remote] = now
-        self.logger.warning(
-            "Deprecated /imageproxy?provider=&path= request from %s (UA: %s); "
-            "clients should read the proxy_id field on MediaItemImage and use "
-            "the canonical /imageproxy/<proxy_id> endpoint instead",
-            remote,
-            request.headers.get("User-Agent", "?"),
         )
 
     async def create_collage_image(
@@ -1298,7 +1192,7 @@ class MetaDataController(CoreController):
         ):
             if queue.current_item and queue.current_item.media_item:
                 if station_image := queue.current_item.media_item.image:
-                    return station_image.path
+                    return self.get_image_url(station_image)
         return None
 
     @staticmethod
@@ -2053,11 +1947,7 @@ class MetaDataController(CoreController):
         missing_description = f"json_extract({DB_TABLE_ARTISTS}.metadata,'$.description') ISNULL"
         never_refreshed = f"json_extract({DB_TABLE_ARTISTS}.metadata,'$.last_refresh') ISNULL"
         query = f"({missing_images} OR {missing_description}) AND {never_refreshed}"
-        artists = await self.mass.music.artists.get_library_items_by_query(
-            limit=METADATA_SCAN_BATCH_SIZE,
-            order_by="random",
-            extra_query_parts=[query],
-        )
+        artists = await self._get_scan_batch(self.mass.music.artists, DB_TABLE_ARTISTS, query)
         if not artists:
             update_current_task_progress_text("No artists with missing metadata found")
             return
@@ -2087,11 +1977,7 @@ class MetaDataController(CoreController):
             f"json_extract({DB_TABLE_PLAYLISTS}.metadata,'$.last_refresh') ISNULL "
             f"OR json_extract({DB_TABLE_PLAYLISTS}.metadata,'$.last_refresh') < {refresh_before}"
         )
-        playlists = await self.mass.music.playlists.get_library_items_by_query(
-            limit=METADATA_SCAN_BATCH_SIZE,
-            order_by="random",
-            extra_query_parts=[query],
-        )
+        playlists = await self._get_scan_batch(self.mass.music.playlists, DB_TABLE_PLAYLISTS, query)
         if not playlists:
             update_current_task_progress_text("No playlists require metadata refresh")
             return
@@ -2125,6 +2011,56 @@ class MetaDataController(CoreController):
         if removed:
             self.logger.debug("Thumbnail cache cleanup: removed %s file(s)", removed)
 
+    async def _get_scan_batch[ItemCls: MediaItemType](
+        self,
+        media_controller: MediaControllerBase[ItemCls],
+        table: str,
+        query: str,
+    ) -> list[ItemCls]:
+        """Fetch a metadata-scan batch, tolerating rows with corrupt metadata JSON."""
+        try:
+            items = await media_controller.get_library_items_by_query(
+                limit=METADATA_SCAN_BATCH_SIZE,
+                order_by="random",
+                extra_query_parts=[query],
+            )
+        except sqlite3.OperationalError as err:
+            if "malformed JSON" not in str(err):
+                raise
+            await self._report_corrupt_metadata_rows(table)
+            return await media_controller.get_library_items_by_query(
+                limit=METADATA_SCAN_BATCH_SIZE,
+                order_by="random",
+                extra_query_parts=[f"{_valid_metadata_guard(table)} AND ({query})"],
+            )
+        # a clean scan proves the table currently holds no corrupt rows
+        self._corrupt_metadata_rows.pop(table, None)
+        return items
+
+    async def _report_corrupt_metadata_rows(self, table: str) -> None:
+        """Report library rows whose metadata column holds invalid JSON."""
+        rows = await self.mass.music.database.get_rows_from_query(
+            f"SELECT item_id, name FROM {table} "
+            f"WHERE {table}.metadata IS NOT NULL AND NOT json_valid({table}.metadata)",
+            limit=25,
+        )
+        # keep the findings for the diagnostics report, replacing the previous
+        # pass so repaired rows drop out again
+        if rows:
+            self._corrupt_metadata_rows[table] = [
+                {"item_id": row["item_id"], "name": row["name"]} for row in rows
+            ]
+        else:
+            self._corrupt_metadata_rows.pop(table, None)
+        for row in rows:
+            message = (
+                f"'{row['name']}' has corrupt metadata and was skipped. To repair, remove "
+                f"'{row['name']}' from the library; it will be re-added with fresh metadata "
+                f"on the next library sync ({table} id {row['item_id']})."
+            )
+            report_current_task_failure(message)
+            self.logger.warning(message)
+
     async def _persist_image_id(self, image_id: str, provider: str, path: str) -> None:
         """Store an image-id mapping so a later imageproxy request can resolve it."""
         await self.cache.set(
@@ -2135,3 +2071,10 @@ class MetaDataController(CoreController):
             expiration=_IMAGE_ID_CACHE_TTL,
             persistent=True,
         )
+
+
+def _valid_metadata_guard(table: str) -> str:
+    """Return a query part that excludes rows with invalid JSON in the metadata column."""
+    # sqlite's json functions raise a fatal 'malformed JSON' error on invalid input,
+    # which would fail the entire scan query because of a single corrupt row
+    return f"({table}.metadata IS NULL OR json_valid({table}.metadata))"

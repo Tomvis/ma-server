@@ -7,10 +7,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from music_assistant_models.enums import PlaybackState, PlayerFeature
+from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
 from music_assistant_models.player import OutputProtocol
 
-from music_assistant.constants import CONF_PLAYERS
+from music_assistant.constants import CONF_GROUP_MEMBERS, CONF_PLAYERS
 from music_assistant.providers.sync_group.player import SyncGroupPlayer
 
 
@@ -831,6 +831,84 @@ class TestPresetMembersInDynamicGroup:
         # an unrelated player is rejected
         assert sgp._is_member_allowed("outsider") is False
 
+    @pytest.mark.asyncio
+    async def test_can_group_with_falls_back_when_all_members_offline(self) -> None:
+        """
+        An offline preset member must not block adding other players.
+
+        Regression: with only offline members in the list, can_group_with
+        returned an empty set instead of offering compatible players, so
+        nothing could be added to the group until the member came back.
+        """
+        mass = _make_mock_mass()
+        sgp = self._make_dynamic_group_with_preset(mass, ["offline_member"])
+        await sgp.on_config_updated()
+
+        offline_member = _make_mock_player("offline_member", available=False)
+        candidate = _make_mock_player("candidate")
+        candidate.type = PlayerType.PLAYER
+        candidate.state.can_group_with = {"other"}
+        candidate.state.active_group = None
+        mass.players.get_player = _player_lookup(
+            {"offline_member": offline_member, "candidate": candidate}
+        )
+        mass.players.all_players = MagicMock(return_value=[candidate])
+
+        assert "candidate" in sgp.can_group_with
+
+    @pytest.mark.asyncio
+    async def test_can_group_with_aggregates_from_available_members(self) -> None:
+        """With at least one available member, candidates come from the members only."""
+        mass = _make_mock_mass()
+        sgp = self._make_dynamic_group_with_preset(mass, ["offline_member", "online_member"])
+        await sgp.on_config_updated()
+
+        offline_member = _make_mock_player("offline_member", available=False)
+        online_member = _make_mock_player("online_member")
+        online_member.state.can_group_with = {"online_member", "friend"}
+        mass.players.get_player = _player_lookup(
+            {"offline_member": offline_member, "online_member": online_member}
+        )
+
+        result = sgp.can_group_with
+
+        assert {"online_member", "friend"} <= result
+        mass.players.all_players.assert_not_called()
+
+
+class TestGetConfigEntriesMemberPicker:
+    """Test the member options offered in the group settings dropdown."""
+
+    @pytest.mark.asyncio
+    async def test_slaved_follower_is_still_offered(self) -> None:
+        """
+        A synced follower must stay selectable in the member dropdown.
+
+        Regression: a member removed from the config during active playback
+        remains slaved at the protocol level. Its can_group_with is then empty,
+        and since it is no longer in the saved ids it vanished from the
+        dropdown, making it impossible to re-add without stopping playback.
+        """
+        mass = _make_mock_mass()
+        leader = _make_mock_player("leader")
+        leader.type = PlayerType.PLAYER
+        leader.state.can_group_with = {"follower"}
+        # slaved follower: empty can_group_with while synced_to is set
+        follower = _make_mock_player("follower")
+        follower.type = PlayerType.PLAYER
+        follower.state.synced_to = "leader"
+        # idle player that cannot group with anything must NOT be offered
+        solo = _make_mock_player("solo")
+        solo.type = PlayerType.PLAYER
+        mass.players.all_players = MagicMock(return_value=[leader, follower, solo])
+        sgp = _make_sync_group(mass)
+
+        entries = await sgp.get_config_entries()
+        members_entry = next(x for x in entries if x.key == CONF_GROUP_MEMBERS)
+        option_ids = {option.value for option in members_entry.options}
+
+        assert option_ids == {"leader", "follower"}
+
 
 class TestMembersFilterMigration:
     """Test the members_filter (exclusion) -> allowed_members (inclusion) migration."""
@@ -1143,6 +1221,32 @@ class TestFormWaitsForLeaderUnsynced:
         # won't be issued against a stuck player (the original Poolhouse race).
         assert sgp.sync_leader is None
 
+    @pytest.mark.asyncio
+    async def test_form_aborts_when_leader_cleared_during_wait(self) -> None:
+        """If a concurrent dissolve clears sync_leader during the wait, abort the stale form."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        leader = _make_mock_player("leader", provider_domain="sonos")
+        leader.state.synced_to = "old_leader"
+        member = _make_mock_player("m2", provider_domain="sonos")
+        mass.players.get_player = _player_lookup({"leader": leader, "m2": member})
+        sgp._attr_group_members = ["leader", "m2"]
+
+        async def fake_wait(_member_id: str, _timeout: float = 5.0) -> bool:
+            leader.state.synced_to = None
+            sgp.sync_leader = None  # simulate a concurrent dissolve while waiting
+            return True
+
+        with (
+            patch.object(sgp, "update_state"),
+            patch.object(sgp, "_wait_member_unsynced", side_effect=fake_wait),
+        ):
+            await sgp._form_syncgroup()
+
+        # the stale form attempt must not (re)sync any members
+        mass.players._handle_set_members.assert_not_awaited()
+        assert sgp.sync_leader is None
+
 
 class TestWaitMemberUnsynced:
     """The helper that waits for a member's synced_to to clear (with recovery)."""
@@ -1164,24 +1268,30 @@ class TestWaitMemberUnsynced:
 
     @pytest.mark.asyncio
     async def test_attempts_recovery_when_stuck(self) -> None:
-        """If the first wait doesn't clear it, issue a recovery ungroup and wait again."""
+        """If the first wait doesn't clear it, kick the member from its stale parent directly."""
         mass = _make_mock_mass()
         sgp = _make_sync_group(mass)
         member = _make_mock_player("m1")
         member.synced_to = "old_leader"  # still stale after first wait
-        mass.players.get_player = _player_lookup({"m1": member})
+        old_leader = _make_mock_player("old_leader")
+        mass.players.get_player = _player_lookup({"m1": member, "old_leader": old_leader})
 
-        # cmd_ungroup is what should be called as the recovery action.
+        # _handle_set_members on the stale parent is the expected recovery action.
         # We make it succeed by side-effect-clearing synced_to.
-        async def _ungroup(_player_id: str) -> None:
+        async def _kick(_parent: Any, player_ids_to_remove: list[str]) -> None:
+            assert player_ids_to_remove == ["m1"]
             member.synced_to = None
 
-        mass.players.cmd_ungroup = AsyncMock(side_effect=_ungroup)
+        mass.players._handle_set_members = AsyncMock(side_effect=_kick)
+        mass.players.cmd_ungroup = AsyncMock()
 
         ok = await sgp._wait_member_unsynced("m1")
 
         assert ok is True
-        mass.players.cmd_ungroup.assert_awaited_once_with("m1")
+        mass.players._handle_set_members.assert_awaited_once_with(
+            old_leader, player_ids_to_remove=["m1"]
+        )
+        mass.players.cmd_ungroup.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_false_when_genuinely_stuck(self) -> None:
@@ -1190,13 +1300,30 @@ class TestWaitMemberUnsynced:
         sgp = _make_sync_group(mass)
         member = _make_mock_player("m1")
         member.synced_to = "old_leader"  # stays stuck even after recovery
-        mass.players.get_player = _player_lookup({"m1": member})
-        mass.players.cmd_ungroup = AsyncMock()  # no-op: state stays stale
+        old_leader = _make_mock_player("old_leader")
+        mass.players.get_player = _player_lookup({"m1": member, "old_leader": old_leader})
+        mass.players._handle_set_members = AsyncMock()  # no-op: state stays stale
 
         ok = await sgp._wait_member_unsynced("m1")
 
         assert ok is False
-        mass.players.cmd_ungroup.assert_awaited_once_with("m1")
+        mass.players._handle_set_members.assert_awaited_once_with(
+            old_leader, player_ids_to_remove=["m1"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_stale_parent_gone(self) -> None:
+        """If the stale parent no longer exists, skip the kick and report stuck."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        member = _make_mock_player("m1")
+        member.synced_to = "old_leader"  # parent is no longer registered
+        mass.players.get_player = _player_lookup({"m1": member})
+
+        ok = await sgp._wait_member_unsynced("m1")
+
+        assert ok is False
+        mass.players._handle_set_members.assert_not_awaited()
 
 
 class TestSupportedFeaturesPower:

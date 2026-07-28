@@ -62,13 +62,18 @@ from music_assistant.constants import (
     PROTOCOL_FEATURES,
     PROTOCOL_PRIORITY,
 )
-from music_assistant.helpers.util import get_changed_dataclass_values
+from music_assistant.helpers.util import get_changed_dataclass_values, html_to_markdown
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, PlayerConfig
     from music_assistant_models.player_queue import PlayerQueue
 
     from .player_provider import PlayerProvider
+
+
+def _clamp_elapsed_time(elapsed_time: float | None) -> float | None:
+    """Return elapsed_time clamped to a non-negative value."""
+    return max(0.0, elapsed_time) if elapsed_time is not None else None
 
 
 class Player(ABC):
@@ -190,7 +195,7 @@ class Player(ABC):
     @property
     def elapsed_time(self) -> float | None:
         """Return the elapsed time in (fractional) seconds of the current track (if any)."""
-        return self._attr_elapsed_time
+        return _clamp_elapsed_time(self._attr_elapsed_time)
 
     @property
     def elapsed_time_last_updated(self) -> float | None:
@@ -861,8 +866,10 @@ class Player(ABC):
         if self.elapsed_time is None or self.elapsed_time_last_updated is None:
             return None
         if self.playback_state == PlaybackState.PLAYING:
-            return self.elapsed_time + (time.time() - self.elapsed_time_last_updated)
-        return self.elapsed_time
+            return _clamp_elapsed_time(
+                self.elapsed_time + (time.time() - self.elapsed_time_last_updated)
+            )
+        return _clamp_elapsed_time(self.elapsed_time)
 
     @cached_property
     @final
@@ -1830,6 +1837,9 @@ class Player(ABC):
                 podcast = getattr(media_item, "podcast", None)
                 metadata = getattr(media_item, "metadata", None)
                 description = getattr(metadata, "description", None) if metadata else None
+                if description:
+                    # descriptions may contain HTML markup; the OSD shows plain text
+                    description = html_to_markdown(description)
                 image_url = (
                     self.mass.metadata.get_image_url(current_item.media_item.image, size=512)
                     or item_image_url

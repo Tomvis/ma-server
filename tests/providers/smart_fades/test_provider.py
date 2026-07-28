@@ -132,6 +132,7 @@ async def test_beat_detection(provider: SmartFadesProvider, mass_mock: Mock) -> 
     stream_details.queue_id = "test"
     stream_details.uri = "test://120bpm"
     stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 120
 
     session_id = "test:test:test_120bpm"
     await provider.start_analysis(session_id, stream_details, audio_format)
@@ -193,6 +194,7 @@ async def test_extended_analysis_fields(provider: SmartFadesProvider, mass_mock:
     stream_details.queue_id = "test"
     stream_details.uri = "test://120bpm"
     stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 120
 
     session_id = "test:test:test_120bpm_extended"
     await provider.start_analysis(session_id, stream_details, audio_format)
@@ -260,6 +262,7 @@ async def test_finalize_returns_audio_analysis_data(provider: SmartFadesProvider
     stream_details.queue_id = "test"
     stream_details.uri = "test://finalize_return"
     stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 120
 
     session_id = "test:test:test_finalize_return"
     await provider.start_analysis(session_id, stream_details, audio_format)
@@ -292,6 +295,7 @@ async def test_finalize_returns_none_on_early_exit(provider: SmartFadesProvider)
     stream_details.queue_id = "test"
     stream_details.uri = "test://finalize_none"
     stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 120
 
     session_id = "test:test:test_finalize_none"
     await provider.start_analysis(session_id, stream_details, audio_format)
@@ -313,6 +317,24 @@ async def test_finalize_returns_none_on_early_exit(provider: SmartFadesProvider)
         result = await provider._finalize(session_id)
 
     assert result is None
+
+
+async def test_digital_silence_yields_finite_spectral_centroid(
+    provider: SmartFadesProvider,
+) -> None:
+    """Digitally-silent audio yields 0 Hz centroid frames instead of non-finite values."""
+    sample_rate = 22050
+    tone = np.sin(2 * np.pi * 440 * np.arange(sample_rate, dtype=np.float32) / sample_rate)
+    pcm = np.concatenate([tone.astype(np.float32), np.zeros(sample_rate, dtype=np.float32)])
+    data = Mock()
+    data.energy_chunks = []
+    data.frequency_band_chunks = {}
+    data.centroid_chunks = []
+
+    provider._compute_energy_and_spectral_centroids(pcm, data)
+
+    assert data.centroid_chunks
+    assert np.isfinite(np.concatenate(data.centroid_chunks)).all()
 
 
 async def test_setup_raises_when_requirements_not_met(
