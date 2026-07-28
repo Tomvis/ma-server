@@ -2747,6 +2747,21 @@ class MusicController(CoreController):
         except Exception as err:
             self.logger.warning("Database vacuum failed: %s", str(err))
 
+    async def __table_exists(self, table_name: str) -> bool:
+        """Check whether a table exists, so a migration step can be skipped if it does not.
+
+        Migrations run against databases at any prior schema version, including ones that
+        never had a given table. Upstream guards its own steps this way (see the
+        audio_analysis step below); the enhanced branch's ALTER steps need the same.
+        """
+        return bool(
+            await self.database.get_rows_from_query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table_name",
+                {"table_name": table_name},
+                limit=1,
+            )
+        )
+
     async def __migrate_database(self, prev_version: int) -> None:  # noqa: PLR0915
         """Perform a database migration."""
         self.logger.info(
@@ -3370,16 +3385,17 @@ class MusicController(CoreController):
             # writes never reference it) and intentionally not dropped here —
             # SQLite DROP COLUMN is recent and the cost of carrying a NULL
             # column outweighs the migration risk.
-            try:
-                await self._database.execute(
-                    f"ALTER TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
-                    "ADD COLUMN [is_manual] BOOLEAN NOT NULL DEFAULT 0;"
-                )
-            except Exception as err:
-                if "duplicate column" not in str(err):
-                    raise
+            if await self.__table_exists(DB_TABLE_GENRE_MEDIA_ITEM_MAPPING):
+                try:
+                    await self._database.execute(
+                        f"ALTER TABLE {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+                        "ADD COLUMN [is_manual] BOOLEAN NOT NULL DEFAULT 0;"
+                    )
+                except Exception as err:
+                    if "duplicate column" not in str(err):
+                        raise
 
-        if prev_version <= 42:
+        if prev_version <= 42 and await self.__table_exists(DB_TABLE_ALBUMS):
             # add listen_later flag + timestamp to albums (Roon-style "save for later")
             for column_sql in (
                 f"ALTER TABLE {DB_TABLE_ALBUMS} "
@@ -3392,7 +3408,7 @@ class MusicController(CoreController):
                     if "duplicate column" not in str(err):
                         raise
 
-        if 42 <= prev_version <= 43:
+        if 42 <= prev_version <= 43 and await self.__table_exists(DB_TABLE_ALBUMS):
             # Earlier enhanced-branch builds stored album DR under
             # `$.critical_reception.dr`. The new schema splits that into the
             # canonical (measured) `$.dynamic_range` and the AMG-review-reported
@@ -3421,7 +3437,7 @@ class MusicController(CoreController):
                 "WHERE json_extract(metadata, '$.critical_reception.dr') IS NOT NULL"
             )
 
-        if prev_version <= 44:
+        if prev_version <= 44 and await self.__table_exists(DB_TABLE_ALBUMS):
             # 3.2.0 merges each critical_reception source's split `types` + `labels`
             # token lists into one human-readable `accolades` list. Rewrite stored album
             # rows so the SQL filters (which now read $.accolades) keep matching; the same
@@ -3464,7 +3480,7 @@ class MusicController(CoreController):
                         {"metadata": serialize_to_json(metadata)},
                     )
 
-        if prev_version <= 45:
+        if prev_version <= 45 and await self.__table_exists(DB_TABLE_ALBUMS):
             # listen_later and library membership are mutually exclusive (enforced
             # going forward in AlbumsController._update_library_item). Clean up any
             # album that landed in both before that enforcement by clearing the

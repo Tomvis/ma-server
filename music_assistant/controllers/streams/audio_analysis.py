@@ -267,12 +267,14 @@ class AudioAnalysisController:
         for worker in workers:
             if not worker.done():
                 worker.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
         # Await provider cancels inline (with a per-call timeout). `_cancel_providers`
         # would fire-and-forget via mass.create_task — but mass.stop already cancelled
         # tracked tasks before calling streams.close(), so those new tasks would race
         # event-loop shutdown and may not actually run.
+        # This has to claim the sessions BEFORE awaiting the workers: each worker's
+        # finally calls `_cancel_providers`, which pops the session and dispatches the
+        # very fire-and-forget cancel this block exists to avoid. Popping first leaves
+        # the worker's call a no-op.
         cancel_tasks: list[asyncio.Task[None]] = []
         for session_key in list(self._active_sessions):
             provider_ids = self._active_sessions.pop(session_key, None)
@@ -287,6 +289,8 @@ class AudioAnalysisController:
                     )
         if cancel_tasks:
             await asyncio.gather(*cancel_tasks, return_exceptions=True)
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         self._session_queues.clear()
         if self.analysis_executor is not None:
             # A running CPU-bound thread can't be cancelled, so shut down without waiting on it.
