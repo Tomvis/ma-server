@@ -97,9 +97,12 @@ CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
 CACHE_CATEGORY_CRITICAL_RECEPTION = 3
 
-# How many bytes to download from a track when extracting custom AMG/TPS/DR tags.
-# Tag headers (ID3v2 / Vorbis comments / FLAC METADATA_BLOCK / MP4 'moov') live near
-# the start of the file; 512 KiB is enough for every common audio container.
+# Upper bound on how many bytes to download from a track when extracting custom
+# AMG/TPS/DR tags. Tag headers (ID3v2 / Vorbis comments / MP4 'moov') live near the
+# start of the file. FLAC is trimmed earlier — as soon as its VORBIS_COMMENT block
+# is buffered (see _flac_tag_prefix) — so a large embedded cover-art PICTURE block
+# can't push the metadata past this cap; the cap only bounds the fallback path
+# (non-FLAC, or FLAC whose comment block never completes within the limit).
 CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
 # How long ffprobe is allowed to run on the temp file. Bounds total sync cost.
 CRITICAL_RECEPTION_PROBE_TIMEOUT = 12.0
@@ -146,6 +149,50 @@ def _silent_unlink(path: str) -> None:
     """Remove a temp file, swallowing OS errors."""
     with suppress(OSError):
         Path(path).unlink()
+
+
+def _flac_tag_prefix(data: bytes | bytearray) -> bytes | None:
+    """
+    Build a minimal, valid FLAC from a (possibly truncated) FLAC byte prefix.
+
+    A FLAC stream is the ``fLaC`` marker, a chain of metadata blocks (STREAMINFO,
+    VORBIS_COMMENT, PICTURE, ...), then audio frames. The custom DR/AMG/TPS tags
+    live in VORBIS_COMMENT, which the tag writer places right after STREAMINFO —
+    before the often multi-megabyte embedded cover-art PICTURE block. ffprobe only
+    reports tags once it has walked the whole metadata chain, so a prefix that
+    stops inside a large PICTURE block is rejected wholesale and the tags are lost
+    even though they sit near the start of the file.
+
+    This returns STREAMINFO plus the blocks up to and including VORBIS_COMMENT,
+    with the last-metadata-block flag forced on the kept VORBIS_COMMENT header, so
+    the result parses from a few kilobytes regardless of cover-art size.
+
+    :param data: A prefix of a FLAC file (need not be complete).
+    :return: The trimmed FLAC bytes, or ``None`` when ``data`` isn't FLAC or its
+        VORBIS_COMMENT block isn't yet fully present (caller keeps buffering or
+        falls back to probing the raw prefix).
+    """
+    if len(data) < 4 or data[:4] != b"fLaC":
+        return None
+    pos = 4
+    size = len(data)
+    while pos + 4 <= size:
+        header = data[pos]
+        block_type = header & 0x7F
+        block_end = pos + 4 + int.from_bytes(data[pos + 1 : pos + 4], "big")
+        if block_end > size:
+            # The block runs past what we have buffered. A VORBIS_COMMENT this deep
+            # isn't usable yet; any other block means the comment (if present) would
+            # already have appeared earlier, so there's nothing to salvage.
+            return None
+        if block_type == 4:  # VORBIS_COMMENT
+            trimmed = bytearray(data[:block_end])
+            trimmed[pos] = 0x80 | block_type  # force last-metadata-block flag
+            return bytes(trimmed)
+        if header & 0x80:  # last metadata block reached, no VORBIS_COMMENT present
+            return None
+        pos = block_end
+    return None
 
 
 class OpenSonicProvider(MusicProvider):
@@ -536,9 +583,10 @@ class OpenSonicProvider(MusicProvider):
             async with resp:
                 tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
                 os.close(tmp_fd)
-                # Accumulate the capped prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
-                # resident), then persist it in a single executor hop.
+                # Accumulate the prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
+                # resident), then persist it in a single executor hop below.
                 buf = bytearray()
+                probe_bytes: bytes | None = None
                 async for chunk in resp.content.iter_chunked(64 * 1024):
                     if not chunk:
                         break
@@ -546,11 +594,22 @@ class OpenSonicProvider(MusicProvider):
                     if remaining <= 0:
                         break
                     buf += chunk[:remaining] if len(chunk) > remaining else chunk
+                    # FLAC keeps its tags in a VORBIS_COMMENT block that the tag
+                    # writer places before the (often multi-MB) embedded cover art.
+                    # Trim to a minimal metadata-only FLAC as soon as that block is
+                    # complete: otherwise a large PICTURE block pushes the metadata
+                    # past the byte cap and ffprobe rejects the truncated file,
+                    # dropping tags that actually sit near the start.
+                    if (flac := _flac_tag_prefix(buf)) is not None:
+                        probe_bytes = flac
+                        break
                     if len(buf) >= CRITICAL_RECEPTION_PROBE_BYTES:
                         break
-            if not buf:
+            if probe_bytes is None:
+                probe_bytes = bytes(buf)
+            if not probe_bytes:
                 return None
-            await asyncio.to_thread(Path(tmp_path).write_bytes, bytes(buf))
+            await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
             try:
                 tags = await asyncio.wait_for(
                     async_parse_tags(tmp_path),
