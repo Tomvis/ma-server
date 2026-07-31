@@ -4,7 +4,9 @@
 # (aiosendspin, av, etc.) are kept; the music_assistant Python source is
 # replaced wholesale with the rating-branch checkout, so server-side features
 # like critical_reception filters and listen_later are present.
-ARG UPSTREAM=ghcr.io/music-assistant/server:latest
+# 2.10 line: `latest` is the 2.9.x stable image and lacks the deps 2.10 providers
+# need, so the base must come from the nightly/dev stream until 2.10.0 is tagged.
+ARG UPSTREAM=ghcr.io/music-assistant/server:nightly
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
@@ -39,7 +41,7 @@ RUN rm -rf /app/venv/lib/python3.14/site-packages/aiosendspin \
 COPY aiosendspin_overlay/ \
      /app/venv/lib/python3.14/site-packages/aiosendspin/
 COPY aiosendspin_dist_info_overlay/ \
-     /app/venv/lib/python3.14/site-packages/aiosendspin-6.0.5+trackfields.dist-info/
+     /app/venv/lib/python3.14/site-packages/aiosendspin-7.0.0+trackfields.dist-info/
 
 # The 2.9.0/py3.14 base now ships everything the rating branch needs beyond
 # the overlays: libportaudio2 plus the former pip deltas (torch/torchaudio
