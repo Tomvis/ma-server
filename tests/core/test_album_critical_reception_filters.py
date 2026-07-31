@@ -7,11 +7,11 @@ behave correctly against a real (in-memory) SQLite engine using the JSON1 extens
 import json
 import sqlite3
 
-from music_assistant.controllers.media.albums import (
+from music_assistant.controllers.music.media.albums import (
     AlbumsController,
     _apply_critical_reception_filters,
 )
-from music_assistant.controllers.media.base import SORT_KEYS
+from music_assistant.controllers.music.media.base import SORT_KEYS
 
 
 def _build(**kwargs: object) -> tuple[list[str], dict[str, object]]:

@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from bandcamp_async_api import (
     BandcampAPIClient,
@@ -26,7 +26,7 @@ from bandcamp_async_api.models import (
     FollowingItem,
 )
 from mashumaro.exceptions import UnserializableDataError
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
+from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
 from music_assistant_models.enums import (
     ConfigEntryType,
     ImageType,
@@ -52,7 +52,6 @@ from music_assistant_models.media_items import (
     Track,
     UniqueList,
 )
-from music_assistant_models.provider import ProviderManifest
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CONF_ENTRY_UNOFFICIAL_PROVIDER
@@ -64,6 +63,7 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     BROWSE_FANS,
+    BROWSE_FEED,
     BROWSE_FOLLOWERS,
     BROWSE_FOLLOWING,
     BROWSE_WISHLIST,
@@ -79,6 +79,9 @@ from .constants import (
 )
 from .converters import BandcampConverters
 
+if TYPE_CHECKING:
+    from music_assistant_models.provider import ProviderManifest
+
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -87,40 +90,9 @@ async def setup(
     return BandcampProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-# noinspection PyTypeHints,PyUnusedLocal
-async def get_config_entries(
-    mass: MusicAssistant,  # noqa: ARG001
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
-    return (
-        CONF_ENTRY_UNOFFICIAL_PROVIDER,
-        ConfigEntry(
-            key=CONF_IDENTITY,
-            type=ConfigEntryType.SECURE_STRING,
-            label="Identity token",
-            required=False,
-            description="Identity token from Bandcamp cookies for account collection access."
-            " Log in https://bandcamp.com and extract browser cookie named 'identity'.",
-            value=values.get(CONF_IDENTITY) if values else None,
-        ),
-        ConfigEntry(
-            key=CONF_TOP_TRACKS_LIMIT,
-            type=ConfigEntryType.INTEGER,
-            label="Artist Top Tracks search limit",
-            required=False,
-            description="Search limit while getting artist top tracks.",
-            value=values.get(CONF_TOP_TRACKS_LIMIT) if values else DEFAULT_TOP_TRACKS_LIMIT,
-            default_value=DEFAULT_TOP_TRACKS_LIMIT,
-            advanced=True,
-        ),
-    )
-
-
 def split_id(id_: str) -> tuple[int, int, int]:
-    """Return (artist_id, album_id, track_id). Missing parts are returned as 0.
+    """
+    Return (artist_id, album_id, track_id). Missing parts are returned as 0.
 
     :param id_: Compound ID string, e.g. "123-456-789".
     :raises InvalidDataError: If the ID contains non-numeric parts.
@@ -149,9 +121,22 @@ class BandcampProvider(MusicProvider):
     )
     top_tracks_limit: int
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return (
+            CONF_ENTRY_UNOFFICIAL_PROVIDER,
+            ConfigEntry(
+                key=CONF_TOP_TRACKS_LIMIT,
+                type=ConfigEntryType.INTEGER,
+                required=False,
+                default_value=DEFAULT_TOP_TRACKS_LIMIT,
+                advanced=True,
+            ),
+        )
+
     async def handle_async_init(self) -> None:
         """Handle async init of the Bandcamp provider."""
-        identity = self.config.get_value(CONF_IDENTITY)
+        identity = self.get_setup_value(CONF_IDENTITY)
         self.top_tracks_limit = cast(
             "int", self.config.get_value(CONF_TOP_TRACKS_LIMIT, DEFAULT_TOP_TRACKS_LIMIT)
         )
@@ -215,6 +200,45 @@ class BandcampProvider(MusicProvider):
 
         return results
 
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Get this provider's available recommendation rows, without items."""
+        if not self._client.identity:
+            return []
+        return [
+            RecommendationFolder(
+                item_id="feed",
+                provider=self.instance_id,
+                name="Bandcamp Feed",
+                translation_key="feed",
+                icon="mdi-rss",
+                is_playable=True,
+            ),
+            RecommendationFolder(
+                item_id="wishlist",
+                provider=self.instance_id,
+                name="Wishlist",
+                translation_key="wishlist",
+                icon="mdi-heart",
+                is_playable=True,
+            ),
+        ]
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Get the items for a single recommendation row.
+
+        :param item_id: The item_id of the row, as returned by get_recommendations.
+        """
+        if not self._client.identity:
+            return UniqueList()
+        if item_id == "feed":
+            return UniqueList(await self._get_feed_tracks())
+        if item_id == "wishlist":
+            return UniqueList(await self._browse_person_content(None, CollectionType.WISHLIST))
+        return UniqueList()
+
     @throttle_with_retries
     async def _fetch_collection_page(
         self,
@@ -222,7 +246,8 @@ class BandcampProvider(MusicProvider):
         older_than_token: str | None,
         fan_id: int | None,
     ) -> CollectionSummary:
-        """Fetch a single page of collection items with throttling and retry.
+        """
+        Fetch a single page of collection items with throttling and retry.
 
         :param collection_type: The type of collection to fetch.
         :param older_than_token: Pagination cursor from the previous page.
@@ -244,7 +269,8 @@ class BandcampProvider(MusicProvider):
         collection_type: CollectionType,
         fan_id: int | None = None,
     ) -> list[CollectionItem | FollowingItem | FanItem]:
-        """Fetch all pages of a collection endpoint.
+        """
+        Fetch all pages of a collection endpoint.
 
         :param collection_type: The type of collection to fetch.
         :param fan_id: Fan ID to query. None = authenticated user.
@@ -375,7 +401,8 @@ class BandcampProvider(MusicProvider):
 
     @throttle_with_retries
     async def _fetch_api_track(self, item_id: str) -> tuple[BCTrack, BCAlbum | None]:
-        """Fetch a raw API track and its parent album by compound item ID.
+        """
+        Fetch a raw API track and its parent album by compound item ID.
 
         Uses get_album when album_id is present (most tracks), falling back
         to get_track for standalone tracks (album_id=0).
@@ -492,33 +519,6 @@ class BandcampProvider(MusicProvider):
 
         return tracks[: self.top_tracks_limit]
 
-    async def recommendations(self) -> list[RecommendationFolder]:
-        """Surface Bandcamp's personalised feed and wishlist as recommendations."""
-        if not self._client.identity:
-            return []
-        folders: list[RecommendationFolder] = []
-        if feed_tracks := await self._get_feed_tracks():
-            folders.append(
-                RecommendationFolder(
-                    item_id="feed",
-                    provider=self.instance_id,
-                    name="Bandcamp Feed",
-                    icon="mdi-rss",
-                    items=UniqueList(feed_tracks),
-                )
-            )
-        if wishlist := await self._browse_person_content(None, CollectionType.WISHLIST):
-            folders.append(
-                RecommendationFolder(
-                    item_id="wishlist",
-                    provider=self.instance_id,
-                    name="Wishlist",
-                    icon="mdi-heart",
-                    items=UniqueList(wishlist),
-                )
-            )
-        return folders
-
     @throttle_with_retries
     async def _fetch_feed(self) -> FeedResponse:
         """Fetch the authenticated user's feed with throttling and retry."""
@@ -552,7 +552,8 @@ class BandcampProvider(MusicProvider):
         return tracks
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
-        """Browse this provider's items.
+        """
+        Browse this provider's items.
 
         :param path: The path to browse, (e.g. provider_id://artists).
         """
@@ -565,6 +566,11 @@ class BandcampProvider(MusicProvider):
         if path_parts and path_parts[0] in (BROWSE_FANS, BROWSE_FOLLOWERS):
             return await self._browse_person(path_parts, base)
 
+        # The feed/wishlist recommendation folders resolve to their tracks here when played;
+        # the folder's explicit path is dropped on deserialization, so play arrives as the
+        # bare item_id slug (e.g. ".../feed") rather than ".../recommendations/feed".
+        if path_parts == [BROWSE_FEED]:
+            return await self._get_feed_tracks()
         if path_parts == [BROWSE_WISHLIST]:
             return await self._browse_person_content(None, CollectionType.WISHLIST)
         if path_parts == [BROWSE_FOLLOWING]:
@@ -591,6 +597,7 @@ class BandcampProvider(MusicProvider):
                         provider=self.instance_id,
                         path=base + folder_id,
                         name=folder_name,
+                        translation_key=folder_id,
                     )
                 )
 
@@ -601,7 +608,8 @@ class BandcampProvider(MusicProvider):
         path_parts: list[str],
         base: str,
     ) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
-        """Route person browse paths: fans/followers and their sub-categories.
+        """
+        Route person browse paths: fans/followers and their sub-categories.
 
         Pattern: (fans|followers)[/{id}[/(collection|wishlist|following|fans|followers)]*]
         """
@@ -649,7 +657,8 @@ class BandcampProvider(MusicProvider):
     # --- Person browse helpers (fans, followers, and social graph traversal) ---
 
     async def _resolve_person_segment(self, segment: str) -> int | None:
-        """Resolve a path segment to a fan_id.
+        """
+        Resolve a path segment to a fan_id.
 
         Checks the slug→fan_id cache first, then tries numeric parse.
         For unknown slugs, rebuilds the cache from fan/follower lists and retries.
@@ -681,7 +690,8 @@ class BandcampProvider(MusicProvider):
 
     @staticmethod
     def _fan_slug(person: FanItem) -> str | None:
-        """Extract the URL slug from a FanItem's url.
+        """
+        Extract the URL slug from a FanItem's url.
 
         e.g. "https://bandcamp.com/teancom" → "teancom"
         """
@@ -723,6 +733,7 @@ class BandcampProvider(MusicProvider):
                 provider=self.instance_id,
                 path=f"{base_path}/{sub_id}",
                 name=name,
+                translation_key=sub_id,
             )
             for sub_id, name in PERSON_SUB_FOLDERS
         ]
@@ -756,7 +767,8 @@ class BandcampProvider(MusicProvider):
     async def _browse_person_content(
         self, person_id: int | None, collection_type: CollectionType
     ) -> list[Album | Track]:
-        """Fetch a person's collection or wishlist items.
+        """
+        Fetch a person's collection or wishlist items.
 
         :param person_id: Person to query. None = authenticated user.
         """
@@ -765,7 +777,7 @@ class BandcampProvider(MusicProvider):
         if cached is not None:
             try:
                 return [self._deserialize_content_item(item) for item in cached]
-            except (LookupError, ValueError, UnserializableDataError, InvalidDataError):
+            except LookupError, ValueError, UnserializableDataError, InvalidDataError:
                 self.logger.warning("Stale cache for %s, fetching fresh", cache_key)
         results: list[Album | Track] = []
         context = f"Failed to get {collection_type.value} for person {person_id}"
@@ -787,7 +799,8 @@ class BandcampProvider(MusicProvider):
 
     @throttle_with_retries
     async def _browse_person_following(self, person_id: int | None) -> list[Artist]:
-        """Fetch a person's followed artists.
+        """
+        Fetch a person's followed artists.
 
         :param person_id: Person to query. None = authenticated user.
         """
@@ -822,7 +835,8 @@ class BandcampProvider(MusicProvider):
         base_path: str,
         person_id: int | None = None,
     ) -> list[BrowseFolder]:
-        """Fetch a person's fans or followers as browsable folders.
+        """
+        Fetch a person's fans or followers as browsable folders.
 
         :param collection_type: FOLLOWING_FANS or FOLLOWERS.
         :param base_path: Browse path prefix for the resulting folder links.
@@ -853,7 +867,8 @@ class BandcampProvider(MusicProvider):
         return folders
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Return the content details for the given track.
+        """
+        Return the content details for the given track.
 
         Fetches fresh from the Bandcamp API since streaming URLs may expire.
         """

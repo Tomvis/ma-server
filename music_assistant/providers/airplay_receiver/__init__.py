@@ -19,9 +19,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
-    ConfigEntryType,
     ContentType,
     ImageType,
     MediaType,
@@ -33,7 +31,6 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import (
     AudioError,
     MediaNotFoundError,
-    PlayerCommandFailed,
     UnsupportedFeaturedException,
 )
 from music_assistant_models.media_items import (
@@ -53,7 +50,7 @@ from music_assistant.providers.airplay_receiver.helpers import get_shairport_syn
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -61,6 +58,7 @@ if TYPE_CHECKING:
 
 CONF_MASS_PLAYER_ID = "mass_player_id"
 CONF_AIRPLAY_NAME = "airplay_name"
+DEFAULT_AIRPLAY_NAME = "Music Assistant"
 
 # Special value for auto player selection
 PLAYER_ID_AUTO = "__auto__"
@@ -72,58 +70,24 @@ SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
 AUDIO_SOURCE_ID = "main"
 
 
+def airplay_receiver_port(instance_id: str) -> int:
+    """
+    Return the AirPlay port used by a receiver instance.
+
+    Deterministically derived from the instance id, so it stays the same across
+    server restarts (Python's built-in ``hash()`` is salted per process).
+
+    :param instance_id: The provider instance id of the AirPlay receiver.
+    """
+    digest = hashlib.md5(instance_id.encode(), usedforsecurity=False).hexdigest()
+    return 7000 + int(digest, 16) % 1000
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
     return AirPlayReceiverProvider(mass, manifest, config)
-
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
-) -> tuple[ConfigEntry, ...]:
-    """
-    Return Config entries to setup this provider.
-
-    instance_id: id of an existing provider instance (None if new instance setup).
-    action: [optional] action key called from config entries UI.
-    values: the (intermediate) raw values for config entries sent with the action.
-    """
-    return (
-        CONF_ENTRY_WARN_PREVIEW,
-        ConfigEntry(
-            key=CONF_MASS_PLAYER_ID,
-            type=ConfigEntryType.STRING,
-            label="Connected Music Assistant Player",
-            description="The Music Assistant player connected to this AirPlay receiver plugin. "
-            "When you stream audio via AirPlay to this virtual speaker, "
-            "the audio will play on the selected player. "
-            "Set to 'Auto' to automatically select a currently playing player, "
-            "or the first available player if none is playing.",
-            multi_value=False,
-            default_value=PLAYER_ID_AUTO,
-            options=[
-                ConfigValueOption("Auto (prefer playing player)", PLAYER_ID_AUTO),
-                *(
-                    ConfigValueOption(x.display_name, x.player_id)
-                    for x in sorted(
-                        mass.players.all_players(False, False), key=lambda p: p.display_name.lower()
-                    )
-                ),
-            ],
-            required=True,
-        ),
-        ConfigEntry(
-            key=CONF_AIRPLAY_NAME,
-            type=ConfigEntryType.STRING,
-            label="AirPlay Device Name",
-            description="How should this AirPlay receiver be named in the AirPlay device list?",
-            default_value="Music Assistant",
-        ),
-    )
 
 
 class AirPlayReceiverProvider(PluginProvider):
@@ -134,9 +98,12 @@ class AirPlayReceiverProvider(PluginProvider):
     ) -> None:
         """Initialize MusicProvider."""
         super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
-        # Default player ID from config (PLAYER_ID_AUTO or a specific player_id)
+        # Configured default player (PLAYER_ID_AUTO or a specific player id)
         self._default_player_id: str = (
-            cast("str", self.config.get_value(CONF_MASS_PLAYER_ID)) or PLAYER_ID_AUTO
+            cast("str", self.get_setup_value(CONF_MASS_PLAYER_ID)) or PLAYER_ID_AUTO
+        )
+        self._airplay_name = (
+            cast("str", self.get_setup_value(CONF_AIRPLAY_NAME)) or DEFAULT_AIRPLAY_NAME
         )
         # Currently active player (the one currently playing or selected)
         self._active_player_id: str | None = None
@@ -151,10 +118,10 @@ class AirPlayReceiverProvider(PluginProvider):
         self.audio_pipe = AsyncNamedPipeWriter(audio_pipe_path)
         self.metadata_pipe = AsyncNamedPipeWriter(metadata_pipe_path)
         self.config_file = f"/tmp/ma_shairport_sync_{self.instance_id}.conf"  # noqa: S108
-        # Use port 7000+ for AirPlay 2 compatibility
-        # Each instance gets a unique port: 7000, 7001, 7002, etc.
-        self.airplay_port = 7000 + (hash(self.instance_id) % 1000)
-        airplay_name = cast("str", self.config.get_value(CONF_AIRPLAY_NAME)) or self.name
+        # Use port 7000+ for AirPlay 2 compatibility, one unique port per instance.
+        # The port must be stable across restarts: the AirPlay provider uses it to
+        # recognize (and ignore) our own shairport-sync advertisement in discovery.
+        self.airplay_port = airplay_receiver_port(self.instance_id)
         # _audio_format describes the original AirPlay source (ALAC at 44.1/16,
         # the protocol-native format AirPlay senders use) and is what we
         # advertise to clients for source-format display.
@@ -175,7 +142,7 @@ class AirPlayReceiverProvider(PluginProvider):
             bit_depth=16,
             channels=2,
         )
-        self._stream_metadata = StreamMetadata(title=f"AirPlay | {airplay_name}")
+        self._stream_metadata = StreamMetadata(title=f"AirPlay | {self._airplay_name}")
         self._audio_source = AudioSource(
             item_id=AUDIO_SOURCE_ID,
             provider=self.instance_id,
@@ -212,32 +179,20 @@ class AirPlayReceiverProvider(PluginProvider):
         self._metadata_reader: MetadataReader | None = None
         self._first_volume_event_received = False  # Track if we've received the first volume event
 
+    @property
+    def instance_name_postfix(self) -> str | None:
+        """Return the advertised receiver name as the multi-instance postfix."""
+        return self._airplay_name if self._airplay_name != DEFAULT_AIRPLAY_NAME else None
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return runtime options for this provider."""
+        return (CONF_ENTRY_WARN_PREVIEW,)
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self._shairport_bin = await get_shairport_sync_binary()
         # Always start the daemon - we always have a default player configured
         self._setup_shairport_daemon()
-
-    async def _stop_shairport_daemon(self) -> None:
-        """Stop the shairport-sync daemon without unloading the provider.
-
-        This allows the provider to restart shairport-sync later when needed.
-        """
-        # Stop metadata reader
-        if self._metadata_reader:
-            await self._metadata_reader.stop()
-            self._metadata_reader = None
-
-        # Stop shairport-sync process
-        if self._runner_task and not self._runner_task.done():
-            self._runner_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._runner_task
-            self._runner_task = None
-
-        # Reset the shairport process reference
-        self._shairport_proc = None
-        self._shairport_started.clear()
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
@@ -255,7 +210,8 @@ class AirPlayReceiverProvider(PluginProvider):
         return [self._audio_source]
 
     async def get_stream_details(self, source_id: str, queue_id: str) -> StreamDetails:
-        """Return StreamDetails for streaming the AirPlay audio to a queue.
+        """
+        Return StreamDetails for streaming the AirPlay audio to a queue.
 
         Side-effect-free: ownership is claimed in on_source_selected (which the
         streams controller fires before this method on the actual stream
@@ -289,7 +245,8 @@ class AirPlayReceiverProvider(PluginProvider):
         action: SourceControl,
         value: int | None = None,
     ) -> None:
-        """Handle source control commands (no-op: AirPlay receiver is passive).
+        """
+        Handle source control commands (no-op: AirPlay receiver is passive).
 
         The AudioSource advertises no control capabilities, so MA will not invoke
         any actions here. Override exists only to satisfy the contract.
@@ -300,51 +257,6 @@ class AirPlayReceiverProvider(PluginProvider):
     def active_player_id(self) -> str | None:
         """Return the currently active player ID for this plugin."""
         return self._active_player_id
-
-    def _get_target_player_id(self) -> str | None:
-        """
-        Determine the target player ID for playback.
-
-        Returns the player ID to use based on the following priority:
-        1. If a player was explicitly selected (source selected on a player), use that
-        2. If default is 'auto': prefer playing player, then first available
-        3. If a specific default player is configured, use that
-
-        :return: The player ID to use for playback, or None if no player available.
-        """
-        # If there's an active player (source was selected on a player), use it
-        if self._active_player_id:
-            # Validate that the active player still exists
-            if self.mass.players.get_player(self._active_player_id):
-                return self._active_player_id
-            # Active player no longer exists, clear it
-            self._active_player_id = None
-
-        # Handle auto selection
-        if self._default_player_id == PLAYER_ID_AUTO:
-            all_players = list(self.mass.players.all_players(False, False))
-            # First, try to find a playing player
-            for player in all_players:
-                if player.state.playback_state == PlaybackState.PLAYING:
-                    self.logger.debug("Auto-selecting playing player: %s", player.display_name)
-                    return player.player_id
-            # Fallback to first available player
-            if all_players:
-                first_player = all_players[0]
-                self.logger.debug(
-                    "Auto-selecting first available player: %s", first_player.display_name
-                )
-                return first_player.player_id
-            # No player available
-            return None
-
-        # Use the specific default player if configured and it still exists
-        if self.mass.players.get_player(self._default_player_id):
-            return self._default_player_id
-        self.logger.warning(
-            "Configured default player '%s' no longer exists", self._default_player_id
-        )
-        return None
 
     async def on_source_selected(
         self,
@@ -413,6 +325,92 @@ class AirPlayReceiverProvider(PluginProvider):
         if self._in_use_by_queue == queue_id:
             self._in_use_by_queue = None
 
+    async def resolve_image(self, path: str) -> bytes:
+        """
+        Resolve an image from an image path.
+
+        This returns raw bytes of the cover art image received from AirPlay metadata.
+
+        :param path: The image path including the current cover art content hash suffix.
+        """
+        if not (self._metadata_reader and self._metadata_reader.cover_art_bytes):
+            return b""
+        current_hash = hashlib.md5(
+            self._metadata_reader.cover_art_bytes, usedforsecurity=False
+        ).hexdigest()[:8]
+        # Only serve when the suffix matches the current artwork's hash, so a
+        # stale request can't cache new bytes under an old hash key.
+        if path == f"cover_art_{current_hash}":
+            return self._metadata_reader.cover_art_bytes
+        return b""
+
+    async def _stop_shairport_daemon(self) -> None:
+        """
+        Stop the shairport-sync daemon without unloading the provider.
+
+        This allows the provider to restart shairport-sync later when needed.
+        """
+        # Stop metadata reader
+        if self._metadata_reader:
+            await self._metadata_reader.stop()
+            self._metadata_reader = None
+
+        # Stop shairport-sync process
+        if self._runner_task and not self._runner_task.done():
+            self._runner_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._runner_task
+            self._runner_task = None
+
+        # Reset the shairport process reference
+        self._shairport_proc = None
+        self._shairport_started.clear()
+
+    def _get_target_player_id(self) -> str | None:
+        """
+        Determine the target player ID for playback.
+
+        Returns the player ID to use based on the following priority:
+        1. If a player was explicitly selected (source selected on a player), use that
+        2. If default is 'auto': prefer playing player, then first available
+        3. If a specific default player is configured, use that
+
+        :return: The player ID to use for playback, or None if no player available.
+        """
+        # If there's an active player (source was selected on a player), use it
+        if self._active_player_id:
+            # Validate that the active player still exists
+            if self.mass.players.get_player(self._active_player_id):
+                return self._active_player_id
+            # Active player no longer exists, clear it
+            self._active_player_id = None
+
+        # Handle auto selection
+        if self._default_player_id == PLAYER_ID_AUTO:
+            all_players = list(self.mass.players.all_players(False, False))
+            # First, try to find a playing player
+            for player in all_players:
+                if player.state.playback_state == PlaybackState.PLAYING:
+                    self.logger.debug("Auto-selecting playing player: %s", player.display_name)
+                    return player.player_id
+            # Fallback to first available player
+            if all_players:
+                first_player = all_players[0]
+                self.logger.debug(
+                    "Auto-selecting first available player: %s", first_player.display_name
+                )
+                return first_player.player_id
+            # No player available
+            return None
+
+        # Use the specific default player if configured and it still exists
+        if self.mass.players.get_player(self._default_player_id):
+            return self._default_player_id
+        self.logger.warning(
+            "Configured default player '%s' no longer exists", self._default_player_id
+        )
+        return None
+
     def _clear_active_player(self) -> None:
         """
         Clear the active player and revert to default if configured.
@@ -430,13 +428,11 @@ class AirPlayReceiverProvider(PluginProvider):
             self.mass.players.trigger_player_update(prev_player_id)
 
     def _save_last_player_id(self, player_id: str) -> None:
-        """Persist the selected player ID to config as the new default."""
+        """Persist the selected player ID as the new default."""
         if self._default_player_id == player_id:
             return  # No change needed
         try:
-            self.mass.config.set_raw_provider_config_value(
-                self.instance_id, CONF_MASS_PLAYER_ID, player_id
-            )
+            self._update_setup_data(CONF_MASS_PLAYER_ID, player_id)
             self._default_player_id = player_id
         except Exception as err:
             self.logger.debug("Failed to persist player ID: %s", err)
@@ -453,8 +449,7 @@ class AirPlayReceiverProvider(PluginProvider):
         template = await asyncio.to_thread(_read_template)
 
         # Replace placeholders
-        airplay_name = cast("str", self.config.get_value(CONF_AIRPLAY_NAME)) or self.name
-        config_content = template.replace("{AIRPLAY_NAME}", airplay_name)
+        config_content = template.replace("{AIRPLAY_NAME}", self._airplay_name)
         config_content = config_content.replace("{METADATA_PIPE}", self.metadata_pipe.path)
         config_content = config_content.replace("{AUDIO_PIPE}", self.audio_pipe.path)
         config_content = config_content.replace("{PORT}", str(self.airplay_port))
@@ -500,7 +495,8 @@ class AirPlayReceiverProvider(PluginProvider):
         return f'\tinterface = "{iface_name}";\n'
 
     async def _setup_pipes_and_config(self) -> None:
-        """Set up named pipes and configuration file for shairport-sync.
+        """
+        Set up named pipes and configuration file for shairport-sync.
 
         :raises: OSError if pipe or config file creation fails.
         """
@@ -521,7 +517,8 @@ class AirPlayReceiverProvider(PluginProvider):
         await check_output("rm", "-f", self.config_file)
 
     async def _write_silence_to_unblock_stream(self) -> None:
-        """Write silence to the audio pipe to unblock ffmpeg.
+        """
+        Write silence to the audio pipe to unblock ffmpeg.
 
         When shairport-sync stops writing but ffmpeg is still reading,
         writing silence will cause ffmpeg to output a chunk, which lets the
@@ -537,7 +534,8 @@ class AirPlayReceiverProvider(PluginProvider):
         await self.audio_pipe.write(silence)
 
     def _process_shairport_log_line(self, line: str) -> None:
-        """Process a log line from shairport-sync stderr.
+        """
+        Process a log line from shairport-sync stderr.
 
         :param line: The log line to process.
         """
@@ -622,7 +620,8 @@ class AirPlayReceiverProvider(PluginProvider):
         self._runner_task = self.mass.create_task(self._shairport_runner())
 
     def _on_metadata_update(self, metadata: dict[str, Any]) -> None:
-        """Handle metadata updates from shairport-sync.
+        """
+        Handle metadata updates from shairport-sync.
 
         :param metadata: Dictionary containing metadata updates.
         """
@@ -657,7 +656,8 @@ class AirPlayReceiverProvider(PluginProvider):
             )
 
     def _handle_play_state_change(self, play_state: str) -> None:
-        """Handle play state changes from sessioncontrol hooks.
+        """
+        Handle play state changes from sessioncontrol hooks.
 
         :param play_state: The new play state ("playing" or "stopped").
         """
@@ -695,16 +695,25 @@ class AirPlayReceiverProvider(PluginProvider):
 
     async def _start_playback(self, target_player_id: str) -> None:
         """Start playback after any pending stop completes."""
-        if self._pending_stop_task and not self._pending_stop_task.done():
+        pending_stop_task = self._pending_stop_task
+        if pending_stop_task is not None:
+            # Await (even if already done) so a failed stop's exception is retrieved,
+            # and continue regardless of how it failed: a stop that can't complete must
+            # not keep the next session from starting. The reference is cleared only
+            # after the await so concurrent starts (rapid "playing" events before the
+            # stream is claimed) all await the same stop instead of racing past it.
             try:
-                await self._pending_stop_task
-            except PlayerCommandFailed as err:
+                await pending_stop_task
+            except Exception as err:
                 self.logger.warning("Failed to stop previous AirPlay playback: %s", err)
-        self._pending_stop_task = None
+            # Don't clear a newer stop that replaced ours while we were awaiting.
+            if self._pending_stop_task is pending_stop_task:
+                self._pending_stop_task = None
         await self.mass.player_queues.play_media(target_player_id, str(self._audio_source.uri))
 
     def _handle_volume_change(self, volume: int) -> None:
-        """Handle volume changes from AirPlay client (iOS/macOS device).
+        """
+        Handle volume changes from AirPlay client (iOS/macOS device).
 
         ignore_volume_control = "yes" means shairport-sync doesn't do software volume control,
         but we still receive volume level changes from the client to apply to the player.
@@ -737,7 +746,8 @@ class AirPlayReceiverProvider(PluginProvider):
             self.logger.debug("Player %s does not support volume control", player_id)
 
     def _update_source_metadata(self, metadata: dict[str, Any]) -> None:
-        """Update source metadata fields from AirPlay metadata.
+        """
+        Update source metadata fields from AirPlay metadata.
 
         :param metadata: Dictionary containing metadata updates.
         """
@@ -760,7 +770,8 @@ class AirPlayReceiverProvider(PluginProvider):
             self._stream_metadata.elapsed_time_last_updated = time.time()
 
     def _update_cover_art(self, metadata: dict[str, Any]) -> None:
-        """Update cover art image URL from AirPlay metadata.
+        """
+        Update cover art image URL from AirPlay metadata.
 
         :param metadata: Dictionary containing metadata updates.
         """
@@ -793,21 +804,3 @@ class AirPlayReceiverProvider(PluginProvider):
                     remotely_accessible=False,
                 )
                 self._stream_metadata.image_url = self.mass.metadata.get_image_url(image)
-
-    async def resolve_image(self, path: str) -> bytes:
-        """Resolve an image from an image path.
-
-        This returns raw bytes of the cover art image received from AirPlay metadata.
-
-        :param path: The image path including the current cover art content hash suffix.
-        """
-        if not (self._metadata_reader and self._metadata_reader.cover_art_bytes):
-            return b""
-        current_hash = hashlib.md5(
-            self._metadata_reader.cover_art_bytes, usedforsecurity=False
-        ).hexdigest()[:8]
-        # Only serve when the suffix matches the current artwork's hash, so a
-        # stale request can't cache new bytes under an old hash key.
-        if path == f"cover_art_{current_hash}":
-            return self._metadata_reader.cover_art_bytes
-        return b""

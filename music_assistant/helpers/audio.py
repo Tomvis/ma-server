@@ -7,7 +7,7 @@ import logging
 import re
 import struct
 import urllib.parse
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterable, Iterator
 from contextlib import aclosing
 from io import BytesIO
 from typing import TYPE_CHECKING, Final
@@ -23,19 +23,15 @@ from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.streamdetails import MultiPartPath
 
 from music_assistant.constants import (
-    CONF_VOLUME_NORMALIZATION,
-    CONF_VOLUME_NORMALIZATION_RADIO,
-    CONF_VOLUME_NORMALIZATION_TRACKS,
     MASS_LOGGER_NAME,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.json import JSON_DECODE_EXCEPTIONS, json_loads
 
-from .ffmpeg import get_ffmpeg_stream
+from .ffmpeg import DEFAULT_MP3_BIT_RATE, get_ffmpeg_stream
 from .process import AsyncProcess, communicate
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import CoreConfig, PlayerConfig
     from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -58,7 +54,8 @@ _MIME_TYPE_OVERRIDES: Final[dict[str, str]] = {
 
 
 def get_mime_type(format_str: str) -> str:
-    """Get the proper IANA MIME type for a given audio format string.
+    """
+    Get the proper IANA MIME type for a given audio format string.
 
     :param format_str: The audio format string (e.g. "mp3", "flac",
         "pcm;codec=pcm;rate=44100;bitrate=16;channels=2").
@@ -70,7 +67,8 @@ def get_mime_type(format_str: str) -> str:
 
 
 def parse_pcm_info(content_type: str) -> tuple[int, int, int]:
-    """Parse PCM info from a codec/content_type string.
+    """
+    Parse PCM info from a codec/content_type string.
 
     :param content_type: Content type string like "pcm;codec=pcm;rate=44100;bitrate=16;channels=2".
     """
@@ -92,7 +90,8 @@ def iter_pcm_slices(
     pcm_format: AudioFormat,
     target_duration_ms: int = 100,
 ) -> Iterator[bytes]:
-    """Yield frame-aligned PCM slices of approximately ``target_duration_ms``.
+    """
+    Yield frame-aligned PCM slices of approximately ``target_duration_ms``.
 
     Large PCM buffers (e.g. crossfade segments or full-track reads) are split
     into fixed-size sub-chunks so that downstream consumers get predictable
@@ -127,7 +126,8 @@ def iter_pcm_slices(
 
 
 def align_audio_to_frame_boundary(audio_data: bytes, pcm_format: AudioFormat) -> bytes:
-    """Align audio data to frame boundaries by truncating incomplete frames.
+    """
+    Align audio data to frame boundaries by truncating incomplete frames.
 
     :param audio_data: Raw PCM audio data to align.
     :param pcm_format: AudioFormat of the audio data.
@@ -149,7 +149,8 @@ async def strip_silence(
     pcm_format: AudioFormat,
     reverse: bool = False,
 ) -> bytes:
-    """Strip silence from begin or end of pcm audio using ffmpeg.
+    """
+    Strip silence from begin or end of pcm audio using ffmpeg.
 
     :param audio_data: Raw PCM audio data.
     :param pcm_format: AudioFormat of the audio data.
@@ -286,7 +287,8 @@ def get_parts_from_position(
     parts: list[MultiPartPath],
     seek_position: int,
 ) -> tuple[list[MultiPartPath], int]:
-    """Get the remaining parts list from a timestamp.
+    """
+    Get the remaining parts list from a timestamp.
 
     Arguments:
     parts: The list of  parts
@@ -569,8 +571,9 @@ def calculate_content_length(
         # Source: https://z-issue.com/wp/flac-compression-level-comparison/
         # Real-world variance: 65-85% depending on audio content.
         return int(pcm_size * 0.747)
-    if fmt.content_type in (ContentType.MP3, ContentType.OGG):
-        # CBR 320kbps as set in get_ffmpeg_args
+    if fmt.content_type == ContentType.MP3:
+        return int(((DEFAULT_MP3_BIT_RATE * 1000) / 8) * seconds)
+    if fmt.content_type == ContentType.OGG:
         return int((320000 / 8) * seconds)
     if fmt.content_type in (ContentType.AAC, ContentType.M4A):
         # CBR 256kbps as set in get_ffmpeg_args
@@ -579,7 +582,8 @@ def calculate_content_length(
 
 
 def get_output_format_key(fmt: AudioFormat) -> str:
-    """Get a stable key representing the output encoding parameters.
+    """
+    Get a stable key representing the output encoding parameters.
 
     :param fmt: The output audio format.
     """
@@ -665,8 +669,29 @@ def get_bit_rate(fmt: AudioFormat) -> int:
     return int((calculate_content_length(fmt, seconds=1) / 1000) * 8)
 
 
+def resolve_output_player_ids(
+    mass: MusicAssistant,
+    player_ids: Iterable[str],
+) -> set[str]:
+    """
+    Resolve output destinations to their user-facing player identifiers.
+
+    :param mass: Music Assistant instance.
+    :param player_ids: Player or protocol-player identifiers to resolve.
+    :return: Deduplicated user-facing player identifiers.
+    """
+    resolved_ids: set[str] = set()
+    for player_id in player_ids:
+        player = mass.players.get_player(player_id)
+        resolved_ids.add(
+            player.protocol_parent_id if player and player.protocol_parent_id else player_id
+        )
+    return resolved_ids
+
+
 def is_grouping_preventing_dsp(player: Player) -> bool:
-    """Check if grouping is preventing DSP from being applied to this leader/PlayerGroup.
+    """
+    Check if grouping is preventing DSP from being applied to this leader/PlayerGroup.
 
     If this returns True, no DSP should be applied to the player.
     This function will not check if the Player is in a group, the caller should do that first.
@@ -705,13 +730,21 @@ def parse_loudnorm(raw_stderr: bytes | str) -> float | None:
 
 
 def get_normalization_mode(
-    core_config: CoreConfig,
-    player_config: PlayerConfig,
+    preference: VolumeNormalizationMode,
+    volume_normalization_enabled: bool,
     streamdetails: StreamDetails,
 ) -> VolumeNormalizationMode:
-    """Get the volume normalization mode for a given player and stream."""
-    if not player_config.get_value(CONF_VOLUME_NORMALIZATION):
-        # disabled for this player
+    """
+    Get the volume normalization mode for a given queue and stream.
+
+    :param preference: The configured normalization preference for the stream's media type
+        (tracks or radio), from the streams core config.
+    :param volume_normalization_enabled: Whether normalization is enabled for the queue, already
+        resolved from the per-queue setting and its global (queue controller) fallback.
+    :param streamdetails: The stream to evaluate.
+    """
+    if not volume_normalization_enabled:
+        # disabled for this queue
         return VolumeNormalizationMode.DISABLED
     if streamdetails.media_type == MediaType.AUDIO_SOURCE:
         # live/realtime: upstream producer owns loudness, no measurement to converge on
@@ -719,16 +752,6 @@ def get_normalization_mode(
     if streamdetails.target_loudness is None:
         # no target loudness set, disable normalization
         return VolumeNormalizationMode.DISABLED
-    # work out preference for track or radio
-    preference = VolumeNormalizationMode(
-        str(
-            core_config.get_value(
-                CONF_VOLUME_NORMALIZATION_RADIO
-                if streamdetails.media_type == MediaType.RADIO
-                else CONF_VOLUME_NORMALIZATION_TRACKS,
-            ),
-        ),
-    )
 
     # handle no measurement available but fallback to dynamic mode is allowed
     if streamdetails.loudness is None and preference == VolumeNormalizationMode.FALLBACK_DYNAMIC:

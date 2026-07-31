@@ -23,7 +23,7 @@ from music_assistant.models.plugin import PluginProvider
 from .server import PlayerRemoteInstance
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
 
@@ -52,118 +52,22 @@ async def setup(
     return PlexConnectProvider(mass, manifest, config)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """
-    Return Config entries to setup this provider.
-
-    :param mass: MusicAssistant instance.
-    :param instance_id: id of an existing provider instance (None if new instance setup).
-    :param action: [optional] action key called from config entries UI.
-    :param values: the (intermediate) raw values for config entries sent with the action.
-    """
-    # Get available Plex music providers
-    plex_providers = [
-        provider
-        for provider in mass.get_providers()
-        if provider.domain == "plex" and provider.type.value == "music"
-    ]
-
-    # Get player name default if player is selected
-    player_name_default = None
-    if values and values.get(CONF_MASS_PLAYER_ID):
-        player_id = str(values.get(CONF_MASS_PLAYER_ID))
-        if player := mass.players.get_player(player_id):
-            player_name_default = player.display_name
-
-    return (
-        ConfigEntry(
-            key=CONF_PLEX_PROVIDER_ID,
-            type=ConfigEntryType.STRING,
-            label="Plex Music Provider",
-            description="Select the Plex music provider to use for this connection.",
-            required=True,
-            options=[
-                ConfigValueOption(provider.name, provider.instance_id)
-                for provider in plex_providers
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_MASS_PLAYER_ID,
-            type=ConfigEntryType.STRING,
-            label="Music Assistant Player",
-            description="Select the MA player to advertise as a Plex remote client.",
-            required=True,
-            options=[
-                ConfigValueOption(x.display_name, x.player_id)
-                for x in sorted(
-                    mass.players.all_players(False, False), key=lambda p: p.display_name.lower()
-                )
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_PLAYER_NAME,
-            type=ConfigEntryType.STRING,
-            label="Player Name in Plex",
-            description=(
-                "Custom name for this player as it appears in Plex apps. "
-                "Leave empty to use the player's name."
-            ),
-            required=False,
-            default_value=player_name_default,
-        ),
-        ConfigEntry(
-            key=CONF_DEVICE_CLASS,
-            type=ConfigEntryType.STRING,
-            label="Device Class",
-            description="How this player appears in Plex apps.",
-            required=False,
-            default_value="speaker",
-            options=[
-                ConfigValueOption("Speaker", "speaker"),
-                ConfigValueOption("Phone", "phone"),
-                ConfigValueOption("Tablet", "tablet"),
-                ConfigValueOption("Set-Top Box", "stb"),
-                ConfigValueOption("TV", "tv"),
-                ConfigValueOption("PC", "pc"),
-                ConfigValueOption("Cloud", "cloud"),
-            ],
-        ),
-        ConfigEntry(
-            key=CONF_PORT,
-            type=ConfigEntryType.INTEGER,
-            label="Network Port",
-            description=(
-                "TCP port this player is advertised and reachable on in Plex apps. "
-                "Leave empty to auto-assign a free port and remember it for this instance."
-            ),
-            required=False,
-            default_value=None,
-            advanced=True,
-            requires_reload=True,
-        ),
-    )
-
-
 class PlexConnectProvider(PluginProvider):
     """Plex Connect plugin provider implementation."""
 
     def __init__(
         self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
     ) -> None:
-        """Initialize the plugin provider.
+        """
+        Initialize the plugin provider.
 
         :param mass: MusicAssistant instance.
         :param manifest: Provider manifest.
         :param config: Provider configuration.
         """
         super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
-        self.mass_player_id = cast("str", self.config.get_value(CONF_MASS_PLAYER_ID))
-        self.plex_provider_id = cast("str", self.config.get_value(CONF_PLEX_PROVIDER_ID))
+        self.mass_player_id = cast("str", self.get_setup_value(CONF_MASS_PLAYER_ID))
+        self.plex_provider_id = cast("str", self.get_setup_value(CONF_PLEX_PROVIDER_ID))
         self.custom_player_name = cast("str | None", self.config.get_value(CONF_PLAYER_NAME))
         self.device_class = cast("str", self.config.get_value(CONF_DEVICE_CLASS)) or "speaker"
 
@@ -172,6 +76,40 @@ class PlexConnectProvider(PluginProvider):
         self._allocated_port: int | None = None
         self._stop_called: bool = False
         self._on_unload_callbacks: list[Callable[..., None]] = []
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return (
+            ConfigEntry(
+                key=CONF_PLAYER_NAME,
+                type=ConfigEntryType.STRING,
+                required=False,
+                default_value=None,
+            ),
+            ConfigEntry(
+                key=CONF_DEVICE_CLASS,
+                type=ConfigEntryType.STRING,
+                required=False,
+                default_value="speaker",
+                options=[
+                    ConfigValueOption("speaker"),
+                    ConfigValueOption("phone"),
+                    ConfigValueOption("tablet"),
+                    ConfigValueOption("stb"),
+                    ConfigValueOption("tv"),
+                    ConfigValueOption("pc"),
+                    ConfigValueOption("cloud"),
+                ],
+            ),
+            ConfigEntry(
+                key=CONF_PORT,
+                type=ConfigEntryType.INTEGER,
+                required=False,
+                default_value=None,
+                advanced=True,
+                requires_reload=True,
+            ),
+        )
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -216,7 +154,8 @@ class PlexConnectProvider(PluginProvider):
             await self._setup_player_instance()
 
     async def unload(self, is_removed: bool = False) -> None:
-        """Handle close/cleanup of the provider.
+        """
+        Handle close/cleanup of the provider.
 
         :param is_removed: Whether the provider is being removed.
         """
@@ -233,7 +172,8 @@ class PlexConnectProvider(PluginProvider):
         self._on_unload_callbacks.clear()
 
     def _is_port_available(self, port: int) -> bool:
-        """Check if a port is available by attempting to bind to it.
+        """
+        Check if a port is available by attempting to bind to it.
 
         :param port: Port number to check.
         :return: True if port is available, False otherwise.
@@ -248,7 +188,8 @@ class PlexConnectProvider(PluginProvider):
             return False
 
     def _find_available_port(self) -> int:
-        """Find the first available port in the configured range.
+        """
+        Find the first available port in the configured range.
 
         :return: First available port number.
         """
@@ -264,7 +205,8 @@ class PlexConnectProvider(PluginProvider):
         raise RuntimeError(msg)
 
     def _resolve_port(self) -> int:
-        """Return the long-term port for this instance, allocating one if needed.
+        """
+        Return the long-term port for this instance, allocating one if needed.
 
         The port is persisted in the instance config so it stays stable across restarts.
         A new port is allocated (and persisted) only on first setup, or if the configured
@@ -334,7 +276,8 @@ class PlexConnectProvider(PluginProvider):
             self._player_instance = None
 
     def _on_mass_player_event(self, event: MassEvent) -> None:
-        """Handle player added/removed events.
+        """
+        Handle player added/removed events.
 
         :param event: The event that occurred.
         """

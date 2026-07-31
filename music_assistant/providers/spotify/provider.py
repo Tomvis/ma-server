@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
-from collections.abc import AsyncGenerator
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
 import aiohttp
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
+    ConfigEntryType,
     ContentType,
     ImageType,
     MediaType,
@@ -30,6 +35,8 @@ from music_assistant_models.media_items import (
     Artist,
     Audiobook,
     AudioFormat,
+    BrowseFolder,
+    ItemMapping,
     MediaItemImage,
     MediaItemType,
     Playlist,
@@ -44,9 +51,10 @@ from music_assistant_models.media_items.metadata import MediaItemChapter
 from music_assistant_models.streamdetails import StreamDetails
 from orjson import JSONDecodeError
 
+from music_assistant.constants import CONF_ENTRY_UNOFFICIAL_PROVIDER
 from music_assistant.controllers.cache import use_cache
-from music_assistant.helpers.app_vars import app_var  # type: ignore[attr-defined]
-from music_assistant.helpers.json import json_loads
+from music_assistant.helpers.app_vars import app_var
+from music_assistant.helpers.json import SerializableType, json_loads
 from music_assistant.helpers.process import check_output
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.helpers.util import lock
@@ -72,9 +80,19 @@ from .parsers import (
 )
 from .streaming import LibrespotStreamer
 
+_PLAYLIST_PAGINATION_STATE_LIMIT = 32
+
 
 class NotModifiedError(Exception):
     """Exception raised when a resource has not been modified."""
+
+
+@dataclass(slots=True)
+class _PlaylistPaginationState:
+    """Hold the synchronization and metadata snapshot for one playlist endpoint."""
+
+    lock: asyncio.Lock
+    snapshot: dict[str, Any] | None = None
 
 
 class SpotifyProvider(MusicProvider):
@@ -87,13 +105,41 @@ class SpotifyProvider(MusicProvider):
     _sp_user: dict[str, Any] | None = None
     _librespot_bin: str | None = None
     _audiobooks_supported = False
+    _playlist_pagination_states: OrderedDict[tuple[str, bool], _PlaylistPaginationState]
     # True if user has configured a custom client ID with valid authentication
     dev_session_active: bool = False
     throttler: ThrottlerManager
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """
+        Return Config entries to setup this provider.
+
+        Authentication is handled by the setup flow (see setup_flow.py); only the genuine
+        options are configurable here.
+        """
+        # audiobook progress sync is only offered where the account's region supports audiobooks
+        audiobooks_supported = bool(getattr(self, "audiobooks_supported", False))
+        return (
+            CONF_ENTRY_UNOFFICIAL_PROVIDER,
+            ConfigEntry(
+                key=CONF_SYNC_PODCAST_PROGRESS,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
+                category="sync_options",
+            ),
+            ConfigEntry(
+                key=CONF_SYNC_AUDIOBOOK_PROGRESS,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                category="sync_options",
+                hidden=not audiobooks_supported,
+            ),
+        )
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self.cache_dir = os.path.join(self.mass.cache_path, self.instance_id)
+        self._playlist_pagination_states = OrderedDict()
         # Default throttler for global session (heavy rate limited)
         self.throttler = ThrottlerManager(rate_limit=1, period=2)
         self.streamer = LibrespotStreamer(self)
@@ -104,8 +150,8 @@ class SpotifyProvider(MusicProvider):
         await self.login()
 
         # Check if user has a custom client ID with valid dev token
-        client_id = self.config.get_value(CONF_CLIENT_ID)
-        dev_token = self.config.get_value(CONF_REFRESH_TOKEN_DEV)
+        client_id = self.get_setup_value(CONF_CLIENT_ID)
+        dev_token = self.get_setup_value(CONF_REFRESH_TOKEN_DEV)
 
         if client_id and dev_token and self._sp_user:
             await self.login_dev()
@@ -160,6 +206,20 @@ class SpotifyProvider(MusicProvider):
         if self._sp_user:
             return str(self._sp_user["display_name"])
         return None
+
+    async def get_diagnostics(self) -> dict[str, SerializableType]:
+        """Return diagnostics info for this provider to include in diagnostics reports."""
+        return {
+            "logged_in": self._sp_user is not None,
+            "token_expires_in_sec": (
+                round(self._auth_info_global["expires_at"] - time.time())
+                if self._auth_info_global
+                else None
+            ),
+            "dev_session_active": self.dev_session_active,
+            "librespot_available": self._librespot_bin is not None,
+            "audiobooks_supported": self._audiobooks_supported,
+        }
 
     ## Library retrieval methods (generators)
     async def get_library_artists(self) -> AsyncGenerator[Artist]:
@@ -216,7 +276,8 @@ class SpotifyProvider(MusicProvider):
                 yield audiobook
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
-        """Retrieve playlists from the provider.
+        """
+        Retrieve playlists from the provider.
 
         Note: We use the global session here because playlists like "Daily Mix"
         are only returned when using the non-dev (global) token.
@@ -225,6 +286,52 @@ class SpotifyProvider(MusicProvider):
         async for item in self._get_all_items("me/playlists", use_global_session=True):
             if item and item["id"]:
                 yield parse_playlist(item, self)
+
+    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Browse Spotify items, including curated sections (new releases, genres & moods).
+
+        :param path: The path to browse (e.g. provider_id:// or provider_id://new-releases).
+        """
+        path_parts = path.split("://")[1].split("/") if "://" in path else []
+        subpath = path_parts[0] if path_parts else None
+        sub_subpath = path_parts[1] if len(path_parts) > 1 else None
+        locale = self.mass.metadata.locale
+
+        if subpath == "new-releases":
+            return await self._get_new_releases()
+
+        if subpath == "categories" and sub_subpath:
+            return await self._get_category_playlists(sub_subpath, locale)
+
+        if subpath == "categories":
+            return await self._get_categories(locale)
+
+        # For root path, add curated folders on top of standard library folders.
+        # At the root the path always ends in "://", so curated paths can be appended directly.
+        if not subpath:
+            curated: list[BrowseFolder] = [
+                BrowseFolder(
+                    item_id="new-releases",
+                    provider=self.instance_id,
+                    path=f"{path}new-releases",
+                    name="New Releases",
+                    translation_key="new_releases",
+                    is_playable=True,
+                ),
+                BrowseFolder(
+                    item_id="categories",
+                    provider=self.instance_id,
+                    path=f"{path}categories",
+                    name="Genres & Moods",
+                    translation_key="genres_and_moods",
+                    is_playable=False,
+                ),
+            ]
+            standard = await super().browse(path)
+            return [*curated, *standard]
+
+        return await super().browse(path)
 
     @use_cache()
     async def search(
@@ -260,93 +367,6 @@ class SpotifyProvider(MusicProvider):
                 break
 
         return searchresult
-
-    def _build_search_types(self, media_types: list[MediaType]) -> str:
-        """Build comma-separated search types string from media types."""
-        searchtypes = []
-        if MediaType.ARTIST in media_types:
-            searchtypes.append("artist")
-        if MediaType.ALBUM in media_types:
-            searchtypes.append("album")
-        if MediaType.TRACK in media_types:
-            searchtypes.append("track")
-        if MediaType.PLAYLIST in media_types:
-            searchtypes.append("playlist")
-        if MediaType.PODCAST in media_types:
-            searchtypes.append("show")
-        if MediaType.AUDIOBOOK in media_types and self.audiobooks_supported:
-            searchtypes.append("audiobook")
-        return ",".join(searchtypes)
-
-    def _process_search_results(
-        self, api_result: dict[str, Any], searchresult: SearchResults
-    ) -> int:
-        """
-        Process API search results and update searchresult object.
-
-        Returns the total number of items received.
-        """
-        items_received = 0
-
-        if "artists" in api_result:
-            artists = [
-                parse_artist(item, self)
-                for item in api_result["artists"]["items"]
-                if (item and item["id"] and item["name"])
-            ]
-            searchresult.artists = [*searchresult.artists, *artists]
-            items_received += len(api_result["artists"]["items"])
-
-        if "albums" in api_result:
-            albums = [
-                parse_album(item, self)
-                for item in api_result["albums"]["items"]
-                if (item and item["id"])
-            ]
-            searchresult.albums = [*searchresult.albums, *albums]
-            items_received += len(api_result["albums"]["items"])
-
-        if "tracks" in api_result:
-            tracks = [
-                parse_track(item, self)
-                for item in api_result["tracks"]["items"]
-                if (item and item["id"])
-            ]
-            searchresult.tracks = [*searchresult.tracks, *tracks]
-            items_received += len(api_result["tracks"]["items"])
-
-        if "playlists" in api_result:
-            playlists = [
-                parse_playlist(item, self)
-                for item in api_result["playlists"]["items"]
-                if (item and item["id"])
-            ]
-            searchresult.playlists = [*searchresult.playlists, *playlists]
-            items_received += len(api_result["playlists"]["items"])
-
-        if "shows" in api_result:
-            podcasts = []
-            for item in api_result["shows"]["items"]:
-                if not (item and item["id"]):
-                    continue
-                # Filter out audiobooks - they have a distinctive description format
-                description = item.get("description", "")
-                if description.startswith("Author(s):") and "Narrator(s):" in description:
-                    continue
-                podcasts.append(parse_podcast(item, self))
-            searchresult.podcasts = [*searchresult.podcasts, *podcasts]
-            items_received += len(api_result["shows"]["items"])
-
-        if "audiobooks" in api_result and self.audiobooks_supported:
-            audiobooks = [
-                parse_audiobook(item, self)
-                for item in api_result["audiobooks"]["items"]
-                if (item and item["id"])
-            ]
-            searchresult.audiobooks = [*searchresult.audiobooks, *audiobooks]
-            items_received += len(api_result["audiobooks"]["items"])
-
-        return items_received
 
     @use_cache()
     async def get_artist(self, prov_artist_id: str) -> Artist:
@@ -606,7 +626,7 @@ class SpotifyProvider(MusicProvider):
         page_size = 50
         offset = page * page_size
 
-        meta = await self._get_paginated_meta(uri, limit=1, offset=0, use_global_session=use_global)
+        meta = await self._get_playlist_pagination_meta(uri, page, use_global)
         cache_checksum = meta["etag"]
         total = meta["total"]
 
@@ -852,46 +872,54 @@ class SpotifyProvider(MusicProvider):
 
         This uses MA's global client ID which has full API access but heavy rate limits.
         """
-        # return existing token if we have one in memory
+        # return the cached access token while it is still valid (refreshed before expiry)
         if (
             not force_refresh
             and self._auth_info_global
-            and (self._auth_info_global["expires_at"] > (time.time() - 600))
+            and (self._auth_info_global["expires_at"] > (time.time() + 600))
         ):
             return self._auth_info_global
-        # request new access token using the refresh token
-        if not (refresh_token := self.config.get_value(CONF_REFRESH_TOKEN_GLOBAL)):
+        # read the refresh token from the persisted store rather than the in-memory config copy,
+        # which can lag a rotation and would make us refresh with a stale (revoked) token
+        if not (refresh_token := self._stored_refresh_token(CONF_REFRESH_TOKEN_GLOBAL)):
             raise LoginFailed("Authentication required")
 
         try:
             auth_info = await get_spotify_token(
                 self.mass.http_session,
-                app_var(2),  # Always use MA's global client ID
-                cast("str", refresh_token),
+                app_var("spotify_client_id"),  # Always use MA's global client ID
+                refresh_token,
                 "global",
             )
             self.logger.debug("Successfully refreshed global access token")
         except LoginFailed as err:
             if "revoked" in str(err) or "invalid_grant" in str(err):
-                # clear refresh token if it's revoked or expired
-                self._update_config_value(CONF_REFRESH_TOKEN_GLOBAL, None)
-                if self.available:
-                    self.unload_with_error(str(err))
+                # Spotify rotates the refresh token on refresh and revokes the previous one.
+                # If the stored token was rotated while this refresh was in flight, the token
+                # we tried is merely stale, so keep the newer one instead of forcing re-auth.
+                if not self._refresh_token_superseded(CONF_REFRESH_TOKEN_GLOBAL, refresh_token):
+                    self._update_setup_data(CONF_REFRESH_TOKEN_GLOBAL, None)
+                    if self.available:
+                        self.unload_with_error(err)
             elif self.available:
-                self.mass.create_task(
-                    self.mass.unload_provider_with_error(self.instance_id, str(err))
-                )
+                self.mass.create_task(self.mass.unload_provider_with_error(self.instance_id, err))
             raise
 
         # make sure that our updated creds get stored in memory + config
         self._auth_info_global = auth_info
-        self._update_config_value(
-            CONF_REFRESH_TOKEN_GLOBAL, auth_info["refresh_token"], encrypted=True
+        # Spotify revokes the previous refresh token only when it rotates one, so on rotation
+        # persist immediately to ensure the new token survives a crash within the debounced-save
+        # window and avoids a forced re-auth; an unchanged token uses the normal debounced save.
+        token_rotated = auth_info["refresh_token"] != refresh_token
+        self._update_setup_data(
+            CONF_REFRESH_TOKEN_GLOBAL,
+            auth_info["refresh_token"],
+            immediate=token_rotated,
         )
 
         # Setup librespot with global token only if dev token is not configured
         # (if dev token exists, librespot will be set up in login_dev instead)
-        if not self.config.get_value(CONF_REFRESH_TOKEN_DEV):
+        if not self.get_setup_value(CONF_REFRESH_TOKEN_DEV):
             await self._setup_librespot_auth(auth_info["access_token"])
 
         # get logged-in user info
@@ -911,16 +939,17 @@ class SpotifyProvider(MusicProvider):
 
         This uses the user's custom client ID which has less rate limits but limited API access.
         """
-        # return existing token if we have one in memory
+        # return the cached access token while it is still valid (refreshed before expiry)
         if (
             not force_refresh
             and self._auth_info_dev
-            and (self._auth_info_dev["expires_at"] > (time.time() - 600))
+            and (self._auth_info_dev["expires_at"] > (time.time() + 600))
         ):
             return self._auth_info_dev
-        # request new access token using the refresh token
-        refresh_token = self.config.get_value(CONF_REFRESH_TOKEN_DEV)
-        client_id = self.config.get_value(CONF_CLIENT_ID)
+        # read the refresh token from the persisted store rather than the in-memory config copy,
+        # which can lag a rotation and would make us refresh with a stale (revoked) token
+        refresh_token = self._stored_refresh_token(CONF_REFRESH_TOKEN_DEV)
+        client_id = self.get_setup_value(CONF_CLIENT_ID)
         if not refresh_token or not client_id:
             raise LoginFailed("Developer authentication not configured")
 
@@ -928,15 +957,18 @@ class SpotifyProvider(MusicProvider):
             auth_info = await get_spotify_token(
                 self.mass.http_session,
                 cast("str", client_id),
-                cast("str", refresh_token),
+                refresh_token,
                 "developer",
             )
             self.logger.debug("Successfully refreshed developer access token")
         except LoginFailed as err:
             if "revoked" in str(err) or "invalid_grant" in str(err):
-                # clear refresh token if it's revoked or expired
-                self._update_config_value(CONF_REFRESH_TOKEN_DEV, None)
-                self._update_config_value(CONF_CLIENT_ID, None)
+                # Spotify rotates the refresh token on refresh and revokes the previous one.
+                # If the stored token was rotated while this refresh was in flight, the token
+                # we tried is merely stale, so keep the newer one instead of forcing re-auth.
+                if not self._refresh_token_superseded(CONF_REFRESH_TOKEN_DEV, refresh_token):
+                    self._update_setup_data(CONF_REFRESH_TOKEN_DEV, None)
+                    self._update_setup_data(CONF_CLIENT_ID, None)
             # Don't unload - we can still use the global session
             self.dev_session_active = False
             self.logger.warning(str(err))
@@ -944,8 +976,14 @@ class SpotifyProvider(MusicProvider):
 
         # make sure that our updated creds get stored in memory + config
         self._auth_info_dev = auth_info
-        self._update_config_value(
-            CONF_REFRESH_TOKEN_DEV, auth_info["refresh_token"], encrypted=True
+        # Spotify revokes the previous refresh token only when it rotates one, so on rotation
+        # persist immediately to ensure the new token survives a crash within the debounced-save
+        # window and avoids a forced re-auth; an unchanged token uses the normal debounced save.
+        token_rotated = auth_info["refresh_token"] != refresh_token
+        self._update_setup_data(
+            CONF_REFRESH_TOKEN_DEV,
+            auth_info["refresh_token"],
+            immediate=token_rotated,
         )
 
         # Setup librespot with dev token (preferred over global token)
@@ -953,6 +991,93 @@ class SpotifyProvider(MusicProvider):
 
         self.logger.info("Successfully logged in to Spotify developer session")
         return auth_info
+
+    def _build_search_types(self, media_types: list[MediaType]) -> str:
+        """Build comma-separated search types string from media types."""
+        searchtypes = []
+        if MediaType.ARTIST in media_types:
+            searchtypes.append("artist")
+        if MediaType.ALBUM in media_types:
+            searchtypes.append("album")
+        if MediaType.TRACK in media_types:
+            searchtypes.append("track")
+        if MediaType.PLAYLIST in media_types:
+            searchtypes.append("playlist")
+        if MediaType.PODCAST in media_types:
+            searchtypes.append("show")
+        if MediaType.AUDIOBOOK in media_types and self.audiobooks_supported:
+            searchtypes.append("audiobook")
+        return ",".join(searchtypes)
+
+    def _process_search_results(
+        self, api_result: dict[str, Any], searchresult: SearchResults
+    ) -> int:
+        """
+        Process API search results and update searchresult object.
+
+        Returns the total number of items received.
+        """
+        items_received = 0
+
+        if "artists" in api_result:
+            artists = [
+                parse_artist(item, self)
+                for item in api_result["artists"]["items"]
+                if (item and item["id"] and item["name"])
+            ]
+            searchresult.artists = [*searchresult.artists, *artists]
+            items_received += len(api_result["artists"]["items"])
+
+        if "albums" in api_result:
+            albums = [
+                parse_album(item, self)
+                for item in api_result["albums"]["items"]
+                if (item and item["id"])
+            ]
+            searchresult.albums = [*searchresult.albums, *albums]
+            items_received += len(api_result["albums"]["items"])
+
+        if "tracks" in api_result:
+            tracks = [
+                parse_track(item, self)
+                for item in api_result["tracks"]["items"]
+                if (item and item["id"])
+            ]
+            searchresult.tracks = [*searchresult.tracks, *tracks]
+            items_received += len(api_result["tracks"]["items"])
+
+        if "playlists" in api_result:
+            playlists = [
+                parse_playlist(item, self)
+                for item in api_result["playlists"]["items"]
+                if (item and item["id"])
+            ]
+            searchresult.playlists = [*searchresult.playlists, *playlists]
+            items_received += len(api_result["playlists"]["items"])
+
+        if "shows" in api_result:
+            podcasts = []
+            for item in api_result["shows"]["items"]:
+                if not (item and item["id"]):
+                    continue
+                # Filter out audiobooks - they have a distinctive description format
+                description = item.get("description", "")
+                if description.startswith("Author(s):") and "Narrator(s):" in description:
+                    continue
+                podcasts.append(parse_podcast(item, self))
+            searchresult.podcasts = [*searchresult.podcasts, *podcasts]
+            items_received += len(api_result["shows"]["items"])
+
+        if "audiobooks" in api_result and self.audiobooks_supported:
+            audiobooks = [
+                parse_audiobook(item, self)
+                for item in api_result["audiobooks"]["items"]
+                if (item and item["id"])
+            ]
+            searchresult.audiobooks = [*searchresult.audiobooks, *audiobooks]
+            items_received += len(api_result["audiobooks"]["items"])
+
+        return items_received
 
     async def _setup_librespot_auth(self, access_token: str) -> None:
         """
@@ -1004,6 +1129,56 @@ class SpotifyProvider(MusicProvider):
     def _get_liked_songs_playlist_id(self) -> str:
         return f"{LIKED_SONGS_FAKE_PLAYLIST_ID_PREFIX}-{self.instance_id}"
 
+    @use_cache(86400, allow_expired_cache=True)  # 24h; serve stale + refresh in background
+    async def _get_new_releases(self) -> list[Album]:
+        """Get Spotify's curated 'new releases' albums."""
+        try:
+            result = await self._get_data("browse/new-releases", limit=50)
+        except MediaNotFoundError:
+            return []
+        return [
+            parse_album(item, self)
+            for item in result.get("albums", {}).get("items", [])
+            if item and item.get("id")
+        ]
+
+    @use_cache(86400 * 7, allow_expired_cache=True)  # 7d; serve stale + refresh in background
+    async def _get_categories(self, locale: str) -> list[BrowseFolder]:
+        """Get Spotify's curated browse categories (genres & moods) as browse folders."""
+        try:
+            result = await self._get_data("browse/categories", locale=locale, limit=50)
+        except MediaNotFoundError:
+            return []
+        return [
+            BrowseFolder(
+                item_id=cat["id"],
+                provider=self.instance_id,
+                path=f"{self.instance_id}://categories/{cat['id']}",
+                name=cat["name"],
+                is_playable=False,
+            )
+            for cat in result.get("categories", {}).get("items", [])
+            if cat and cat.get("id") and cat.get("name")
+        ]
+
+    @use_cache(86400, allow_expired_cache=True)  # 24h; serve stale + refresh in background
+    async def _get_category_playlists(self, category_id: str, locale: str) -> list[Playlist]:
+        """Get the playlists for a single Spotify browse category."""
+        try:
+            result = await self._get_data(
+                f"browse/categories/{category_id}/playlists",
+                locale=locale,
+                limit=50,
+                use_global_session=True,
+            )
+        except MediaNotFoundError:
+            return []
+        return [
+            parse_playlist(item, self)
+            for item in result.get("playlists", {}).get("items", [])
+            if item and item.get("id") and item.get("name")
+        ]
+
     async def _get_liked_songs_playlist(self) -> Playlist:
         if self._sp_user is None:
             raise LoginFailed("User info not available - not logged in")
@@ -1011,7 +1186,9 @@ class SpotifyProvider(MusicProvider):
         liked_songs = Playlist(
             item_id=self._get_liked_songs_playlist_id(),
             provider=self.instance_id,
-            name=f"Liked Songs {self._sp_user['display_name']}",  # TODO to be translated
+            name=f"Liked Songs {self._sp_user['display_name']}",
+            translation_key="liked_songs",
+            translation_params=[self._sp_user["display_name"]],
             owner=self._sp_user["display_name"],
             provider_mappings={
                 ProviderMapping(
@@ -1039,6 +1216,43 @@ class SpotifyProvider(MusicProvider):
             liked_songs.metadata.add_image(image)
 
         return liked_songs
+
+    async def _get_playlist_pagination_meta(
+        self, endpoint: str, page: int, use_global_session: bool
+    ) -> dict[str, Any]:
+        """
+        Return pagination metadata for a Spotify playlist traversal.
+
+        :param endpoint: Spotify API endpoint for the playlist items.
+        :param page: Requested playlist page.
+        :param use_global_session: Whether the global Spotify session is required.
+        """
+        state_key = (endpoint, use_global_session)
+        if state := self._playlist_pagination_states.get(state_key):
+            self._playlist_pagination_states.move_to_end(state_key)
+        else:
+            state = _PlaylistPaginationState(lock=asyncio.Lock())
+            self._playlist_pagination_states[state_key] = state
+            while len(self._playlist_pagination_states) > _PLAYLIST_PAGINATION_STATE_LIMIT:
+                self._playlist_pagination_states.popitem(last=False)
+
+        observed_snapshot = state.snapshot
+        async with state.lock:
+            snapshot = state.snapshot
+            # A concurrent page may have populated this snapshot while this call waited.
+            if snapshot and (page > 0 or snapshot is not observed_snapshot):
+                return snapshot
+
+            if page == 0:
+                state.snapshot = None
+            meta = await self._get_paginated_meta(
+                endpoint,
+                limit=1,
+                offset=0,
+                use_global_session=use_global_session,
+            )
+            state.snapshot = meta
+            return meta
 
     async def _playlist_requires_global_token(self, prov_playlist_id: str) -> bool:
         """
@@ -1145,7 +1359,7 @@ class SpotifyProvider(MusicProvider):
         """Get all items from a paged list."""
         offset = 0
         # single request to fetch the etag (used as cache checksum) and total
-        meta = await self._get_paginated_meta(endpoint, limit=1, offset=0, **kwargs)
+        meta = await self._get_cached_paginated_meta(endpoint, limit=1, offset=0, **kwargs)
         cache_checksum = meta["etag"]
         total = meta["total"]
         while True:
@@ -1182,7 +1396,11 @@ class SpotifyProvider(MusicProvider):
         )
         return result
 
-    @use_cache(120, allow_bypass=False)  # short cache: subsequent calls reuse cached data
+    @use_cache(120, allow_bypass=False)  # short cache: repeated traversals reuse metadata
+    async def _get_cached_paginated_meta(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
+        """Get cached pagination metadata for a paginated API endpoint."""
+        return await self._get_paginated_meta(endpoint, **kwargs)
+
     async def _get_paginated_meta(self, endpoint: str, **kwargs: Any) -> dict[str, Any]:
         """Get etag and total item count for a paginated api endpoint."""
         _res = await self._get_data(endpoint, **kwargs)
@@ -1236,7 +1454,7 @@ class SpotifyProvider(MusicProvider):
                 try:
                     error = await response.json(loads=json_loads)
                     message = error.get("error", {}).get("message") or response.reason
-                except (aiohttp.ContentTypeError, JSONDecodeError):
+                except aiohttp.ContentTypeError, JSONDecodeError:
                     message = (await response.text()) or response.reason
 
                 self.logger.debug(
@@ -1368,5 +1586,29 @@ class SpotifyProvider(MusicProvider):
             if e.status == 403:
                 return False  # Not available
             raise  # Re-raise other HTTP errors
-        except (MediaNotFoundError, ProviderUnavailableError):
+        except MediaNotFoundError, ProviderUnavailableError:
             return False
+
+    def _stored_refresh_token(self, key: str) -> str | None:
+        """
+        Return the currently persisted refresh token, or None if not set.
+
+        Reads through the live setup_data (kept in sync with a just-rotated token) so a
+        refresh never uses a stale, revoked token from a lagging in-memory config copy.
+
+        :param key: Setup data key of the refresh token to read.
+        """
+        token = self.get_setup_value(key)
+        return cast("str", token) if token else None
+
+    def _refresh_token_superseded(self, key: str, used_token: str) -> bool:
+        """
+        Return whether the stored refresh token differs from the one just used.
+
+        :param key: Config key of the refresh token to check.
+        :param used_token: The refresh token value that was just used to refresh.
+        """
+        stored_token = self._stored_refresh_token(key)
+        if not stored_token:
+            return False
+        return stored_token != used_token

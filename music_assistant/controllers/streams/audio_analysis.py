@@ -14,15 +14,17 @@ from concurrent.futures import ThreadPoolExecutor
 from math import isfinite
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 from music_assistant_models.audio_analysis import AudioAnalysisCoverage
+from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import ContentType, MediaType, ProviderType, StreamType
 from music_assistant_models.errors import ProviderUnavailableError
+from music_assistant_models.media_items import AudioMetadata
 
 from music_assistant.constants import (
     CONF_BACKGROUND_SCAN_CONCURRENCY,
     DB_TABLE_AUDIO_ANALYSIS,
+    DB_TABLE_AUDIO_ANALYSIS_FAILURES,
     DB_TABLE_PROVIDER_MAPPINGS,
     DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
     LOUDNESS_MEASUREMENT_MIN_LUFS,
@@ -30,9 +32,9 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBufferDiscarded, AudioBufferEOF
 from music_assistant.helpers.api import api_command
-from music_assistant.helpers.datetime import local_clock_time_to_utc
+from music_assistant.helpers.datetime import local_clock_time_to_utc, utc_timestamp
 from music_assistant.helpers.json import json_dumps, json_loads
-from music_assistant.helpers.util import is_arm
+from music_assistant.helpers.util import inference_thread_budget, is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.audio_analysis_provider import (
     AudioAnalysisProvider,
@@ -46,6 +48,8 @@ START_ANALYSIS_TIMEOUT_SECONDS = 5.0
 LOUDNESS_ANALYSIS_DOMAIN = "loudness_analysis"
 SMART_FADES_ANALYSIS_DOMAIN = "smart_fades"
 SONIC_ANALYSIS_DOMAIN = "sonic_analysis"
+# AA domains trusted for frontend-facing track data (bpm/key/waveform), authoritative first.
+TRACK_EXPORT_AA_PRIORITY = (SMART_FADES_ANALYSIS_DOMAIN, SONIC_ANALYSIS_DOMAIN)
 BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 BACKGROUND_PER_TRACK_TIMEOUT_SECONDS = 300
 BACKGROUND_PER_TRACK_TIMEOUT_DURATION_MULTIPLIER = 1.5
@@ -81,6 +85,10 @@ REALTIME_ANALYSIS_MAX_SESSIONS = 2
 # ended stream is finalized. A source that ends far short of it (e.g. a stream that died
 # without raising an error) is discarded instead, so no truncated analysis is persisted.
 ANALYSIS_MIN_COMPLETENESS_RATIO = 0.9
+# Free the heavy analysis models after this long with no analysis activity; they are reloaded
+# on the next track. Long enough that gaps between tracks/sessions don't thrash the reload.
+MODEL_IDLE_UNLOAD_SECONDS = 300
+MODEL_IDLE_CHECK_INTERVAL_SECONDS = 60
 FILESYSTEM_PROVIDER_DOMAINS: tuple[str, ...] = (
     "filesystem_local",
     "filesystem_smb",
@@ -90,7 +98,9 @@ FILESYSTEM_PROVIDER_DOMAINS: tuple[str, ...] = (
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.audio_analysis")
 
 if TYPE_CHECKING:
-    from music_assistant_models.media_items import AudioFormat
+    from datetime import datetime
+
+    from music_assistant_models.media_items import AudioFormat, Track
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.controllers.streams.audio_buffer import AudioBuffer
@@ -193,9 +203,6 @@ def _first_non_finite_field(analysis: AudioAnalysisData) -> str | None:
         if isinstance(value, float):
             if not isfinite(value):
                 return fld.name
-        elif isinstance(value, np.ndarray):
-            if value.size and not np.isfinite(value).all():
-                return fld.name
         elif isinstance(value, list) and any(
             isinstance(item, float) and not isfinite(item) for item in value
         ):
@@ -234,9 +241,6 @@ class AudioAnalysisController:
         # per queue (concurrent queues don't evict each other's still-playing analysis).
         self._session_queues: dict[str, str] = {}
         self._inference_runtime_configured = False
-        # Kept alive to persist the process-wide native BLAS thread cap (set in
-        # ensure_inference_runtime_configured); never used as a context manager.
-        self._blas_limiter: object | None = None
         # Bounds how many analysis offloads run concurrently to half the cores; created in
         # ensure_inference_runtime_configured once the core count is known (None until then),
         # and honored by AudioAnalysisProvider._run_offloaded.
@@ -247,6 +251,9 @@ class AudioAnalysisController:
         # Niced worker pool that runs analysis offloads, so the lower priority applies to
         # analysis threads only; created in ensure_inference_runtime_configured.
         self.analysis_executor: ThreadPoolExecutor | None = None
+        # Monotonic time of the last analysis start, and the monitor that unloads idle models.
+        self._last_analysis_activity: float = 0.0
+        self._idle_unload_task: asyncio.Task[None] | None = None
 
     def setup(self) -> None:
         """Register the nightly background scan task."""
@@ -262,13 +269,16 @@ class AudioAnalysisController:
 
     async def close(self) -> None:
         """Drain in-flight sessions and chunk workers on shutdown."""
-        workers = list(self._workers.values())
+        tasks = list(self._workers.values())
         self._workers.clear()
-        for worker in workers:
-            if not worker.done():
-                worker.cancel()
+        if self._idle_unload_task is not None:
+            tasks.append(self._idle_unload_task)
+            self._idle_unload_task = None
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         # Await provider cancels inline (with a per-call timeout). `_cancel_providers`
-        # would fire-and-forget via mass.create_task — but mass.stop already cancelled
+        # would fire-and-forget via mass.create_task - but mass.stop already cancelled
         # tracked tasks before calling streams.close(), so those new tasks would race
         # event-loop shutdown and may not actually run.
         # This has to claim the sessions BEFORE awaiting the workers: each worker's
@@ -289,8 +299,8 @@ class AudioAnalysisController:
                     )
         if cancel_tasks:
             await asyncio.gather(*cancel_tasks, return_exceptions=True)
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._session_queues.clear()
         if self.analysis_executor is not None:
             # A running CPU-bound thread can't be cancelled, so shut down without waiting on it.
@@ -306,10 +316,9 @@ class AudioAnalysisController:
         """
         if self._inference_runtime_configured:
             return
-        # Lazy imports: only torch-backed providers call this, so a host running no such
-        # provider never imports torch/threadpoolctl. Running before the first model load
-        # also lets set_num_interop_threads take effect (only settable before the first op).
-        import threadpoolctl  # noqa: PLC0415
+        # Lazy import: only torch-backed providers call this, so a host running no such
+        # provider never imports torch. Running before the first model load also lets
+        # set_num_interop_threads take effect (only settable before the first op).
         import torch  # noqa: PLC0415
 
         budget = self._aa_thread_budget()
@@ -318,18 +327,16 @@ class AudioAnalysisController:
             # set_num_interop_threads can only be called before the first torch op
             torch.set_num_interop_threads(1)
         # torch.set_num_threads only governs torch's own ops. The per-block librosa/numpy
-        # feature extraction runs through the native BLAS pool (OpenBLAS), which otherwise
-        # spawns a thread per core per worker and, across concurrent sessions, saturates
-        # every core and starves playback. Cap it to the same budget; the limiter is kept
-        # alive on the controller so the cap persists for the process.
-        self._blas_limiter = threadpoolctl.threadpool_limits(limits=budget, user_api="blas")
+        # feature extraction runs through the native BLAS pool (OpenBLAS), which is capped to
+        # the same budget from the environment at process start (cap_native_thread_pools);
+        # it cannot be capped from here without deadlocking against a concurrent import.
         arm = is_arm()
         if arm:
             # NNPACK frequently fails to initialize on ARM SBCs (e.g. Raspberry Pi); torch
             # then re-logs "Could not initialize NNPACK" to stderr on every conv op. The fp32
             # conv fallback is used on those hosts regardless, so disabling it only removes
             # the log spam.
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(RuntimeError):
                 torch.backends.nnpack.set_flags(False)  # type: ignore[no-untyped-call]
         # Cap concurrent analysis offloads to half the cores so analysis (live or background)
         # never occupies the whole box and starves playback/the host — slow and steady on any
@@ -345,11 +352,11 @@ class AudioAnalysisController:
             initializer=_nice_analysis_worker,
         )
         self.logger.info(
-            "AudioAnalysis runtime: torch intra=%d interop=%d, blas<=%d, "
+            "AudioAnalysis runtime: torch intra=%d interop=%d, blas<=%s, "
             "analysis concurrency<=%d (1 while a player streams), nnpack=%s",
             torch.get_num_threads(),
             torch.get_num_interop_threads(),
-            budget,
+            os.environ.get("OPENBLAS_NUM_THREADS", "uncapped"),
             concurrency_cap,
             "off" if arm else "on",
         )
@@ -508,6 +515,92 @@ class AudioAnalysisController:
                 "analysis_version": analysis_version,
             },
         )
+        await self.clear_analysis_failure(
+            item_id=item_id,
+            provider_instance_id_or_domain=provider_instance_id_or_domain,
+            aa_provider_domain=aa_provider_domain,
+            media_type=media_type,
+        )
+
+    async def record_analysis_failure(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        aa_provider_domain: str,
+        reason: str,
+        retry_at: datetime | None = None,
+        analysis_version: int = 1,
+        media_type: MediaType = MediaType.TRACK,
+    ) -> None:
+        """
+        Record an analysis failure for a track.
+
+        No-op when the provider does not resolve to a loaded music provider.
+
+        :param item_id: Provider-native item ID from streamdetails.item_id.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        :param aa_provider_domain: Domain of the AA provider that failed.
+        :param reason: Human-readable failure reason.
+        :param retry_at: Timezone-aware datetime when to allow a retry; None (default)
+            means never auto-retry.
+        :param analysis_version: The AA provider's algorithm version at failure time.
+        :param media_type: The media type of the item.
+        """
+        provider = self.mass.get_provider(provider_instance_id_or_domain)
+        if not isinstance(provider, MusicProvider):
+            self.logger.debug(
+                "Skipping failure record for %s: not a loaded music provider",
+                provider_instance_id_or_domain,
+            )
+            return
+        prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
+        await self.mass.music.database.insert_or_replace(
+            DB_TABLE_AUDIO_ANALYSIS_FAILURES,
+            {
+                "media_type": media_type.value,
+                "item_id": item_id,
+                "provider": prov_key,
+                "aa_provider_domain": aa_provider_domain,
+                "reason": reason,
+                "analysis_version": analysis_version,
+                "next_retry": int(retry_at.timestamp()) if retry_at is not None else None,
+            },
+        )
+
+    async def clear_analysis_failure(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        aa_provider_domain: str,
+        media_type: MediaType = MediaType.TRACK,
+    ) -> None:
+        """
+        Delete a recorded analysis failure (e.g. after a later success).
+
+        No-op when the provider does not resolve to a loaded music provider.
+
+        :param item_id: Provider-native item ID from streamdetails.item_id.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        :param aa_provider_domain: Domain of the AA provider whose failure to clear.
+        :param media_type: The media type of the item.
+        """
+        provider = self.mass.get_provider(provider_instance_id_or_domain)
+        if not isinstance(provider, MusicProvider):
+            self.logger.debug(
+                "Skipping failure clear for %s: not a loaded music provider",
+                provider_instance_id_or_domain,
+            )
+            return
+        prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
+        await self.mass.music.database.delete(
+            DB_TABLE_AUDIO_ANALYSIS_FAILURES,
+            {
+                "item_id": item_id,
+                "provider": prov_key,
+                "aa_provider_domain": aa_provider_domain,
+                "media_type": media_type.value,
+            },
+        )
 
     async def get_audio_analysis(
         self,
@@ -566,6 +659,53 @@ class AudioAnalysisController:
                 item_id,
             )
         return merged
+
+    async def get_track_audio_metadata(self, track: Track) -> AudioMetadata | None:
+        """
+        Return AudioMetadata (bpm, musical key) for a track, or None when no analysis exists.
+
+        Provider mappings are tried best-quality first; per field the Smart Fades AA
+        provider is preferred over other AA providers.
+
+        :param track: The track to look up stored analysis data for.
+        """
+        priority = TRACK_EXPORT_AA_PRIORITY
+        for mapping in sorted(track.provider_mappings, key=lambda m: m.quality, reverse=True):
+            analysis = await self.get_audio_analysis(
+                mapping.item_id, mapping.provider_instance, priority=priority
+            )
+            if analysis is None or (analysis.bpm is None and analysis.key is None):
+                continue
+            musical_key: str | None = None
+            if analysis.key is not None:
+                musical_key = f"{analysis.key} {analysis.mode}" if analysis.mode else analysis.key
+            return AudioMetadata(bpm=analysis.bpm, musical_key=musical_key)
+        return None
+
+    @api_command("audio_analysis/wave_form")
+    async def get_wave_form(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+    ) -> list[float] | None:
+        """
+        Return the RMS energy waveform for a track, or None when no analysis exists.
+
+        The waveform is a fixed array of 1800 bins (normalized 0.0-1.0) evenly covering
+        the track duration. Values come from the Smart Fades AA provider when available,
+        falling back to any other AA provider that stored RMS energy.
+
+        :param item_id: Provider-native item ID.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        """
+        analysis = await self.get_audio_analysis(
+            item_id,
+            provider_instance_id_or_domain,
+            priority=TRACK_EXPORT_AA_PRIORITY,
+        )
+        if analysis is None or analysis.rms_energy is None:
+            return None
+        return [float(value) for value in analysis.rms_energy]
 
     async def set_track_loudness(
         self,
@@ -656,7 +796,7 @@ class AudioAnalysisController:
         for row in rows:
             try:
                 data = json_loads(row["analysis_data"])
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 continue
             if not isinstance(data, dict):
                 continue
@@ -809,7 +949,7 @@ class AudioAnalysisController:
             if merged is not None:
                 yield (*current_key, merged)
 
-    @api_command("audio_analysis/coverage")
+    @api_command("audio_analysis/coverage", required_scope=Scope.SYSTEM_MANAGE)
     async def get_coverage(self, aa_domain: str) -> AudioAnalysisCoverage:
         """
         Return analysis-coverage health counts for an AA provider.
@@ -852,6 +992,62 @@ class AudioAnalysisController:
             stale_version=stale_version,
             analysis_version=provider.analysis_version,
         )
+
+    @api_command("audio_analysis/failures", required_scope=Scope.SYSTEM_MANAGE)
+    async def get_failures(self, aa_domain: str | None = None) -> list[dict[str, Any]]:
+        """
+        Return recorded analysis failures, optionally filtered by AA provider domain.
+
+        :param aa_domain: When given, only failures for this AA provider domain are returned.
+        """
+        match = {"aa_provider_domain": aa_domain} if aa_domain is not None else None
+        rows = await self.mass.music.database.get_rows(
+            DB_TABLE_AUDIO_ANALYSIS_FAILURES, match, limit=0
+        )
+        return [
+            {
+                "item_id": r["item_id"],
+                "provider": r["provider"],
+                "aa_provider_domain": r["aa_provider_domain"],
+                "reason": r["reason"],
+                "next_retry": r["next_retry"],
+                "timestamp_created": r["timestamp_created"],
+            }
+            for r in rows
+        ]
+
+    @api_command("audio_analysis/failures/clear", required_scope=Scope.SYSTEM_MANAGE)
+    async def clear_failures(
+        self,
+        item_id: str | None = None,
+        provider: str | None = None,
+        aa_domain: str | None = None,
+    ) -> int:
+        """
+        Delete recorded failures matching the given filters; returns the number deleted.
+
+        At least one filter is required; a call with all filters None deletes nothing.
+
+        :param item_id: Provider-native item ID to clear.
+        :param provider: Stored music-provider key (domain or instance_id) to clear.
+        :param aa_domain: AA provider domain to clear.
+        """
+        match: dict[str, Any] = {}
+        if item_id is not None:
+            match["item_id"] = item_id
+        if provider is not None:
+            match["provider"] = provider
+        if aa_domain is not None:
+            match["aa_provider_domain"] = aa_domain
+        if not match:
+            return 0
+        rows = await self.mass.music.database.get_rows(
+            DB_TABLE_AUDIO_ANALYSIS_FAILURES, match, limit=0
+        )
+        count = len(rows)
+        if count:
+            await self.mass.music.database.delete(DB_TABLE_AUDIO_ANALYSIS_FAILURES, match)
+        return count
 
     async def _run_background_scan(self) -> None:
         """Run the scan as decode-once-fan-out streaming over candidate tracks."""
@@ -1132,18 +1328,19 @@ class AudioAnalysisController:
         """
         Return tracks that need (re)analysis for one or more AA providers.
 
-        A track is a candidate for a given AA provider domain when it has no
-        analysis row for that domain, or when its stored row predates the
-        provider's current analysis_version (a NULL stored version, from
-        pre-versioning rows, is also treated as stale). This mirrors the
-        per-track version gate in AudioAnalysisProvider.start_analysis so a
-        provider bumping its analysis_version triggers a background re-scan.
+        A track is a candidate for a given AA provider domain when it has no analysis row for
+        that domain, when its stored row predates the provider's current analysis_version (a
+        NULL stored version, from pre-versioning rows, is also treated as stale), and when no
+        blocking failure row exists (a failure at the current-or-newer analysis_version whose
+        retry is NULL or still in the future). The version check mirrors the per-track gate in
+        AudioAnalysisProvider.start_analysis so a provider bumping its analysis_version triggers
+        a background re-scan.
 
-        :param aa_provider_versions: Mapping of AA provider domain to the
-            provider's current analysis_version.
+        :param aa_provider_versions: Mapping of AA provider domain to the provider's current
+            analysis_version.
         :param limit: Maximum number of candidate rows to return (0 for no limit).
-        :returns: Rows {item_id, provider_instance, missing_domains} where
-            missing_domains lists the AA provider domains needing analysis.
+        :returns: Rows {item_id, provider_instance, missing_domains} where missing_domains
+            lists the AA provider domains needing analysis.
         """
         if not aa_provider_versions:
             return []
@@ -1152,8 +1349,10 @@ class AudioAnalysisController:
         if not filesystem_domains:
             return []
 
-        # CROSS JOIN (track x possible domain), keep pairs with no up-to-date analysis
-        # row, GROUP_CONCAT the missing domains per track.
+        # CROSS JOIN (track x possible domain), keep pairs with no up-to-date analysis row and
+        # no blocking failure row, then GROUP_CONCAT the missing domains per track. An analysis
+        # row counts as up-to-date only when its analysis_version is non-NULL and >= the
+        # provider's current version, so missing and stale-version rows both surface.
         # Filesystem domains are bound as :fs_N params (rather than spliced into
         # the SQL) for defense in depth; the values today come from a trusted
         # constant, but a future contributor adding a domain string with a
@@ -1166,6 +1365,7 @@ class AudioAnalysisController:
         )
         params: dict[str, Any] = {
             "media_type": MediaType.TRACK.value,
+            "now": int(utc_timestamp()),
             **{f"aa_{i}": d for i, d in enumerate(aa_domains)},
             **{f"ver_{i}": aa_provider_versions[d] for i, d in enumerate(aa_domains)},
             **{f"fs_{i}": d for i, d in enumerate(filesystem_domains)},
@@ -1190,6 +1390,15 @@ class AudioAnalysisController:
             f"      AND aa.analysis_version IS NOT NULL "
             f"      AND aa.analysis_version >= possible.current_version"
             f"  ) "
+            f"  AND NOT EXISTS ("
+            f"    SELECT 1 FROM {DB_TABLE_AUDIO_ANALYSIS_FAILURES} f "
+            f"    WHERE f.item_id = pm.provider_item_id "
+            f"      AND f.provider = pm.provider_instance "
+            f"      AND f.aa_provider_domain = possible.aa_provider_domain "
+            f"      AND f.media_type = :media_type "
+            f"      AND f.analysis_version >= possible.current_version "
+            f"      AND (f.next_retry IS NULL OR f.next_retry > :now)"
+            f"  ) "
             f"GROUP BY pm.provider_item_id, pm.provider_instance"
         )
         rows = await self.mass.music.database.get_rows_from_query(query, params, limit=limit)
@@ -1208,11 +1417,7 @@ class AudioAnalysisController:
         return results
 
     async def _count_candidates_missing_analysis(self, aa_domain: str, current_version: int) -> int:
-        """Count filesystem candidate tracks needing (re)analysis for aa_domain.
-
-        A track is counted when it has no analysis row for the domain, or when
-        its stored analysis_version is NULL or less than current_version.
-        """
+        """Count filesystem candidate tracks lacking a current analysis row or blocking failure."""
         filesystem_domains = self._available_filesystem_domains()
         if not filesystem_domains:
             return 0
@@ -1229,6 +1434,15 @@ class AudioAnalysisController:
             f"      AND aa.media_type = :media_type "
             f"      AND aa.analysis_version IS NOT NULL "
             f"      AND aa.analysis_version >= :current_version"
+            f"  ) "
+            f"  AND NOT EXISTS ("
+            f"    SELECT 1 FROM {DB_TABLE_AUDIO_ANALYSIS_FAILURES} f "
+            f"    WHERE f.item_id = pm.provider_item_id "
+            f"      AND f.provider = pm.provider_instance "
+            f"      AND f.aa_provider_domain = :aa_domain "
+            f"      AND f.media_type = :media_type "
+            f"      AND f.analysis_version >= :current_version "
+            f"      AND (f.next_retry IS NULL OR f.next_retry > :now)"
             f"  )"
         )
         return await self.mass.music.database.get_count_from_query(
@@ -1237,6 +1451,7 @@ class AudioAnalysisController:
                 "media_type": MediaType.TRACK.value,
                 "aa_domain": aa_domain,
                 "current_version": current_version,
+                "now": int(utc_timestamp()),
             },
         )
 
@@ -1248,6 +1463,7 @@ class AudioAnalysisController:
         providers: list[AudioAnalysisProvider],
     ) -> set[str]:
         """Call start_analysis on each provider, returning IDs of those that accepted."""
+        self._mark_analysis_activity()
         provider_ids: set[str] = set()
         # Bound each provider's start_analysis: AudioBuffer.get_buffer awaits this
         # synchronously during playback setup, so a hung provider (torch model
@@ -1271,6 +1487,8 @@ class AudioAnalysisController:
                 )
                 continue
             except Exception as err:
+                # provider.start_analysis is provider-implemented; skip the one that
+                # fails to start and keep the rest of the session going.
                 self.logger.warning(
                     "Failed to start analysis on provider %s: %s", provider.name, err
                 )
@@ -1307,6 +1525,35 @@ class AudioAnalysisController:
         self._cancel_providers(session_key)
         self.logger.debug("Stopped realtime analysis session %s", session_key)
 
+    def _mark_analysis_activity(self) -> None:
+        """Record analysis activity and ensure the idle-model monitor is running."""
+        self._last_analysis_activity = time.monotonic()
+        if self._idle_unload_task is None or self._idle_unload_task.done():
+            self._idle_unload_task = self.mass.create_task(self._monitor_idle_models())
+
+    async def _monitor_idle_models(self) -> None:
+        """Unload heavy models once no analysis has run for MODEL_IDLE_UNLOAD_SECONDS."""
+        while True:
+            await asyncio.sleep(MODEL_IDLE_CHECK_INTERVAL_SECONDS)
+            if self._active_sessions:
+                # Keep the timer fresh while analysis is running.
+                self._last_analysis_activity = time.monotonic()
+                continue
+            if time.monotonic() - self._last_analysis_activity < MODEL_IDLE_UNLOAD_SECONDS:
+                continue
+            await self._unload_idle_models()
+            return  # stop until the next analysis restarts the monitor
+
+    async def _unload_idle_models(self) -> None:
+        """Free heavy models on every provider that supports unloading them."""
+        for provider in self.providers:
+            if not provider.has_unloadable_models:
+                continue
+            try:
+                await provider.unload_idle_models()
+            except Exception as err:
+                self.logger.warning("Failed to unload models for %s: %s", provider.name, err)
+
     async def _distribute_chunk(
         self,
         session_key: str,
@@ -1338,13 +1585,25 @@ class AudioAnalysisController:
                     timeout=max_interval,
                 )
             except TimeoutError:
+                sem = self.analysis_semaphore
+                contention = (
+                    f"{sem.in_flight}/{sem.capacity} permits in use, {sem.waiters} queued"
+                    if isinstance(sem, InstrumentedSemaphore)
+                    else "concurrency gauge unavailable"
+                )
                 self.logger.warning(
-                    "Provider %s timed out processing chunk for %s, removing from session",
+                    "Provider %s timed out after %.1fs processing chunk for %s "
+                    "(%s, %d active sessions), removing from session",
                     prov_id,
+                    max_interval,
                     session_key,
+                    contention,
+                    len(self._active_sessions),
                 )
                 return prov_id
             except Exception as err:
+                # process_pcm_chunk is provider-implemented (torch/numpy/ffmpeg); evict
+                # the provider that fails on a chunk rather than crashing the session.
                 self.logger.warning("Error processing PCM chunk on provider %s: %s", prov_id, err)
                 return prov_id
             return None
@@ -1438,7 +1697,8 @@ class AudioAnalysisController:
 
     def _aa_thread_budget(self) -> int:
         """Return the per-op PyTorch intra-op thread budget for inference (~25% of cpu_count)."""
-        return max(1, self._cpu_count() // 4)
+        # Shared with the native BLAS cap applied at process start, so torch and BLAS agree.
+        return inference_thread_budget()
 
     def _get_scan_concurrency(self) -> int:
         """Read background scan concurrency from config, clamped to [1, 16]."""
@@ -1451,6 +1711,6 @@ class AudioAnalysisController:
                 )
                 or DEFAULT_BACKGROUND_SCAN_CONCURRENCY
             )
-        except Exception:
+        except ValueError, TypeError:
             value = DEFAULT_BACKGROUND_SCAN_CONCURRENCY
         return max(1, min(value, 16))

@@ -38,7 +38,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -59,6 +61,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -72,7 +75,7 @@
     }),
     'name': 'Infest',
     'position': None,
-    'provider': 'jellyfin',
+    'provider': 'xx-instance-id-xx',
     'provider_mappings': list([
       dict({
         'audio_format': dict({
@@ -95,8 +98,7 @@
       }),
     ]),
     'sort_name': 'infest',
-    'translation_key': None,
-    'uri': 'jellyfin://album/70b7288088b42d318f75dbcc41fd0091',
+    'uri': 'xx-instance-id-xx://album/70b7288088b42d318f75dbcc41fd0091',
     'version': '',
     'year': 2000,
   })
@@ -140,7 +142,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -161,6 +165,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -174,7 +179,7 @@
     }),
     'name': 'Nu-Clear Sounds',
     'position': None,
-    'provider': 'jellyfin',
+    'provider': 'xx-instance-id-xx',
     'provider_mappings': list([
       dict({
         'audio_format': dict({
@@ -197,8 +202,7 @@
       }),
     ]),
     'sort_name': 'nu-clear sounds',
-    'translation_key': None,
-    'uri': 'jellyfin://album/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
+    'uri': 'xx-instance-id-xx://album/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4',
     'version': '',
     'year': 1998,
   })
@@ -242,7 +246,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -263,6 +269,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -276,7 +283,7 @@
     }),
     'name': 'This Is Christmas',
     'position': None,
-    'provider': 'jellyfin',
+    'provider': 'xx-instance-id-xx',
     'provider_mappings': list([
       dict({
         'audio_format': dict({
@@ -299,8 +306,7 @@
       }),
     ]),
     'sort_name': 'this is christmas',
-    'translation_key': None,
-    'uri': 'jellyfin://album/32ed6a0091733dcff57eae67010f3d4b',
+    'uri': 'xx-instance-id-xx://album/32ed6a0091733dcff57eae67010f3d4b',
     'version': '',
     'year': 2011,
   })
@@ -318,10 +324,10 @@
         'item_id': '[unknown]',
         'media_type': 'artist',
         'name': '[unknown]',
-        'provider': 'jellyfin',
+        'provider': 'xx-instance-id-xx',
         'sort_name': 'unknown]',
         'translation_key': None,
-        'uri': 'jellyfin://artist/[unknown]',
+        'uri': 'xx-instance-id-xx://artist/[unknown]',
         'version': '',
         'year': None,
       }),
@@ -336,7 +342,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -350,6 +358,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -363,7 +372,7 @@
     }),
     'name': 'Yesterday, When I Was Mad [Disc 2]',
     'position': None,
-    'provider': 'jellyfin',
+    'provider': 'xx-instance-id-xx',
     'provider_mappings': list([
       dict({
         'audio_format': dict({
@@ -386,8 +395,7 @@
       }),
     ]),
     'sort_name': 'yesterday when i was mad [disc 0000000002]',
-    'translation_key': None,
-    'uri': 'jellyfin://album/7c8d0bd55291c7fc0451d17ebef30017',
+    'uri': 'xx-instance-id-xx://album/7c8d0bd55291c7fc0451d17ebef30017',
     'version': '',
     'year': None,
   })
@@ -409,7 +417,9 @@
     'listen_later_added_at': None,
     'media_type': 'artist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -444,6 +454,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -457,7 +468,7 @@
     }),
     'name': 'Ash',
     'position': None,
-    'provider': 'jellyfin',
+    'provider': 'xx-instance-id-xx',
     'provider_mappings': list([
       dict({
         'audio_format': dict({
@@ -480,8 +491,7 @@
       }),
     ]),
     'sort_name': 'ash',
-    'translation_key': None,
-    'uri': 'jellyfin://artist/dd954bbf54398e247d803186d3585b79',
+    'uri': 'xx-instance-id-xx://artist/dd954bbf54398e247d803186d3585b79',
     'version': '',
   })
 # ---
@@ -521,6 +531,7 @@
         'year': None,
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 1,
     'duration': 272,
@@ -534,7 +545,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -555,6 +568,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -592,7 +606,6 @@
     ]),
     'sort_name': 'do i wanna know?',
     'track_number': 1,
-    'translation_key': None,
     'uri': 'xx-instance-id-xx://track/da9c458e425584680765ddc3a89cbc0c',
     'version': '',
   })
@@ -625,14 +638,15 @@
         'item_id': '[unknown]',
         'media_type': 'artist',
         'name': '[unknown]',
-        'provider': 'jellyfin',
+        'provider': 'xx-instance-id-xx',
         'sort_name': 'unknown]',
         'translation_key': None,
-        'uri': 'jellyfin://artist/[unknown]',
+        'uri': 'xx-instance-id-xx://artist/[unknown]',
         'version': '',
         'year': None,
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 577,
@@ -646,7 +660,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -660,6 +676,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -697,7 +714,6 @@
     ]),
     'sort_name': '11 thrown away',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'xx-instance-id-xx://track/b5319fb11cde39fca2023184fcfa9862',
     'version': '',
   })
@@ -723,6 +739,7 @@
         'year': None,
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 1,
     'duration': 246,
@@ -736,7 +753,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -757,6 +776,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -794,7 +814,6 @@
     ]),
     'sort_name': 'where the bands are',
     'track_number': 1,
-    'translation_key': None,
     'uri': 'xx-instance-id-xx://track/54918f75ee8f6c8b8dc5efd680644f29',
     'version': '2018 Version',
   })
@@ -851,6 +870,7 @@
         'year': None,
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 1,
     'duration': 224,
@@ -868,7 +888,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': None,
@@ -889,6 +911,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': None,
       'lrc_lyrics': None,
       'lyrics': None,
@@ -926,7 +949,6 @@
     ]),
     'sort_name': 'zombie christmas',
     'track_number': 8,
-    'translation_key': None,
     'uri': 'xx-instance-id-xx://track/fb12a77f49616a9fc56a6fab2b94174c',
     'version': '',
   })

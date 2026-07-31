@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from music_assistant_models.enums import MediaType, StreamType
 from music_assistant_models.errors import UnplayableMediaError
 from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
-from niconico.objects.video.watch import (  # Using by StreamConversionData(BaseModel Serialization)
+from niconico.objects.video.watch import (  # noqa: TC002 - Using by StreamConversionData(BaseModel Serialization)
     WatchData,
     WatchMediaDomandAudio,
 )
@@ -20,7 +20,8 @@ from music_assistant.providers.nicovideo.helpers import create_audio_format
 
 @dataclass
 class NicovideoStreamData:
-    """Type-safe container for nicovideo HLS streaming data.
+    """
+    Type-safe container for nicovideo HLS streaming data.
 
     This dataclass is stored in StreamDetails.data to pass
     HLS-specific information to get_audio_stream().
@@ -45,14 +46,16 @@ class StreamConversionData(BaseModel):
 
 
 class NicovideoStreamConverter(NicovideoConverterBase):
-    """Handles StreamDetails conversion for nicovideo.
+    """
+    Handles StreamDetails conversion for nicovideo.
 
     This converter transforms nicovideo video data into MusicAssistant StreamDetails
     using StreamType.CUSTOM for optimized HLS streaming with fast seeking support.
     """
 
     def convert_from_conversion_data(self, conversion_data: StreamConversionData) -> StreamDetails:
-        """Convert StreamConversionData into StreamDetails.
+        """
+        Convert StreamConversionData into StreamDetails.
 
         Args:
             conversion_data: Data containing video info, audio selection, and HLS details

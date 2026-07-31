@@ -33,6 +33,9 @@ class AnnounceData(TypedDict):
     announcement_url: str
     pre_announce: bool
     pre_announce_url: str
+    # player that fetches the announcement stream when it is not the
+    # visible player itself (e.g. a linked protocol player)
+    announce_player_id: str | None
 
 
 @overload
@@ -149,7 +152,8 @@ async def wait_for_power_on(
     player_control: PlayerControl | None = None,
     timeout: float = 5.0,
 ) -> None:
-    """Wait for a player (or player control) to report powered on after a power on command.
+    """
+    Wait for a player (or player control) to report powered on after a power on command.
 
     :param logger: Logger instance for debug logging.
     :param player: The player to wait for (checked when player_control is None).

@@ -15,7 +15,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -28,6 +30,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': None,
           'lrc_lyrics': None,
           'lyrics': None,
@@ -64,7 +67,6 @@
           }),
         ]),
         'sort_name': '',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
@@ -79,7 +81,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -92,6 +96,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -133,7 +138,6 @@
       }),
     ]),
     'sort_name': 'テストシリース68461151-527007',
-    'translation_key': None,
     'uri': 'nicovideo_test://album/527007',
     'version': '',
     'year': None,
@@ -156,7 +160,9 @@
           'listen_later_added_at': None,
           'media_type': 'artist',
           'metadata': dict({
+            'artist_entity_type': None,
             'chapters': None,
+            'collections': None,
             'copyright': None,
             'critical_reception': None,
             'description': None,
@@ -169,6 +175,7 @@
             'label': None,
             'languages': None,
             'last_refresh': None,
+            'life_span': None,
             'links': None,
             'lrc_lyrics': None,
             'lyrics': None,
@@ -205,7 +212,6 @@
             }),
           ]),
           'sort_name': 'ケスト',
-          'translation_key': None,
           'uri': 'nicovideo_test://artist/68461151',
           'version': '',
         }),
@@ -220,7 +226,9 @@
       'listen_later_added_at': None,
       'media_type': 'album',
       'metadata': dict({
+        'artist_entity_type': None,
         'chapters': None,
+        'collections': None,
         'copyright': None,
         'critical_reception': None,
         'description': 'This is a dummy description for testing purposes.',
@@ -233,6 +241,7 @@
         'label': None,
         'languages': None,
         'last_refresh': None,
+        'life_span': None,
         'links': list([
           dict({
             'type': 'website',
@@ -274,7 +283,6 @@
         }),
       ]),
       'sort_name': 'テストシリース68461151-527007',
-      'translation_key': None,
       'uri': 'nicovideo_test://album/527007',
       'version': '',
       'year': None,
@@ -295,7 +303,9 @@
             'listen_later_added_at': None,
             'media_type': 'artist',
             'metadata': dict({
+              'artist_entity_type': None,
               'chapters': None,
+              'collections': None,
               'copyright': None,
               'critical_reception': None,
               'description': None,
@@ -316,6 +326,7 @@
               'label': None,
               'languages': None,
               'last_refresh': None,
+              'life_span': None,
               'links': list([
                 dict({
                   'type': 'website',
@@ -357,11 +368,11 @@
               }),
             ]),
             'sort_name': 'ケスト',
-            'translation_key': None,
             'uri': 'nicovideo_test://artist/68461151',
             'version': '',
           }),
         ]),
+        'audio_metadata': None,
         'date_added': None,
         'disc_number': 0,
         'duration': 2,
@@ -375,7 +386,9 @@
         'listen_later_added_at': None,
         'media_type': 'track',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': 'This is a dummy description for testing purposes.',
@@ -403,6 +416,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -445,7 +459,6 @@
         ]),
         'sort_name': 'apiテスト用',
         'track_number': 0,
-        'translation_key': None,
         'uri': 'nicovideo_test://track/sm45285955',
         'version': '',
       }),
@@ -468,7 +481,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -481,6 +496,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': None,
           'lrc_lyrics': None,
           'lyrics': None,
@@ -517,7 +533,6 @@
           }),
         ]),
         'sort_name': '',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
@@ -532,7 +547,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -545,6 +562,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -586,7 +604,6 @@
       }),
     ]),
     'sort_name': 'テストシリース68461151-527007',
-    'translation_key': None,
     'uri': 'nicovideo_test://album/527007',
     'version': '',
     'year': None,
@@ -605,7 +622,9 @@
     'listen_later_added_at': None,
     'media_type': 'artist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -626,6 +645,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -667,7 +687,6 @@
       }),
     ]),
     'sort_name': '中の',
-    'translation_key': None,
     'uri': 'nicovideo_test://artist/4',
     'version': '',
   })
@@ -685,7 +704,9 @@
     'listen_later_added_at': None,
     'media_type': 'artist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -706,6 +727,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -747,7 +769,6 @@
       }),
     ]),
     'sort_name': 'ケスト',
-    'translation_key': None,
     'uri': 'nicovideo_test://artist/68461151',
     'version': '',
   })
@@ -768,7 +789,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -789,6 +812,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -830,11 +854,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -848,7 +872,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -876,6 +902,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -918,7 +945,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -939,7 +965,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -960,6 +988,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -1001,11 +1030,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -1019,7 +1048,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1047,6 +1078,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1089,7 +1121,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -1108,7 +1139,9 @@
     'listen_later_added_at': None,
     'media_type': 'playlist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1129,6 +1162,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1175,6 +1209,7 @@
       'track',
     ]),
     'translation_key': None,
+    'translation_params': None,
     'uri': 'nicovideo_test://playlist/78597499',
     'version': '',
   })
@@ -1193,7 +1228,9 @@
     'listen_later_added_at': None,
     'media_type': 'playlist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1214,6 +1251,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1260,6 +1298,7 @@
       'track',
     ]),
     'translation_key': None,
+    'translation_params': None,
     'uri': 'nicovideo_test://playlist/78597499',
     'version': '',
   })
@@ -1279,7 +1318,9 @@
       'listen_later_added_at': None,
       'media_type': 'playlist',
       'metadata': dict({
+        'artist_entity_type': None,
         'chapters': None,
+        'collections': None,
         'copyright': None,
         'critical_reception': None,
         'description': 'This is a dummy description for testing purposes.',
@@ -1300,6 +1341,7 @@
         'label': None,
         'languages': None,
         'last_refresh': None,
+        'life_span': None,
         'links': list([
           dict({
             'type': 'website',
@@ -1346,6 +1388,7 @@
         'track',
       ]),
       'translation_key': None,
+      'translation_params': None,
       'uri': 'nicovideo_test://playlist/78597499',
       'version': '',
     }),
@@ -1365,7 +1408,9 @@
             'listen_later_added_at': None,
             'media_type': 'artist',
             'metadata': dict({
+              'artist_entity_type': None,
               'chapters': None,
+              'collections': None,
               'copyright': None,
               'critical_reception': None,
               'description': None,
@@ -1386,6 +1431,7 @@
               'label': None,
               'languages': None,
               'last_refresh': None,
+              'life_span': None,
               'links': list([
                 dict({
                   'type': 'website',
@@ -1427,11 +1473,11 @@
               }),
             ]),
             'sort_name': 'ケスト',
-            'translation_key': None,
             'uri': 'nicovideo_test://artist/68461151',
             'version': '',
           }),
         ]),
+        'audio_metadata': None,
         'date_added': None,
         'disc_number': 0,
         'duration': 2,
@@ -1445,7 +1491,9 @@
         'listen_later_added_at': None,
         'media_type': 'track',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': 'This is a dummy description for testing purposes.',
@@ -1473,6 +1521,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -1515,7 +1564,6 @@
         ]),
         'sort_name': 'apiテスト用',
         'track_number': 0,
-        'translation_key': None,
         'uri': 'nicovideo_test://track/sm45285955',
         'version': '',
       }),
@@ -1536,7 +1584,9 @@
     'listen_later_added_at': None,
     'media_type': 'playlist',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1557,6 +1607,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1603,6 +1654,7 @@
       'track',
     ]),
     'translation_key': None,
+    'translation_params': None,
     'uri': 'nicovideo_test://playlist/78597499',
     'version': '',
   })
@@ -1623,7 +1675,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -1636,6 +1690,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': None,
           'lrc_lyrics': None,
           'lyrics': None,
@@ -1672,7 +1727,6 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
@@ -1687,7 +1741,9 @@
     'listen_later_added_at': None,
     'media_type': 'album',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1700,6 +1756,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1741,7 +1798,6 @@
       }),
     ]),
     'sort_name': 'テストシリース68461151-527007',
-    'translation_key': None,
     'uri': 'nicovideo_test://album/527007',
     'version': '',
     'year': None,
@@ -1763,7 +1819,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -1784,6 +1842,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -1825,11 +1884,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -1843,7 +1902,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -1871,6 +1932,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -1913,7 +1975,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -1934,7 +1995,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -1955,6 +2018,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -1996,11 +2060,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -2014,7 +2078,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -2042,6 +2108,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -2084,7 +2151,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -2100,7 +2166,7 @@
       'output_format_str': 'mp4',
       'sample_rate': 48000,
     }),
-    'dsp': None,
+    'audio_processing': None,
     'duration': 2,
     'item_id': 'sm45285955',
     'loudness': -7000.0,
@@ -2143,7 +2209,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -2164,6 +2232,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -2205,11 +2274,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -2223,7 +2292,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -2251,6 +2322,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -2293,7 +2365,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -2314,7 +2385,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -2335,6 +2408,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -2376,11 +2450,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -2394,7 +2468,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -2422,6 +2498,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -2464,7 +2541,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })
@@ -2486,7 +2562,9 @@
           'listen_later_added_at': None,
           'media_type': 'artist',
           'metadata': dict({
+            'artist_entity_type': None,
             'chapters': None,
+            'collections': None,
             'copyright': None,
             'critical_reception': None,
             'description': None,
@@ -2507,6 +2585,7 @@
             'label': None,
             'languages': None,
             'last_refresh': None,
+            'life_span': None,
             'links': list([
               dict({
                 'type': 'website',
@@ -2548,7 +2627,6 @@
             }),
           ]),
           'sort_name': 'ケスト',
-          'translation_key': None,
           'uri': 'nicovideo_test://artist/68461151',
           'version': '',
         }),
@@ -2563,7 +2641,9 @@
       'listen_later_added_at': None,
       'media_type': 'album',
       'metadata': dict({
+        'artist_entity_type': None,
         'chapters': None,
+        'collections': None,
         'copyright': None,
         'critical_reception': None,
         'description': 'This is a dummy description for testing purposes.',
@@ -2576,6 +2656,7 @@
         'label': None,
         'languages': None,
         'last_refresh': None,
+        'life_span': None,
         'links': list([
           dict({
             'type': 'website',
@@ -2617,7 +2698,6 @@
         }),
       ]),
       'sort_name': 'テストシリース68461151-527007',
-      'translation_key': None,
       'uri': 'nicovideo_test://album/527007',
       'version': '',
       'year': None,
@@ -2635,7 +2715,9 @@
         'listen_later_added_at': None,
         'media_type': 'artist',
         'metadata': dict({
+          'artist_entity_type': None,
           'chapters': None,
+          'collections': None,
           'copyright': None,
           'critical_reception': None,
           'description': None,
@@ -2656,6 +2738,7 @@
           'label': None,
           'languages': None,
           'last_refresh': None,
+          'life_span': None,
           'links': list([
             dict({
               'type': 'website',
@@ -2697,11 +2780,11 @@
           }),
         ]),
         'sort_name': 'ケスト',
-        'translation_key': None,
         'uri': 'nicovideo_test://artist/68461151',
         'version': '',
       }),
     ]),
+    'audio_metadata': None,
     'date_added': None,
     'disc_number': 0,
     'duration': 2,
@@ -2715,7 +2798,9 @@
     'listen_later_added_at': None,
     'media_type': 'track',
     'metadata': dict({
+      'artist_entity_type': None,
       'chapters': None,
+      'collections': None,
       'copyright': None,
       'critical_reception': None,
       'description': 'This is a dummy description for testing purposes.',
@@ -2754,6 +2839,7 @@
       'label': None,
       'languages': None,
       'last_refresh': None,
+      'life_span': None,
       'links': list([
         dict({
           'type': 'website',
@@ -2796,7 +2882,6 @@
     ]),
     'sort_name': 'apiテスト用',
     'track_number': 0,
-    'translation_key': None,
     'uri': 'nicovideo_test://track/sm45285955',
     'version': '',
   })

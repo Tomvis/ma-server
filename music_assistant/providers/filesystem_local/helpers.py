@@ -10,7 +10,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from music_assistant_models.errors import MediaNotFoundError
+
 from music_assistant.helpers.compare import compare_strings
+from music_assistant.helpers.security import is_safe_path
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +30,12 @@ IGNORE_DIRS = (
 
 @dataclass
 class FileSystemItem:
-    """Representation of an item (file or directory) on the filesystem.
+    """
+    Representation of an item (file or directory) on the filesystem.
 
     - filename: Name (not path) of the file (or directory).
     - relative_path: Relative path to the item on this filesystem provider.
     - absolute_path: Absolute path to this item.
-    - parent_path: Absolute path to the parent directory.
     - is_dir: Boolean if item is directory (not file).
     - checksum: Checksum for this path (usually last modified time) None for dir.
     - file_size : File size in number of bytes or None if unknown (or not a file).
@@ -62,14 +65,11 @@ class FileSystemItem:
         return self.filename.rsplit(".", 1)[0]
 
     @property
-    def parent_path(self) -> str:
-        """Return parent path of this item."""
-        return os.path.dirname(self.absolute_path)
-
-    @property
     def parent_name(self) -> str:
-        """Return parent name of this item."""
-        return Path(self.parent_path).name
+        """Return the name of this item's parent directory."""
+        # derived from the relative path: the absolute path may be a URL on
+        # network/cloud providers (webdav, cloud filesystems)
+        return Path(self.relative_parent_path).name
 
     @property
     def relative_parent_path(self) -> str:
@@ -78,7 +78,8 @@ class FileSystemItem:
 
     @classmethod
     def from_dir_entry(cls, entry: os.DirEntry[str], base_path: str) -> FileSystemItem:
-        """Create FileSystemItem from os.DirEntry. NOT Async friendly.
+        """
+        Create FileSystemItem from os.DirEntry. NOT Async friendly.
 
         :raises OSError: If the file cannot be stat'd (e.g., invalid filename encoding).
         """
@@ -136,7 +137,8 @@ def tokenize(input_str: str, delimiters: str) -> list[str]:
 
 
 def _dir_contains_album_name(id3_album_name: str, directory_name: str) -> bool:
-    """Check if a directory name contains an album name.
+    """
+    Check if a directory name contains an album name.
 
     This function tokenizes both input strings using different delimiters and
     checks if the album name is a substring of the directory name.
@@ -225,10 +227,17 @@ def get_relative_path(base_path: str, path: str) -> str:
 
 
 def get_absolute_path(base_path: str, path: str) -> str:
-    """Return the absolute path string for a path."""
-    if path.startswith(base_path):
-        return path
-    return os.path.join(base_path, path)
+    """
+    Return the absolute path for a path, constrained to base_path.
+
+    :raises MediaNotFoundError: If the resolved path escapes base_path
+        (e.g. via ``../`` traversal or an absolute path outside the base).
+    """
+    absolute_path = path if path.startswith(base_path) else os.path.join(base_path, path)
+    if not is_safe_path(absolute_path, base_path):
+        msg = f"Path is outside the configured base directory: {path}"
+        raise MediaNotFoundError(msg)
+    return absolute_path
 
 
 def recursive_iter(
@@ -326,8 +335,8 @@ def sorted_scandir(base_path: str, sub_path: str, sort: bool = False) -> list[Fi
     """
 
     def nat_key(name: str) -> tuple[int | str, ...]:
-        """Sort key for natural sorting."""
-        return tuple(int(s) if s.isdigit() else s for s in re.split(r"(\d+)", name))
+        """Sort key for natural sorting, case insensitive to match the frontend sorting."""
+        return tuple(int(s) if s.isdigit() else s.casefold() for s in re.split(r"(\d+)", name))
 
     if base_path not in sub_path:
         sub_path = os.path.join(base_path, sub_path)

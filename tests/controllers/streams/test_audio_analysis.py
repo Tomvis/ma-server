@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sqlite3
 from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,7 +16,7 @@ import pytest
 from music_assistant_models.audio_analysis import AudioAnalysisCoverage
 from music_assistant_models.enums import ContentType, MediaType, StreamType
 from music_assistant_models.errors import ProviderUnavailableError
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import AudioFormat, ProviderMapping, Track
 
 import music_assistant.controllers.streams.audio_analysis as audio_analysis_mod
 from music_assistant.constants import (
@@ -32,7 +34,10 @@ from music_assistant.controllers.streams.audio_analysis import (
 from music_assistant.controllers.streams.audio_buffer import AudioBufferEOF
 from music_assistant.helpers.json import json_dumps
 from music_assistant.models.audio_analysis import AudioAnalysisData
-from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
+from music_assistant.models.audio_analysis_provider import (
+    AudioAnalysisProvider,
+    InstrumentedSemaphore,
+)
 from music_assistant.models.music_provider import MusicProvider
 
 
@@ -55,18 +60,16 @@ async def test_distribute_chunk_calls_all_providers() -> None:
 
 
 def test_ensure_inference_runtime_configured_is_idempotent() -> None:
-    """The inference runtime (torch + native BLAS caps) is configured once per controller."""
+    """The inference runtime (torch thread caps) is configured once per controller."""
     controller = _make_controller()
     with (
         patch("torch.set_num_threads") as set_threads,
         patch("torch.set_num_interop_threads"),
-        patch("threadpoolctl.threadpool_limits") as blas_limits,
         patch("torch.backends.nnpack.set_flags"),
     ):
         controller.ensure_inference_runtime_configured()
         controller.ensure_inference_runtime_configured()
     set_threads.assert_called_once()
-    blas_limits.assert_called_once()
     if controller.analysis_executor is not None:
         controller.analysis_executor.shutdown(wait=False)
 
@@ -77,7 +80,6 @@ def test_ensure_inference_runtime_creates_solo_lock_and_executor() -> None:
     with (
         patch("torch.set_num_threads"),
         patch("torch.set_num_interop_threads"),
-        patch("threadpoolctl.threadpool_limits"),
         patch("torch.backends.nnpack.set_flags"),
     ):
         controller.ensure_inference_runtime_configured()
@@ -115,7 +117,6 @@ async def test_analysis_concurrency_capped_at_half_cores(
         ),
         patch("torch.set_num_threads"),
         patch("torch.set_num_interop_threads"),
-        patch("threadpoolctl.threadpool_limits"),
         patch("torch.backends.nnpack.set_flags"),
     ):
         controller.ensure_inference_runtime_configured()
@@ -125,6 +126,34 @@ async def test_analysis_concurrency_capped_at_half_cores(
     for _ in range(expected_permits):
         await semaphore.acquire()
     assert semaphore.locked()
+
+
+@pytest.mark.asyncio
+async def test_instrumented_semaphore_tracks_in_flight_and_waiters() -> None:
+    """InstrumentedSemaphore exposes live permit-in-use and queued-acquirer counts."""
+    sem = InstrumentedSemaphore(2)
+    assert (sem.capacity, sem.in_flight, sem.waiters) == (2, 0, 0)
+
+    await sem.acquire()
+    await sem.acquire()
+    assert sem.in_flight == 2
+    assert sem.locked()
+
+    # A third acquire blocks behind the cap and registers as a waiter.
+    blocked = asyncio.ensure_future(sem.acquire())
+    await asyncio.sleep(0)
+    assert sem.waiters == 1
+    assert sem.in_flight == 2
+
+    # Freeing a permit lets the queued acquirer through; the queue drains.
+    sem.release()
+    await blocked
+    assert sem.waiters == 0
+    assert sem.in_flight == 2
+
+    sem.release()
+    sem.release()
+    assert sem.in_flight == 0
 
 
 @pytest.mark.asyncio
@@ -447,6 +476,7 @@ async def test_find_candidates_handles_sqlite_row_without_get(
     controller = _make_controller()
     p1 = _make_aa_provider("prov-1", available=True)
     p1.domain = "loudness_analysis"
+    p1.analysis_version = 1
     p1.available = True
     monkeypatch.setattr(
         controller.__class__,
@@ -827,7 +857,8 @@ def test_merged_from_rows_priority_domain_not_available_is_excluded() -> None:
 
 
 def test_merged_from_rows_regression_sonic_does_not_clobber_loudness() -> None:
-    """Regression: sonic_analysis' RMS loudness must not overwrite the EBU R128 value.
+    """
+    Regression: sonic_analysis' RMS loudness must not overwrite the EBU R128 value.
 
     Reproduces the volume-jump bug: a newer sonic_analysis row carries an RMS-proxy
     loudness_integrated that wins under last-write-wins, but scoping to loudness_analysis
@@ -1257,11 +1288,12 @@ async def test_count_candidates_missing_analysis_queries_with_available_filesyst
     assert "aa.analysis_version IS NOT NULL" in sql
     assert "aa.analysis_version >= :current_version" in sql
     assert f"'{domain}'" in sql
-    assert params == {
-        "media_type": MediaType.TRACK.value,
-        "aa_domain": "sonic_analysis",
-        "current_version": 2,
-    }
+    assert params["media_type"] == MediaType.TRACK.value
+    assert params["aa_domain"] == "sonic_analysis"
+    assert params["current_version"] == 2
+    assert "now" in params
+    assert "aa.analysis_version IS NOT NULL" in sql
+    assert "aa.analysis_version >= :current_version" in sql
 
 
 def test_controller_has_no_provider_specific_extra_data_keys() -> None:
@@ -1272,6 +1304,25 @@ def test_controller_has_no_provider_specific_extra_data_keys() -> None:
     # do not weaken this to an import/attribute check.
     assert "_EXPORT_STRIP_EXTRA_DATA_KEYS" not in source
     assert "clap_embedding" not in source
+
+
+# --- track audio metadata & waveform export ---
+
+
+def _track_with_mapping(item_id: str = "track-1", provider: str = "test-provider") -> Track:
+    """Build a Track with a single provider mapping."""
+    return Track(
+        item_id=item_id,
+        provider="library",
+        name="Test Track",
+        provider_mappings={
+            ProviderMapping(
+                item_id=item_id,
+                provider_domain=provider,
+                provider_instance=provider,
+            )
+        },
+    )
 
 
 def _analysis_controller_with_rows(
@@ -1294,6 +1345,46 @@ def _analysis_controller_with_rows(
 
 
 @pytest.mark.asyncio
+async def test_get_track_audio_metadata_skips_corrupt_sqlite_row(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt sqlite3.Row is logged and skipped without hiding valid analysis."""
+    corrupt_data = json_dumps({"spectral_centroid": [100.0, None]})
+    valid_data = json_dumps(AudioAnalysisData(bpm=128.0).to_dict())
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.row_factory = sqlite3.Row
+        rows = cast(
+            "list[Mapping[str, Any]]",
+            db.execute(
+                """
+                SELECT 1 AS id, ? AS aa_provider_domain, ? AS analysis_data
+                UNION ALL
+                SELECT 2, ?, ?
+                """,
+                (
+                    SONIC_ANALYSIS_DOMAIN,
+                    corrupt_data,
+                    SMART_FADES_ANALYSIS_DOMAIN,
+                    valid_data,
+                ),
+            ).fetchall(),
+        )
+
+    controller = _analysis_controller_with_rows(rows)
+    with caplog.at_level("WARNING", logger=audio_analysis_mod.LOGGER.name):
+        result = await controller.get_track_audio_metadata(_track_with_mapping())
+
+    assert result is not None
+    assert result.bpm == 128.0
+    warning = next(
+        record for record in caplog.records if record.name == audio_analysis_mod.LOGGER.name
+    )
+    assert "id=1, domain=sonic_analysis" in warning.getMessage()
+    assert corrupt_data not in warning.getMessage()
+    assert warning.exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_get_audio_analysis_deletes_unparsable_rows(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1302,9 +1393,7 @@ async def test_get_audio_analysis_deletes_unparsable_rows(
         {
             "id": 7,
             "aa_provider_domain": SMART_FADES_ANALYSIS_DOMAIN,
-            # a non-list value fails ndarray deserialization; the [100.0, None]
-            # payload used on dev parses fine here (numpy coerces None to nan)
-            "analysis_data": json_dumps({"spectral_centroid": "garbage"}),
+            "analysis_data": json_dumps({"spectral_centroid": [100.0, None]}),
         },
         _aa_row(SONIC_ANALYSIS_DOMAIN, 8, bpm=101.0),
     ]
@@ -1324,9 +1413,7 @@ async def test_get_audio_analysis_deletes_unparsable_rows(
 async def test_set_audio_analysis_rejects_non_finite_values() -> None:
     """A payload holding non-finite floats is refused before anything reaches the database."""
     c, db = _stub_controller()
-    list_case = AudioAnalysisData(
-        spectral_centroid=np.array([100.0, float("nan"), 200.0], dtype=np.float32)
-    )
+    list_case = AudioAnalysisData(spectral_centroid=[100.0, float("nan"), 200.0])
     with pytest.raises(ValueError, match="spectral_centroid"):
         await c.set_audio_analysis(
             "track-1", "test-provider", SMART_FADES_ANALYSIS_DOMAIN, list_case
@@ -1337,3 +1424,57 @@ async def test_set_audio_analysis_rejects_non_finite_values() -> None:
             "track-1", "test-provider", SMART_FADES_ANALYSIS_DOMAIN, scalar_case
         )
     db.insert_or_replace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_track_audio_metadata_prefers_smart_fades() -> None:
+    """bpm/key come from smart_fades even when another AA provider wrote them later."""
+    c = _analysis_controller_with_rows(
+        [
+            _aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, bpm=128.0, key="F#", mode="minor"),
+            _aa_row(SONIC_ANALYSIS_DOMAIN, 2, bpm=100.0),
+        ]
+    )
+    result = await c.get_track_audio_metadata(_track_with_mapping())
+    assert result is not None
+    assert result.bpm == 128.0
+    assert result.musical_key == "F# minor"
+
+
+@pytest.mark.asyncio
+async def test_get_track_audio_metadata_key_without_mode() -> None:
+    """musical_key falls back to the bare pitch class when no mode was detected."""
+    c = _analysis_controller_with_rows([_aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, key="C")])
+    result = await c.get_track_audio_metadata(_track_with_mapping())
+    assert result is not None
+    assert result.bpm is None
+    assert result.musical_key == "C"
+
+
+@pytest.mark.asyncio
+async def test_get_track_audio_metadata_none_without_relevant_analysis() -> None:
+    """No AudioMetadata when stored analysis has neither bpm nor key."""
+    c = _analysis_controller_with_rows(
+        [_aa_row(SONIC_ANALYSIS_DOMAIN, 1, loudness_integrated=-7.5)]
+    )
+    assert await c.get_track_audio_metadata(_track_with_mapping()) is None
+
+
+@pytest.mark.asyncio
+async def test_get_wave_form_returns_rms_bins() -> None:
+    """wave_form returns the stored RMS energy bins as a plain list of floats."""
+    rms = np.linspace(0.0, 1.0, 1800, dtype=np.float32).tolist()
+    c = _analysis_controller_with_rows([_aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, rms_energy=rms)])
+    result = await c.get_wave_form("track-1", "test-provider")
+    assert result is not None
+    assert len(result) == 1800
+    assert result[0] == pytest.approx(0.0)
+    assert result[-1] == pytest.approx(1.0)
+    assert all(isinstance(v, float) for v in result)
+
+
+@pytest.mark.asyncio
+async def test_get_wave_form_none_without_rms() -> None:
+    """wave_form returns None when no AA provider stored RMS energy."""
+    c = _analysis_controller_with_rows([_aa_row(SMART_FADES_ANALYSIS_DOMAIN, 1, bpm=120.0)])
+    assert await c.get_wave_form("track-1", "test-provider") is None

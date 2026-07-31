@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import logging
 import pathlib
+import threading
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta
 from sqlite3 import IntegrityError
+from typing import Any
 
 import pytest
-from music_assistant_models.auth import AuthProviderType, UserRole
+from music_assistant_models.auth import AuthProviderType, Scope, User, UserRole
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 
 from music_assistant.constants import HOMEASSISTANT_SYSTEM_USER
@@ -17,6 +19,7 @@ from music_assistant.controllers.config import ConfigController
 from music_assistant.controllers.webserver.auth import (
     JOIN_CODE_LENGTH,
     TOKEN_ABSOLUTE_MAX_EXPIRATION,
+    TOKEN_ACTIVITY_PERSIST_INTERVAL,
     TOKEN_GUEST_EXPIRATION,
     TOKEN_LONG_LIVED_EXPIRATION,
     TOKEN_SHORT_LIVED_EXPIRATION,
@@ -24,11 +27,13 @@ from music_assistant.controllers.webserver.auth import (
 )
 from music_assistant.controllers.webserver.controller import WebserverController
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
+    ImpersonatedUser,
     get_current_user,
-    is_system_user_allowed_admin_command,
-    resolve_username_workaround,
+    has_scope,
+    resolve_command_impersonation,
     set_current_token,
     set_current_user,
+    set_impersonated_user,
 )
 from music_assistant.controllers.webserver.helpers.auth_providers import BuiltinLoginProvider
 from music_assistant.helpers.datetime import utc
@@ -37,7 +42,8 @@ from music_assistant.mass import MusicAssistant
 
 @pytest.fixture
 async def mass_minimal(tmp_path: pathlib.Path) -> AsyncGenerator[MusicAssistant]:
-    """Create a minimal Music Assistant instance for auth testing without starting the webserver.
+    """
+    Create a minimal Music Assistant instance for auth testing without starting the webserver.
 
     :param tmp_path: Temporary directory for test data.
     """
@@ -53,12 +59,8 @@ async def mass_minimal(tmp_path: pathlib.Path) -> AsyncGenerator[MusicAssistant]
 
     # Initialize the minimum required for auth testing
     mass_instance.loop = asyncio.get_running_loop()
-    # Use id() as fallback since _thread_id is a private attribute that may not exist
-    mass_instance.loop_thread_id = (
-        getattr(mass_instance.loop, "_thread_id", None)
-        if hasattr(mass_instance.loop, "_thread_id")
-        else id(mass_instance.loop)
-    )
+    # fixture runs on the event loop thread, like MusicAssistant.start()
+    mass_instance.loop_thread_id = threading.get_ident()
 
     # Create config controller
     mass_instance.config = ConfigController(mass_instance)
@@ -85,7 +87,8 @@ async def mass_minimal(tmp_path: pathlib.Path) -> AsyncGenerator[MusicAssistant]
 
 @pytest.fixture
 async def auth_manager(mass_minimal: MusicAssistant) -> AuthenticationManager:
-    """Get authentication manager from mass instance.
+    """
+    Get authentication manager from mass instance.
 
     :param mass_minimal: Minimal MusicAssistant instance.
     """
@@ -93,7 +96,8 @@ async def auth_manager(mass_minimal: MusicAssistant) -> AuthenticationManager:
 
 
 async def test_auth_manager_initialization(auth_manager: AuthenticationManager) -> None:
-    """Test that the authentication manager initializes correctly.
+    """
+    Test that the authentication manager initializes correctly.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -104,7 +108,8 @@ async def test_auth_manager_initialization(auth_manager: AuthenticationManager) 
 
 
 async def test_has_users_initially_empty(auth_manager: AuthenticationManager) -> None:
-    """Test that has_users returns False when no users exist.
+    """
+    Test that has_users returns False when no users exist.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -113,7 +118,8 @@ async def test_has_users_initially_empty(auth_manager: AuthenticationManager) ->
 
 
 async def test_create_user(auth_manager: AuthenticationManager) -> None:
-    """Test creating a new user.
+    """
+    Test creating a new user.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -136,7 +142,8 @@ async def test_create_user(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_get_user(auth_manager: AuthenticationManager) -> None:
-    """Test retrieving a user by ID.
+    """
+    Test retrieving a user by ID.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -156,7 +163,8 @@ async def test_get_user(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_create_user_with_builtin_provider(auth_manager: AuthenticationManager) -> None:
-    """Test creating a user with built-in authentication.
+    """
+    Test creating a user with built-in authentication.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -175,7 +183,8 @@ async def test_create_user_with_builtin_provider(auth_manager: AuthenticationMan
 
 
 async def test_authenticate_with_password(auth_manager: AuthenticationManager) -> None:
-    """Test authenticating with username and password.
+    """
+    Test authenticating with username and password.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -214,7 +223,8 @@ async def test_authenticate_with_password(auth_manager: AuthenticationManager) -
 
 
 async def test_create_token(auth_manager: AuthenticationManager) -> None:
-    """Test creating access tokens.
+    """
+    Test creating access tokens.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -233,7 +243,8 @@ async def test_create_token(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_authenticate_with_token(auth_manager: AuthenticationManager) -> None:
-    """Test authenticating with an access token.
+    """
+    Test authenticating with an access token.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -249,7 +260,8 @@ async def test_authenticate_with_token(auth_manager: AuthenticationManager) -> N
 
 
 async def test_token_expiration(auth_manager: AuthenticationManager) -> None:
-    """Test that expired tokens are rejected.
+    """
+    Test that expired tokens are rejected.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -275,7 +287,8 @@ async def test_token_expiration(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_update_user_profile(auth_manager: AuthenticationManager) -> None:
-    """Test updating user profile information.
+    """
+    Test updating user profile information.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -299,7 +312,8 @@ async def test_update_user_profile(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_change_password(auth_manager: AuthenticationManager) -> None:
-    """Test changing user password.
+    """
+    Test changing user password.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -338,7 +352,8 @@ async def test_change_password(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_revoke_token(auth_manager: AuthenticationManager) -> None:
-    """Test revoking an access token.
+    """
+    Test revoking an access token.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -365,7 +380,8 @@ async def test_revoke_token(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_list_users(auth_manager: AuthenticationManager) -> None:
-    """Test listing all users (admin only).
+    """
+    Test listing all users (admin only).
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -388,7 +404,8 @@ async def test_list_users(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_disable_enable_user(auth_manager: AuthenticationManager) -> None:
-    """Test disabling and enabling user accounts.
+    """
+    Test disabling and enabling user accounts.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -415,7 +432,8 @@ async def test_disable_enable_user(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_cannot_disable_own_account(auth_manager: AuthenticationManager) -> None:
-    """Test that users cannot disable their own account.
+    """
+    Test that users cannot disable their own account.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -428,7 +446,8 @@ async def test_cannot_disable_own_account(auth_manager: AuthenticationManager) -
 
 
 async def test_user_preferences(auth_manager: AuthenticationManager) -> None:
-    """Test updating user preferences.
+    """
+    Test updating user preferences.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -443,7 +462,8 @@ async def test_user_preferences(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_link_user_to_provider(auth_manager: AuthenticationManager) -> None:
-    """Test linking user to authentication provider.
+    """
+    Test linking user to authentication provider.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -472,7 +492,8 @@ async def test_link_user_to_provider(auth_manager: AuthenticationManager) -> Non
 
 
 async def test_homeassistant_system_user(auth_manager: AuthenticationManager) -> None:
-    """Test Home Assistant system user creation.
+    """
+    Test Home Assistant system user creation.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -482,7 +503,7 @@ async def test_homeassistant_system_user(auth_manager: AuthenticationManager) ->
     assert system_user is not None
     assert system_user.username == HOMEASSISTANT_SYSTEM_USER
     assert system_user.display_name == "Home Assistant Integration"
-    assert system_user.role == UserRole.USER
+    assert system_user.role == UserRole.SERVICE
 
     # Getting it again should return the same user
     system_user2 = await auth_manager.get_homeassistant_system_user()
@@ -597,7 +618,8 @@ async def test_homeassistant_system_user_token_cleans_up_expired_rows(
 
 
 async def test_update_user_role(auth_manager: AuthenticationManager) -> None:
-    """Test updating user role (admin only).
+    """
+    Test updating user role (admin only).
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -616,7 +638,8 @@ async def test_update_user_role(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_delete_user(auth_manager: AuthenticationManager) -> None:
-    """Test deleting a user account.
+    """
+    Test deleting a user account.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -635,7 +658,8 @@ async def test_delete_user(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_cannot_delete_own_account(auth_manager: AuthenticationManager) -> None:
-    """Test that users cannot delete their own account.
+    """
+    Test that users cannot delete their own account.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -648,7 +672,8 @@ async def test_cannot_delete_own_account(auth_manager: AuthenticationManager) ->
 
 
 async def test_get_user_tokens(auth_manager: AuthenticationManager) -> None:
-    """Test getting user's tokens.
+    """
+    Test getting user's tokens.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -669,7 +694,8 @@ async def test_get_user_tokens(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_get_login_providers(auth_manager: AuthenticationManager) -> None:
-    """Test getting available login providers.
+    """
+    Test getting available login providers.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -680,7 +706,8 @@ async def test_get_login_providers(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_create_user_with_api(auth_manager: AuthenticationManager) -> None:
-    """Test creating user via API command.
+    """
+    Test creating user via API command.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -703,7 +730,8 @@ async def test_create_user_with_api(auth_manager: AuthenticationManager) -> None
 
 
 async def test_create_user_api_validation(auth_manager: AuthenticationManager) -> None:
-    """Test validation in create_user_with_api.
+    """
+    Test validation in create_user_with_api.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -733,7 +761,8 @@ async def test_create_user_api_validation(auth_manager: AuthenticationManager) -
 
 
 async def test_logout(auth_manager: AuthenticationManager) -> None:
-    """Test logout functionality.
+    """
+    Test logout functionality.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -757,7 +786,8 @@ async def test_logout(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_token_sliding_expiration(auth_manager: AuthenticationManager) -> None:
-    """Test that short-lived tokens auto-renew on use.
+    """
+    Test that short-lived tokens auto-renew on use.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -784,7 +814,8 @@ async def test_token_sliding_expiration(auth_manager: AuthenticationManager) -> 
 
 
 async def test_long_lived_token_no_auto_renewal(auth_manager: AuthenticationManager) -> None:
-    """Test that long-lived tokens do NOT auto-renew on use.
+    """
+    Test that long-lived tokens do NOT auto-renew on use.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -808,6 +839,150 @@ async def test_long_lived_token_no_auto_renewal(auth_manager: AuthenticationMana
 
     # Expiration should remain the same for long-lived tokens
     assert updated_expires_at == initial_expires_at
+
+
+async def test_token_activity_write_throttled(
+    auth_manager: AuthenticationManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Test that rapid authentications persist the token activity only once.
+
+    The HTTP API authenticates on every request; the activity timestamp must not be
+    written to the database again while the stored one is still fresh.
+
+    :param auth_manager: AuthenticationManager instance.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    user = await auth_manager.create_user(username="throttleuser", role=UserRole.USER)
+    token = await auth_manager.create_token(user, "Throttle Test", is_long_lived=False)
+
+    token_update_count = 0
+    original_update = auth_manager.database.update
+
+    async def counting_update(table: str, match: dict[str, Any], values: dict[str, Any]) -> None:
+        nonlocal token_update_count
+        if table == "auth_tokens":
+            token_update_count += 1
+        await original_update(table, match, values)
+
+    monkeypatch.setattr(auth_manager.database, "update", counting_update)
+
+    # Two rapid authentications: only the first persists the activity timestamp.
+    assert await auth_manager.authenticate_with_token(token) is not None
+    assert await auth_manager.authenticate_with_token(token) is not None
+    assert token_update_count == 1
+
+
+async def test_token_activity_write_resumes_after_interval(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Test that token activity is persisted again once the stored timestamp is stale.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="throttleresume", role=UserRole.USER)
+    token = await auth_manager.create_token(user, "Throttle Resume Test", is_long_lived=False)
+    assert await auth_manager.authenticate_with_token(token) is not None
+
+    # Age the stored activity timestamp (and sliding expiration) past the persist interval.
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_row = await auth_manager.database.get_row("auth_tokens", {"token_hash": token_hash})
+    assert token_row is not None
+    stale_time = utc() - TOKEN_ACTIVITY_PERSIST_INTERVAL - timedelta(minutes=5)
+    stale_expires = stale_time + timedelta(days=TOKEN_SHORT_LIVED_EXPIRATION)
+    await auth_manager.database.update(
+        "auth_tokens",
+        {"token_id": token_row["token_id"]},
+        {"last_used_at": stale_time.isoformat(), "expires_at": stale_expires.isoformat()},
+    )
+
+    assert await auth_manager.authenticate_with_token(token) is not None
+
+    # Both the activity timestamp and the sliding expiration must be persisted again.
+    updated_row = await auth_manager.database.get_row("auth_tokens", {"token_hash": token_hash})
+    assert updated_row is not None
+    assert datetime.fromisoformat(updated_row["last_used_at"]) > stale_time
+    assert datetime.fromisoformat(updated_row["expires_at"]) > stale_expires
+
+
+async def test_revoked_token_rejected_within_throttle_window(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Test that revocation takes effect immediately while the activity write is throttled.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="throttlerevoke", role=UserRole.USER)
+    token = await auth_manager.create_token(user, "Throttle Revoke Test", is_long_lived=False)
+    set_current_user(user)
+
+    # First use persists a fresh activity timestamp (entering the throttle window).
+    assert await auth_manager.authenticate_with_token(token) is not None
+
+    token_id = await auth_manager.get_token_id_from_token(token)
+    assert token_id is not None
+    await auth_manager.revoke_token(token_id)
+
+    # The throttle only affects the activity write, never the validation reads.
+    assert await auth_manager.authenticate_with_token(token) is None
+
+
+async def test_expired_token_rejected_despite_fresh_activity(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Test that expiry validation is not affected by a fresh activity timestamp.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="throttleexpired", role=UserRole.USER)
+    token = await auth_manager.create_token(user, "Throttle Expired Test", is_long_lived=False)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_row = await auth_manager.database.get_row("auth_tokens", {"token_hash": token_hash})
+    assert token_row is not None
+    await auth_manager.database.update(
+        "auth_tokens",
+        {"token_id": token_row["token_id"]},
+        {
+            "expires_at": (utc() - timedelta(days=1)).isoformat(),
+            "last_used_at": utc().isoformat(),
+        },
+    )
+
+    assert await auth_manager.authenticate_with_token(token) is None
+
+
+async def test_token_absolute_max_enforced_despite_fresh_activity(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Test that the absolute lifetime cap is enforced even with a fresh activity timestamp.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="throttleabsmax", role=UserRole.USER)
+    token = await auth_manager.create_token(user, "Throttle Abs Max Test", is_long_lived=False)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_row = await auth_manager.database.get_row("auth_tokens", {"token_hash": token_hash})
+    assert token_row is not None
+    created_at = utc() - timedelta(days=TOKEN_ABSOLUTE_MAX_EXPIRATION + 1)
+    future_expires = utc() + timedelta(days=TOKEN_SHORT_LIVED_EXPIRATION)
+    await auth_manager.database.update(
+        "auth_tokens",
+        {"token_id": token_row["token_id"]},
+        {
+            "created_at": created_at.isoformat(),
+            "expires_at": future_expires.isoformat(),
+            "last_used_at": utc().isoformat(),
+        },
+    )
+
+    assert await auth_manager.authenticate_with_token(token) is None
+    assert await auth_manager.database.get_row("auth_tokens", {"token_hash": token_hash}) is None
 
 
 async def test_long_lived_token_default_is_one_year() -> None:
@@ -964,8 +1139,36 @@ async def test_guest_token_fixed_short_lifetime(auth_manager: AuthenticationMana
     assert updated_row["expires_at"] == token_row["expires_at"]
 
 
+async def test_guest_cannot_create_long_lived_token(auth_manager: AuthenticationManager) -> None:
+    """
+    Test that a guest cannot create a long-lived token for their own account.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    guest = await auth_manager.create_user(username="guesttoken", role=UserRole.GUEST)
+    set_current_user(guest)
+
+    with pytest.raises(InsufficientPermissions):
+        await auth_manager.create_long_lived_token("Guest Escalation")
+
+
+async def test_no_long_lived_token_for_guest_account(auth_manager: AuthenticationManager) -> None:
+    """
+    Test that a long-lived token cannot be created for a guest account, even by an admin.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    admin = await auth_manager.create_user(username="tokenadmin", role=UserRole.ADMIN)
+    guest = await auth_manager.create_user(username="guesttarget", role=UserRole.GUEST)
+    set_current_user(admin)
+
+    with pytest.raises(InsufficientPermissions):
+        await auth_manager.create_long_lived_token("Guest Token", user_id=guest.user_id)
+
+
 async def test_username_case_insensitive_creation(auth_manager: AuthenticationManager) -> None:
-    """Test that usernames are normalized to lowercase on creation.
+    """
+    Test that usernames are normalized to lowercase on creation.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -983,7 +1186,8 @@ async def test_username_case_insensitive_creation(auth_manager: AuthenticationMa
 async def test_username_case_insensitive_duplicate_prevention(
     auth_manager: AuthenticationManager,
 ) -> None:
-    """Test that duplicate usernames with different cases are prevented.
+    """
+    Test that duplicate usernames with different cases are prevented.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -997,7 +1201,8 @@ async def test_username_case_insensitive_duplicate_prevention(
 
 
 async def test_username_case_insensitive_login(auth_manager: AuthenticationManager) -> None:
-    """Test that login works with any case variation of username.
+    """
+    Test that login works with any case variation of username.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1041,7 +1246,8 @@ async def test_username_case_insensitive_login(auth_manager: AuthenticationManag
 
 
 async def test_username_case_insensitive_lookup(auth_manager: AuthenticationManager) -> None:
-    """Test that user lookup by username is case-insensitive.
+    """
+    Test that user lookup by username is case-insensitive.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1065,7 +1271,8 @@ async def test_username_case_insensitive_lookup(auth_manager: AuthenticationMana
 
 
 async def test_username_update_normalizes(auth_manager: AuthenticationManager) -> None:
-    """Test that updating username normalizes it to lowercase.
+    """
+    Test that updating username normalizes it to lowercase.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1080,7 +1287,8 @@ async def test_username_update_normalizes(auth_manager: AuthenticationManager) -
 
 
 async def test_link_user_to_provider_idempotent(auth_manager: AuthenticationManager) -> None:
-    """Test that linking user to provider is idempotent.
+    """
+    Test that linking user to provider is idempotent.
 
     This tests the fix for the bug where re-linking a user would cause
     IntegrityError due to UNIQUE constraint on (provider_type, provider_user_id).
@@ -1116,7 +1324,8 @@ async def test_link_user_to_provider_idempotent(auth_manager: AuthenticationMana
 
 
 async def test_ingress_auth_existing_username(auth_manager: AuthenticationManager) -> None:
-    """Test HA ingress auth when username exists but isn't linked to HA provider.
+    """
+    Test HA ingress auth when username exists but isn't linked to HA provider.
 
     This tests the scenario where a user is created during setup, and then
     tries to login via HA ingress with the same username.
@@ -1161,7 +1370,8 @@ async def test_ingress_auth_existing_username(auth_manager: AuthenticationManage
 
 
 async def test_generate_join_code(auth_manager: AuthenticationManager) -> None:
-    """Test generating a join code for a user.
+    """
+    Test generating a join code for a user.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1181,10 +1391,78 @@ async def test_generate_join_code(auth_manager: AuthenticationManager) -> None:
     assert expires_at > utc()
 
 
+async def test_get_join_code_expiry(auth_manager: AuthenticationManager) -> None:
+    """
+    Test looking up the expiry for a specific active join code.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="joinexpiryuser", role=UserRole.GUEST)
+
+    code, expires_at = await auth_manager.generate_join_code(
+        user=user,
+        expires_in_hours=24,
+    )
+
+    assert await auth_manager.get_join_code_expiry(code, user) == expires_at
+    assert await auth_manager.get_join_code_expiry(code.lower(), user) == expires_at
+    assert await auth_manager.get_join_code_expiry("BADCODE", user) is None
+
+
+async def test_get_join_code_expiry_requires_matching_user(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Test that join code expiry lookup can be scoped to a specific user.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="joinexpiryowner", role=UserRole.GUEST)
+    other_user = await auth_manager.create_user(
+        username="joinexpiryother",
+        role=UserRole.GUEST,
+    )
+
+    code, expires_at = await auth_manager.generate_join_code(
+        user=user,
+        expires_in_hours=24,
+    )
+
+    assert await auth_manager.get_join_code_expiry(code, user) == expires_at
+    assert await auth_manager.get_join_code_expiry(code) == expires_at
+    assert await auth_manager.get_join_code_expiry(code, other_user) is None
+
+
+async def test_get_join_code_expiry_expired(auth_manager: AuthenticationManager) -> None:
+    """
+    Test that expired join codes have no active expiry.
+
+    :param auth_manager: AuthenticationManager instance.
+    """
+    user = await auth_manager.create_user(username="joinexpiryexpired", role=UserRole.GUEST)
+
+    code, _ = await auth_manager.generate_join_code(
+        user=user,
+        expires_in_hours=24,
+    )
+    code_row = await auth_manager.database.get_row("join_codes", {"code": code})
+    assert code_row is not None
+
+    past_time = utc() - timedelta(hours=1)
+    await auth_manager.database.update(
+        "join_codes",
+        {"code_id": code_row["code_id"]},
+        {"expires_at": past_time.isoformat()},
+    )
+
+    assert await auth_manager.get_join_code_expiry(code, user) is None
+
+
 async def test_generate_join_code_non_guest_rejected(
     auth_manager: AuthenticationManager,
 ) -> None:
-    """Test that generating a join code for non-guest users is rejected.
+    """
+    Test that generating a join code for non-guest users is rejected.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1199,7 +1477,8 @@ async def test_generate_join_code_non_guest_rejected(
 
 
 async def test_exchange_join_code(auth_manager: AuthenticationManager) -> None:
-    """Test exchanging a valid join code for a JWT token.
+    """
+    Test exchanging a valid join code for a JWT token.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1225,7 +1504,8 @@ async def test_exchange_join_code(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_exchange_join_code_case_insensitive(auth_manager: AuthenticationManager) -> None:
-    """Test that join codes are case-insensitive.
+    """
+    Test that join codes are case-insensitive.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1247,7 +1527,8 @@ async def test_exchange_join_code_case_insensitive(auth_manager: AuthenticationM
 
 
 async def test_exchange_join_code_invalid(auth_manager: AuthenticationManager) -> None:
-    """Test that invalid join codes are rejected.
+    """
+    Test that invalid join codes are rejected.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1256,7 +1537,8 @@ async def test_exchange_join_code_invalid(auth_manager: AuthenticationManager) -
 
 
 async def test_exchange_join_code_expired(auth_manager: AuthenticationManager) -> None:
-    """Test that expired join codes are rejected.
+    """
+    Test that expired join codes are rejected.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1284,7 +1566,8 @@ async def test_exchange_join_code_expired(auth_manager: AuthenticationManager) -
 
 
 async def test_exchange_join_code_max_uses(auth_manager: AuthenticationManager) -> None:
-    """Test that join codes respect max_uses limit.
+    """
+    Test that join codes respect max_uses limit.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1310,7 +1593,8 @@ async def test_exchange_join_code_max_uses(auth_manager: AuthenticationManager) 
 
 
 async def test_exchange_join_code_unlimited_uses(auth_manager: AuthenticationManager) -> None:
-    """Test that join codes with max_uses=0 have unlimited uses.
+    """
+    Test that join codes with max_uses=0 have unlimited uses.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1329,7 +1613,8 @@ async def test_exchange_join_code_unlimited_uses(auth_manager: AuthenticationMan
 
 
 async def test_revoke_join_codes_for_user(auth_manager: AuthenticationManager) -> None:
-    """Test revoking join codes for a specific user.
+    """
+    Test revoking join codes for a specific user.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1354,7 +1639,8 @@ async def test_revoke_join_codes_for_user(auth_manager: AuthenticationManager) -
 
 
 async def test_authenticate_with_join_code_api(auth_manager: AuthenticationManager) -> None:
-    """Test the public API endpoint for join code authentication.
+    """
+    Test the public API endpoint for join code authentication.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1382,7 +1668,8 @@ async def test_authenticate_with_join_code_api(auth_manager: AuthenticationManag
 async def test_authenticate_with_join_code_api_invalid(
     auth_manager: AuthenticationManager,
 ) -> None:
-    """Test the API endpoint with invalid join code.
+    """
+    Test the API endpoint with invalid join code.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1394,7 +1681,8 @@ async def test_authenticate_with_join_code_api_invalid(
 
 
 async def test_list_join_codes(auth_manager: AuthenticationManager) -> None:
-    """Test listing active join codes (admin only).
+    """
+    Test listing active join codes (admin only).
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1418,7 +1706,8 @@ async def test_list_join_codes(auth_manager: AuthenticationManager) -> None:
 
 
 async def test_revoke_join_code_api(auth_manager: AuthenticationManager) -> None:
-    """Test revoking a specific join code by code_id (admin only).
+    """
+    Test revoking a specific join code by code_id (admin only).
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1446,7 +1735,8 @@ async def test_revoke_join_code_api(auth_manager: AuthenticationManager) -> None
 
 
 async def test_revoke_join_code_api_not_found(auth_manager: AuthenticationManager) -> None:
-    """Test revoking a non-existent join code raises error.
+    """
+    Test revoking a non-existent join code raises error.
 
     :param auth_manager: AuthenticationManager instance.
     """
@@ -1457,70 +1747,85 @@ async def test_revoke_join_code_api_not_found(auth_manager: AuthenticationManage
         await auth_manager.revoke_join_code("nonexistent-code-id")
 
 
-async def test_system_user_allowed_admin_commands(auth_manager: AuthenticationManager) -> None:
-    """
-    Test the temporary stable-branch exemption for the Home Assistant system user.
-
-    :param auth_manager: AuthenticationManager instance.
-    """
-    system_user = await auth_manager.get_homeassistant_system_user()
-    standard_user = await auth_manager.create_user(username="user_a", role=UserRole.USER)
-
-    assert is_system_user_allowed_admin_command(system_user, "players/remove")
-    assert is_system_user_allowed_admin_command(system_user, "config/players/remove")
-    # other admin commands remain off limits for the system user
-    assert not is_system_user_allowed_admin_command(system_user, "config/core/save")
-    # regular users are not exempt
-    assert not is_system_user_allowed_admin_command(standard_user, "players/remove")
-
-
-async def test_username_workaround(auth_manager: AuthenticationManager) -> None:
-    """
-    Test the temporary stable-branch username argument on listing commands.
-
-    :param auth_manager: AuthenticationManager instance.
-    """
-    mass = auth_manager.mass
-    system_user = await auth_manager.get_homeassistant_system_user()
+async def test_impersonated_user_context_manager(auth_manager: AuthenticationManager) -> None:
+    """Test the ImpersonatedUser context manager."""
     admin_user = await auth_manager.create_user(username="admin", role=UserRole.ADMIN)
-    standard_user = await auth_manager.create_user(username="user_a", role=UserRole.USER)
+    standard_user_a = await auth_manager.create_user(username="user_a", role=UserRole.USER)
+    standard_user_b = await auth_manager.create_user(username="user_b", role=UserRole.USER)
+    service_user = await auth_manager.create_user(username="service", role=UserRole.SERVICE)
 
-    # no username argument present is a no-op and leaves other args untouched
-    set_current_user(system_user)
-    args: dict[str, str | int] = {"limit": 10}
-    await resolve_username_workaround(mass, "music/tracks/library_items", args)
-    assert args == {"limit": 10}
-    assert get_current_user() == system_user
-
-    # the system user may execute listing commands as another user
-    args = {"limit": 10, "username": "user_a"}
-    await resolve_username_workaround(mass, "music/tracks/library_items", args)
-    assert args == {"limit": 10}
-    assert get_current_user() == standard_user
-
-    # admin users may do the same (also on music/search)
-    set_current_user(admin_user)
-    await resolve_username_workaround(mass, "music/search", {"username": "user_a"})
-    assert get_current_user() == standard_user
-
-    # the username argument is ignored on other commands
-    set_current_user(system_user)
-    args = {"username": "user_a"}
-    await resolve_username_workaround(mass, "player_queues/items", args)
-    assert args == {"username": "user_a"}
-    assert get_current_user() == system_user
-
-    # an unknown username must raise
-    with pytest.raises(InvalidDataError):
-        await resolve_username_workaround(mass, "music/search", {"username": "nobody"})
-
-    # a regular user may not execute listing commands as another user
-    set_current_user(standard_user)
+    # non-authenticated user must raise
+    set_current_user(None)
     with pytest.raises(InsufficientPermissions):
-        await resolve_username_workaround(mass, "music/search", {"username": "admin"})
-    # but passing their own username is a no-op
-    await resolve_username_workaround(mass, "music/search", {"username": "user_a"})
-    assert get_current_user() == standard_user
+        async with ImpersonatedUser(auth_manager.mass, "user_a"):
+            ...
+    # impersonation attempt without the users.impersonate scope must raise
+    set_current_user(standard_user_a)
+    with pytest.raises(InsufficientPermissions):
+        async with ImpersonatedUser(auth_manager.mass, "admin"):
+            ...
+    # invalid username must raise
+    set_current_user(admin_user)
+    with pytest.raises(InvalidDataError):
+        async with ImpersonatedUser(auth_manager.mass, "wrong_username"):
+            ...
+
+    # verify that a standard user may impersonate itself (by username or user_id)
+    set_current_user(standard_user_a)
+    set_impersonated_user(None)
+    async with ImpersonatedUser(auth_manager.mass, "user_a"):
+        assert get_current_user() == standard_user_a
+    async with ImpersonatedUser(auth_manager.mass, standard_user_a.user_id):
+        assert get_current_user() == standard_user_a
+    # passing None is a no-op which preserves any active impersonation
+    set_impersonated_user(standard_user_b)
+    async with ImpersonatedUser(auth_manager.mass, None):
+        assert get_current_user() == standard_user_b
+    assert get_current_user() == standard_user_b
+
+    # verify that an admin user may impersonate another user
+    set_current_user(admin_user)
+
+    set_impersonated_user(None)  # non-nested use
+    assert get_current_user() == admin_user
+    async with ImpersonatedUser(auth_manager.mass, "user_a"):
+        assert get_current_user() == standard_user_a
+    assert get_current_user() == admin_user
+
+    set_impersonated_user(standard_user_b)  # nested use
+    async with ImpersonatedUser(auth_manager.mass, "user_a"):
+        assert get_current_user() == standard_user_a
+    assert get_current_user() == standard_user_b
+
+    # verify that a service user may impersonate another user (users.impersonate scope)
+    set_current_user(service_user)
+    set_impersonated_user(None)
+    assert has_scope(service_user, Scope.USERS_IMPERSONATE)
+    async with ImpersonatedUser(auth_manager.mass, "user_a"):
+        assert get_current_user() == standard_user_a
+    assert get_current_user() == service_user
+
+
+async def test_impersonated_user_anonymous_playback_is_noop(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """
+    Verify an unauthenticated call without a username is a no-op.
+
+    Regression: play_media wraps every call in ImpersonatedUser, so protocol/hardware
+    triggered playback (presets, Spotify Connect, ...) - which has no authenticated user
+    and passes no username - must not raise.
+    """
+    set_current_user(None)
+    set_impersonated_user(None)
+    async with ImpersonatedUser(auth_manager.mass, None):
+        assert get_current_user() is None
+    assert get_current_user() is None
+
+    # an unauthenticated caller may still not impersonate another user
+    with pytest.raises(InsufficientPermissions):
+        async with ImpersonatedUser(auth_manager.mass, "user_a"):
+            ...
 
 
 async def test_join_code_length_at_least_12() -> None:
@@ -1594,3 +1899,87 @@ async def test_exchange_join_code_success_does_not_reset_rate_limit(
     result = await auth_manager.exchange_join_code(code)
     assert result["success"] is False
     assert "too many" in result["error"].lower()
+
+
+async def test_resolve_command_impersonation(auth_manager: AuthenticationManager) -> None:
+    """Test resolving the impersonation argument of an incoming API command."""
+    admin_user = await auth_manager.create_user(username="admin", role=UserRole.ADMIN)
+    standard_user = await auth_manager.create_user(username="user_a", role=UserRole.USER)
+    set_current_user(admin_user)
+    set_impersonated_user(None)
+
+    # no user argument present is a no-op and leaves other args untouched
+    args: dict[str, object] = {"queue_id": "abc"}
+    assert await resolve_command_impersonation(auth_manager.mass, args) is None
+    assert args == {"queue_id": "abc"}
+
+    # an empty string is deliberately treated as "no impersonation requested"
+    # (optional fields in automations/scripts commonly template to an empty string)
+    args = {"queue_id": "abc", "user": ""}
+    assert await resolve_command_impersonation(auth_manager.mass, args) is None
+    assert args == {"queue_id": "abc"}
+
+    # the user argument is popped and resolved (by username)
+    args = {"queue_id": "abc", "user": "user_a"}
+    resolved = await resolve_command_impersonation(auth_manager.mass, args)
+    assert resolved == standard_user
+    assert args == {"queue_id": "abc"}
+
+    # the user argument is also resolved by user_id
+    args = {"user": standard_user.user_id}
+    resolved = await resolve_command_impersonation(auth_manager.mass, args)
+    assert resolved == standard_user
+
+    # username is accepted as (deprecated) alias for user
+    args = {"username": "user_a"}
+    resolved = await resolve_command_impersonation(auth_manager.mass, args)
+    assert resolved == standard_user
+    assert args == {}
+
+    # a caller without the users.impersonate scope may not impersonate another user
+    set_current_user(standard_user)
+    with pytest.raises(InsufficientPermissions):
+        await resolve_command_impersonation(auth_manager.mass, {"user": "admin"})
+
+
+def test_has_scope() -> None:
+    """Test the scope check for each of the builtin user roles."""
+
+    def _user(role: str) -> User:
+        return User(user_id="abc123", username="testuser", role=role)
+
+    # admin has all scopes through the wildcard
+    assert has_scope(_user(UserRole.ADMIN), Scope.CONFIG_CORE_WRITE)
+    assert has_scope(_user(UserRole.ADMIN), Scope.LIBRARY_MANAGE)
+    # regular user
+    assert has_scope(_user(UserRole.USER), Scope.LIBRARY_WRITE)
+    assert has_scope(_user(UserRole.USER), Scope.CONFIG_CORE_READ)
+    assert not has_scope(_user(UserRole.USER), Scope.CONFIG_CORE_WRITE)
+    assert not has_scope(_user(UserRole.USER), Scope.USERS_IMPERSONATE)
+    # guest
+    assert has_scope(_user(UserRole.GUEST), Scope.LIBRARY_READ)
+    assert not has_scope(_user(UserRole.GUEST), Scope.LIBRARY_WRITE)
+    assert not has_scope(_user(UserRole.GUEST), Scope.CONFIG_CORE_READ)
+    # service
+    assert has_scope(_user(UserRole.SERVICE), Scope.USERS_IMPERSONATE)
+    assert has_scope(_user(UserRole.SERVICE), Scope.CONFIG_PLAYERS_WRITE)
+    assert not has_scope(_user(UserRole.SERVICE), Scope.CONFIG_CORE_WRITE)
+    # an unknown (custom) role id is fail-closed and grants no scopes at all
+    assert not has_scope(_user("some_future_role"), Scope.LIBRARY_READ)
+
+
+async def test_homeassistant_system_user_has_service_role(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """Test that the Home Assistant system user is created with the service role."""
+    system_user = await auth_manager.get_homeassistant_system_user()
+    assert system_user.role == UserRole.SERVICE
+
+    # a pre-existing system user with the old user role is migrated to service
+    await auth_manager.database.update(
+        "users", {"user_id": system_user.user_id}, {"role": UserRole.USER.value}
+    )
+    await auth_manager._migrate_system_user_role()
+    migrated_user = await auth_manager.get_user(system_user.user_id)
+    assert migrated_user is not None
+    assert migrated_user.role == UserRole.SERVICE

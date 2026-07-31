@@ -22,6 +22,8 @@ import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from music_assistant_models.auth import Scope
+
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.datetime import from_utc_timestamp, utc
 from music_assistant.helpers.diagnostics import (
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
 
     from music_assistant_models.config_entries import CoreConfig
 
+    from music_assistant.helpers.json import SerializableType
     from music_assistant.mass import MusicAssistant
 
 SCHEMA_VERSION = 1
@@ -60,7 +63,7 @@ CORE_CONTROLLER_ATTRS = (
 )
 
 type DiagnosticsSectionCallback = Callable[
-    [], dict[str, Any] | None | Awaitable[dict[str, Any] | None]
+    [], dict[str, SerializableType] | None | Awaitable[dict[str, SerializableType] | None]
 ]
 
 
@@ -115,7 +118,7 @@ class DiagnosticsController(CoreController):
 
         return unregister
 
-    @api_command("diagnostics/get", required_role="admin")
+    @api_command("diagnostics/get", required_scope=Scope.SYSTEM_MANAGE)
     async def get_report(self, include_log_tail: bool = False) -> dict[str, Any]:
         """
         Return a full (sanitized) diagnostics report.
@@ -199,7 +202,7 @@ class DiagnosticsController(CoreController):
                 "available": loaded.available if loaded else False,
             }
             if prov_conf.last_error is not None:
-                entry["last_error"] = sanitize_text(prov_conf.last_error)
+                entry["last_error"] = sanitize_text(prov_conf.last_error.message)
             providers.append(entry)
         providers.sort(key=lambda entry: (entry["domain"], entry["instance_id"]))
         return providers

@@ -13,7 +13,7 @@ from ipaddress import IPv4Address
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import ClientTimeout
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
 from zeroconf import (
     NonUniqueNameException,
@@ -100,22 +100,14 @@ class DiscoveryController(CoreController):
             self._schedule_periodic_ha_announce()
         self._schedule_periodic_upnp_discovery()
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict[str, ConfigValueType] | None = None,
-    ) -> tuple[ConfigEntry, ...]:
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return config entries for the discovery controller."""
-        del action, values
         return (
             CONF_ENTRY_ZEROCONF_INTERFACES,
             ConfigEntry(
                 key=CONF_UPNP_NETWORK_SCAN,
                 type=ConfigEntryType.BOOLEAN,
-                label="Allow network scan for UPnP discovery",
                 default_value=False,
-                description="Enable additional broadcast-based SSDP discovery. "
-                "Use this if some UPnP/DLNA devices do not answer regular discovery.",
                 requires_reload=False,
             ),
         )
@@ -159,7 +151,8 @@ class DiscoveryController(CoreController):
     async def async_find_mdns_service(
         self, service_type: str, name_filter: str, timeout: float = 3.0
     ) -> AsyncServiceInfo | None:
-        """Find an mDNS service by exact device name match, checking cache first then waiting.
+        """
+        Find an mDNS service by exact device name match, checking cache first then waiting.
 
         :param service_type: The mDNS service type (e.g., "_raop._tcp.local.").
         :param name_filter: Device name that must exactly match the service name portion.
@@ -263,7 +256,9 @@ class DiscoveryController(CoreController):
         info = AsyncServiceInfo(
             zeroconf_type,
             name=f"{server_id}.{zeroconf_type}",
-            addresses=[await get_ip_pton(self.mass.webserver.publish_ip)],
+            addresses=[
+                await get_ip_pton(address) for address in self.mass.webserver.publish_addresses
+            ],
             port=self.mass.webserver.publish_port,
             properties=self.mass.get_server_info().to_dict(),
             server="mass.local.",

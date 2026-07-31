@@ -56,7 +56,8 @@ class AsyncProcess:
         name: str | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
-        """Initialize AsyncProcess.
+        """
+        Initialize AsyncProcess.
 
         :param args: Command and arguments to execute.
         :param stdin: Stdin configuration (True for PIPE, False for None, or custom).
@@ -157,7 +158,8 @@ class AsyncProcess:
                 return err.partial
 
     async def read(self, n: int) -> bytes:
-        """Read up to n bytes from the stdout stream.
+        """
+        Read up to n bytes from the stdout stream.
 
         If n is positive, this function try to read n bytes,
         and may return less or equal bytes than requested, but at least one byte.
@@ -415,15 +417,30 @@ class AsyncProcess:
         self._stderr_reader_task = task
 
 
-async def check_output(*args: str, env: dict[str, str] | None = None) -> tuple[int, bytes]:
-    """Run subprocess and return returncode and output."""
+async def check_output(
+    *args: str, env: dict[str, str] | None = None, timeout: float | None = None
+) -> tuple[int, bytes]:
+    """
+    Run subprocess and return returncode and output.
+
+    :param env: Optional environment overrides for the subprocess.
+    :param timeout: Maximum seconds to wait for the process to exit. On expiry the
+        process is killed and TimeoutError is raised; None (default) waits forever.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         stderr=asyncio.subprocess.STDOUT,
         stdout=asyncio.subprocess.PIPE,
         env=get_subprocess_env(env),
     )
-    stdout, _ = await proc.communicate()
+    try:
+        async with asyncio.timeout(timeout):
+            stdout, _ = await proc.communicate()
+    except TimeoutError:
+        proc.kill()
+        with suppress(ProcessLookupError):
+            await proc.wait()
+        raise
     assert proc.returncode is not None  # for type checking
     return (proc.returncode, stdout)
 

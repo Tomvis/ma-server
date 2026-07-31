@@ -24,6 +24,7 @@ from music_assistant_models.media_items import (
     PodcastEpisode,
     ProviderMapping,
     Radio,
+    SoundEffect,
     Track,
     UniqueList,
 )
@@ -339,7 +340,8 @@ def generate_m3u(
     items: Sequence[PlaylistItem],
     playlist_image_url: str | None = None,
 ) -> str:
-    """Generate an M3U8 playlist string from PlaylistItem entries.
+    """
+    Generate an M3U8 playlist string from PlaylistItem entries.
 
     :param playlist_name: Human-readable name (written as #PLAYLIST directive).
     :param items: Entries to write. Only fields that are set are emitted.
@@ -405,7 +407,8 @@ def construct_media_item_from_playlist_item(
     item: PlaylistItem,
     mass: MusicAssistant,
 ) -> MediaItemType | None:
-    """Construct a MediaItem from a PlaylistItem's stored metadata.
+    """
+    Construct a MediaItem from a PlaylistItem's stored metadata.
 
     Resolves provider mappings by instance_id first (free dict lookup),
     falling back to domain if the instance no longer exists.
@@ -432,7 +435,17 @@ def construct_media_item_from_playlist_item(
     item_id = first_provider.item_id if first_provider else item.path.rsplit("/", 1)[-1]
 
     media_item: MediaItemType
-    if media_type == MediaType.RADIO:
+    if media_type == MediaType.SOUND_EFFECT:
+        media_item = SoundEffect(
+            item_id=item_id,
+            provider=item_provider,
+            name=name,
+            provider_mappings=provider_mappings,
+            external_ids=external_ids,
+        )
+        if duration is not None:
+            media_item.duration = duration
+    elif media_type == MediaType.RADIO:
         media_item = Radio(
             item_id=item_id,
             provider=item_provider,
@@ -672,7 +685,8 @@ def collect_podcast_info(full_item: MediaItem) -> PodcastInfo | None:
 
 
 def media_item_to_playlist_item(full_item: MediaItem) -> PlaylistItem:
-    """Convert a MediaItem to a PlaylistItem with full M3U metadata.
+    """
+    Convert a MediaItem to a PlaylistItem with full M3U metadata.
 
     Pure conversion — takes an already-fetched MediaItem and produces a
     PlaylistItem suitable for ``generate_m3u``.

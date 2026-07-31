@@ -1,4 +1,5 @@
-"""Smart Playlist Plugin Provider for Music Assistant.
+"""
+Smart Playlist Plugin Provider for Music Assistant.
 
 Allows creating rule-based playlists (dynamic or fixed) from library tracks,
 filtered by genres, artists, albums, favorites, popularity and similar tracks.
@@ -18,23 +19,23 @@ import uuid as _uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace as dc_replace
+from itertools import zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
     AlbumType,
     ConfigEntryType,
     EventType,
-    ImageType,
     MediaType,
     ProviderFeature,
 )
-from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
+from music_assistant_models.errors import InvalidDataError, MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
-    MediaItemImage,
     MediaItemType,
     Playlist,
     ProviderMapping,
@@ -42,12 +43,13 @@ from music_assistant_models.media_items import (
     Track,
     UniqueList,
 )
-from music_assistant_models.media_items.metadata import MediaItemMetadata
+from music_assistant_models.media_items.metadata import MediaItemImage, MediaItemMetadata
 
 from music_assistant.constants import DYNAMIC_PLAYLIST_SAMPLE_SIZE
 from music_assistant.controllers.cache import use_cache
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.security import is_safe_name
+from music_assistant.helpers.track_filter import filter_tracks
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.smart_playlist.helpers import (
@@ -62,7 +64,7 @@ from music_assistant.providers.smart_playlist.helpers import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
 
@@ -89,25 +91,60 @@ async def setup(
     return SmartPlaylistProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,  # noqa: ARG001
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
-) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
-    return (
-        ConfigEntry(
-            key=CONF_AI_DESCRIPTIONS,
-            type=ConfigEntryType.BOOLEAN,
-            label="Generate descriptions with AI",
-            description="When a provider with AI support is available, use it to write a "
-            "natural-language description for each smart playlist. Falls back to a plain "
-            "rules summary when no AI provider is available.",
-            required=False,
-            default_value=True,
-        ),
-    )
+def _filter_by_explicit(tracks: list[Track], explicit_rule: bool | None) -> list[Track]:
+    """
+    Filter tracks based on the explicit content rule.
+
+    :param tracks: List of tracks to filter.
+    :param explicit_rule: True = only explicit tracks, False = exclude explicit tracks,
+                          None = no filter.
+    :return: Filtered list of tracks.
+    """
+    if explicit_rule is True:
+        # Only include tracks explicitly marked as explicit
+        return [t for t in tracks if t.metadata.explicit is True]
+    if explicit_rule is False:
+        # Exclude tracks explicitly marked as explicit; pass through unknown
+        return [t for t in tracks if t.metadata.explicit is not True]
+    return tracks
+
+
+def _filter_by_duration(
+    tracks: list[Track], min_duration: int | None, max_duration: int | None
+) -> list[Track]:
+    """
+    Filter tracks based on duration bounds.
+
+    :param tracks: List of tracks to filter.
+    :param min_duration: Minimum duration in seconds (None = no minimum).
+    :param max_duration: Maximum duration in seconds (None = no maximum).
+    :return: Filtered list of tracks.
+    """
+    if min_duration is not None:
+        tracks = [t for t in tracks if t.duration and t.duration >= min_duration]
+    if max_duration is not None:
+        tracks = [t for t in tracks if t.duration and t.duration <= max_duration]
+    return tracks
+
+
+def _filter_by_last_played(tracks: list[Track], value: int | None, unit: str | None) -> list[Track]:
+    """
+    Filter tracks not played within a specified time period.
+
+    :param tracks: List of tracks to filter.
+    :param value: Time value (None = no filter).
+    :param unit: Time unit: "hours", "days", "weeks", "months" (None = no filter).
+    :return: Filtered list of tracks not played in the specified period (includes never-played).
+    """
+    if value is None or unit is None:
+        return tracks
+
+    # Convert to seconds based on unit
+    seconds_per_unit = {"hours": 3600, "days": 86400, "weeks": 604800, "months": 2592000}
+    seconds = value * seconds_per_unit.get(unit, 86400)  # Default to days if unknown
+
+    threshold_timestamp = int(time.time()) - seconds
+    return [t for t in tracks if not t.last_played or t.last_played < threshold_timestamp]
 
 
 class SmartPlaylistProvider(PluginProvider):
@@ -119,6 +156,17 @@ class SmartPlaylistProvider(PluginProvider):
     _descriptions_store: dict[str, str]
     _unregister_handles: list[Callable[[], None]]
     _flush_lock: asyncio.Lock
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return (
+            ConfigEntry(
+                key=CONF_AI_DESCRIPTIONS,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                default_value=True,
+            ),
+        )
 
     async def handle_async_init(self) -> None:
         """Handle async initialization."""
@@ -135,29 +183,49 @@ class SmartPlaylistProvider(PluginProvider):
     async def loaded_in_mass(self) -> None:
         """Register API commands after the provider is loaded."""
         self._unregister_handles.append(
-            self.mass.register_api_command("smart_playlists/create", self.create_smart_playlist)
-        )
-        self._unregister_handles.append(
-            self.mass.register_api_command("smart_playlists/generate", self.generate_playlist)
-        )
-        self._unregister_handles.append(
             self.mass.register_api_command(
-                "smart_playlists/get_rules", self.get_smart_playlist_rules
+                "smart_playlists/create",
+                self.create_smart_playlist,
+                required_scope=Scope.LIBRARY_WRITE,
             )
         )
         self._unregister_handles.append(
             self.mass.register_api_command(
-                "smart_playlists/update_rules", self.update_smart_playlist_rules
+                "smart_playlists/generate",
+                self.generate_playlist,
+                required_scope=Scope.LIBRARY_WRITE,
             )
         )
         self._unregister_handles.append(
-            self.mass.register_api_command("smart_playlists/list", self.list_smart_playlists)
+            self.mass.register_api_command(
+                "smart_playlists/get_rules",
+                self.get_smart_playlist_rules,
+                required_scope=Scope.LIBRARY_READ,
+            )
         )
         self._unregister_handles.append(
-            self.mass.register_api_command("smart_playlists/preview_tracks", self.preview_tracks)
+            self.mass.register_api_command(
+                "smart_playlists/update_rules",
+                self.update_smart_playlist_rules,
+                required_scope=Scope.LIBRARY_WRITE,
+            )
         )
         self._unregister_handles.append(
-            self.mass.register_api_command("smart_playlists/count_tracks", self.count_tracks)
+            self.mass.register_api_command(
+                "smart_playlists/list", self.list_smart_playlists, required_scope=Scope.LIBRARY_READ
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "smart_playlists/preview_tracks",
+                self.preview_tracks,
+                required_scope=Scope.LIBRARY_READ,
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "smart_playlists/count_tracks", self.count_tracks, required_scope=Scope.LIBRARY_READ
+            )
         )
         # Subscribe to library events to handle playlist deletion and renaming.
         self._unregister_handles.append(
@@ -171,6 +239,9 @@ class SmartPlaylistProvider(PluginProvider):
         )
         # Re-add playlists missing from the library (e.g. after a DB reset).
         self.mass.create_task(self._reconcile_library())
+        # One-time migration: remove legacy icon.svg from smart playlists
+        # TODO: remove after 2.10 release
+        self.mass.create_task(self._migrate_legacy_icon())
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
@@ -205,21 +276,38 @@ class SmartPlaylistProvider(PluginProvider):
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
         """Browse smart playlists."""
-        return [self._build_playlist(pid, rules) for pid, rules in self._rules_store.items()]
+        playlists = []
+        for pid, rules in self._rules_store.items():
+            playlists.append(await self._build_playlist(pid, rules))
+        return playlists
 
-    async def recommendations(self) -> list[RecommendationFolder]:
-        """Return smart playlists as a recommendation folder."""
-        playlists = [self._build_playlist(pid, r) for pid, r in self._rules_store.items()]
-        if not playlists:
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Get this plugin's available recommendation rows, without items."""
+        if not self._rules_store:
             return []
         return [
             RecommendationFolder(
                 item_id="smart_playlists",
-                provider=self.domain,
+                provider=self.instance_id,
                 name="Smart Playlists",
-                items=playlists,  # type: ignore[arg-type]
+                translation_key="smart_playlists",
             )
         ]
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Get the smart playlists for a single recommendation row.
+
+        :param item_id: The item_id of the row, as returned by get_recommendations.
+        """
+        items: UniqueList[MediaItemType | ItemMapping | BrowseFolder] = UniqueList()
+        if item_id != "smart_playlists":
+            return items
+        for pid, rules in self._rules_store.items():
+            items.append(await self._build_playlist(pid, rules))
+        return items
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
         """Get playlist details by provider id."""
@@ -227,10 +315,13 @@ class SmartPlaylistProvider(PluginProvider):
         if rules is None:
             msg = f"Smart playlist {prov_playlist_id} not found"
             raise MediaNotFoundError(msg)
-        return self._build_playlist(resolved_id, rules)
+
+        # Build playlist from rules
+        return await self._build_playlist(resolved_id, rules)
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
-        """Evaluate rules and return tracks.
+        """
+        Evaluate rules and return tracks.
 
         Returns a full batch on page 0; empty list on subsequent pages. Dynamic playlists
         return a bounded buffer (``DYNAMIC_PLAYLIST_SAMPLE_SIZE``) cached for
@@ -252,7 +343,10 @@ class SmartPlaylistProvider(PluginProvider):
         user_provider_filter = (
             tuple(sorted(user.provider_filter)) if user and user.provider_filter else ()
         )
-        return await self._cached_dynamic_sample(resolved_id, user_provider_filter)
+        # Filter the cached sample at the boundary (not inside the cached evaluation) so a
+        # recency-filtered batch from a queue refill never gets cached and served to browse.
+        sample = await self._cached_dynamic_sample(resolved_id, user_provider_filter)
+        return filter_tracks(sample)
 
     @use_cache(
         expiration=DYNAMIC_SAMPLE_CACHE_EXPIRATION,
@@ -284,10 +378,42 @@ class SmartPlaylistProvider(PluginProvider):
                 if existing is not None:
                     continue
                 self.logger.info("Re-adding missing smart playlist '%s' to library", playlist_id)
-                playlist = self._build_playlist(playlist_id, rules)
+                playlist = await self._build_playlist(playlist_id, rules)
                 await self.mass.music.playlists.add_item_to_library(playlist)
             except Exception as exc:
                 self.logger.warning("Could not re-add smart playlist %s: %s", playlist_id, exc)
+
+    async def _migrate_legacy_icon(self) -> None:
+        """Remove legacy icon.svg from smart playlists (added by versions prior to PR #4447)."""
+        try:
+            migrated_count = 0
+            async for playlist in self.mass.music.playlists.iter_library_items(
+                provider=self.instance_id
+            ):
+                if not playlist.metadata.images:
+                    continue
+
+                old_images = [
+                    img
+                    for img in playlist.metadata.images
+                    if not (img.path == "icon.svg" and img.provider == self.instance_id)
+                ]
+
+                if len(old_images) != len(playlist.metadata.images):
+                    playlist.metadata.images = UniqueList(old_images)
+                    await self.mass.music.playlists.update_item_in_library(
+                        playlist.item_id, playlist, overwrite=True
+                    )
+                    migrated_count += 1
+                    self.logger.debug(
+                        "Migrated smart playlist '%s' - removed legacy icon.svg", playlist.name
+                    )
+            if migrated_count > 0:
+                self.logger.info(
+                    "Migrated %d smart playlist(s) - removed legacy icon.svg", migrated_count
+                )
+        except Exception as exc:
+            self.logger.warning("Failed to migrate legacy icons: %s", exc)
 
     async def _on_media_item_deleted(self, event: MassEvent) -> None:
         """Remove the rules for a deleted smart playlist."""
@@ -305,7 +431,7 @@ class SmartPlaylistProvider(PluginProvider):
                 break
 
     async def _on_media_item_updated(self, event: MassEvent) -> None:
-        """Sync library playlist name changes back to the in-memory/disk store."""
+        """Sync library playlist name back to the in-memory store."""
         item = event.data
         if not isinstance(item, Playlist):
             return
@@ -325,7 +451,8 @@ class SmartPlaylistProvider(PluginProvider):
         rules: dict[str, Any],
         is_dynamic: bool = True,
     ) -> Playlist:
-        """Create a new smart playlist with the given rules.
+        """
+        Create a new smart playlist with the given rules.
 
         :param name: Name for the new playlist.
         :param rules: Dictionary of SmartPlaylistRules fields.
@@ -334,7 +461,12 @@ class SmartPlaylistProvider(PluginProvider):
         """
         if not is_safe_name(name):
             msg = f"{name} is not a valid playlist name"
-            raise InvalidDataError(msg)
+            raise InvalidDataError(
+                msg,
+                translation_key="invalid_name",
+                translation_owner=self.translation_owner,
+                translation_args=[name],
+            )
 
         parsed_rules = SmartPlaylistRules.from_dict(rules)
         parsed_rules.is_dynamic = is_dynamic
@@ -344,7 +476,7 @@ class SmartPlaylistProvider(PluginProvider):
         self._names_store[playlist_id] = name
         await self._save_rules(playlist_id, parsed_rules)
 
-        playlist = self._build_playlist(playlist_id, parsed_rules)
+        playlist = await self._build_playlist(playlist_id, parsed_rules)
         library_playlist = await self.mass.music.playlists.add_item_to_library(playlist)
         self.mass.metadata.schedule_update_metadata(library_playlist)
         self._schedule_ai_description_refresh(playlist_id)
@@ -356,7 +488,8 @@ class SmartPlaylistProvider(PluginProvider):
         rules: dict[str, Any],
         count: int | None = None,
     ) -> Playlist:
-        """Evaluate rules once and create a static (non-dynamic) builtin playlist.
+        """
+        Evaluate rules once and create a static (non-dynamic) builtin playlist.
 
         :param name: Name for the new playlist.
         :param rules: Dictionary of SmartPlaylistRules fields.
@@ -365,7 +498,12 @@ class SmartPlaylistProvider(PluginProvider):
         """
         if not is_safe_name(name):
             msg = f"{name} is not a valid playlist name"
-            raise InvalidDataError(msg)
+            raise InvalidDataError(
+                msg,
+                translation_key="invalid_name",
+                translation_owner=self.translation_owner,
+                translation_args=[name],
+            )
 
         parsed_rules = SmartPlaylistRules.from_dict(rules)
         self._validate_rules(parsed_rules)
@@ -395,7 +533,8 @@ class SmartPlaylistProvider(PluginProvider):
         return final_playlist
 
     async def get_smart_playlist_rules(self, playlist_id: str) -> dict[str, Any] | None:
-        """Return the smart playlist rules for the given playlist id.
+        """
+        Return the smart playlist rules for the given playlist id.
 
         :param playlist_id: Provider playlist id (UUID) or library DB id (integer string).
         :return: Rules dict or None if not found.
@@ -413,7 +552,8 @@ class SmartPlaylistProvider(PluginProvider):
         playlist_id: str,
         rules: dict[str, Any],
     ) -> None:
-        """Update the rules for an existing smart playlist.
+        """
+        Update the rules for an existing smart playlist.
 
         :param playlist_id: Provider playlist id (UUID) or library DB id (integer string).
         :param rules: Updated SmartPlaylistRules fields as dict.
@@ -427,6 +567,9 @@ class SmartPlaylistProvider(PluginProvider):
         if existing is not None:
             parsed_rules.is_dynamic = existing.is_dynamic
         self._validate_rules(parsed_rules)
+
+        rules_changed = existing is None or existing.to_dict() != parsed_rules.to_dict()
+
         # Drop the stale AI description before saving so it is invalidated on disk in the
         # same flush as the rule change, not left behind until the background refresh runs.
         self._descriptions_store.pop(prov_id, None)
@@ -439,6 +582,14 @@ class SmartPlaylistProvider(PluginProvider):
             await self._update_playlist_description(
                 library_item.item_id, self._description_for(prov_id, parsed_rules)
             )
+            if rules_changed:
+                self.mass.call_later(
+                    5,
+                    self.mass.metadata.update_metadata,
+                    library_item,
+                    task_id=f"smart_playlist_metadata_refresh_{prov_id}",
+                    force_refresh=True,
+                )
         self._schedule_ai_description_refresh(prov_id)
 
     async def list_smart_playlists(self) -> list[dict[str, Any]]:
@@ -454,7 +605,8 @@ class SmartPlaylistProvider(PluginProvider):
         ]
 
     async def count_tracks(self, rules: dict[str, Any]) -> dict[str, Any]:
-        """Return the track count and approximate total duration for the given rules.
+        """
+        Return the track count and approximate total duration for the given rules.
 
         :param rules: SmartPlaylistRules fields as dict.
         :return: Dict with ``count`` (int) and ``duration_seconds`` (int).
@@ -472,7 +624,8 @@ class SmartPlaylistProvider(PluginProvider):
         rules: dict[str, Any],
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Return a preview of tracks matching the given rules.
+        """
+        Return a preview of tracks matching the given rules.
 
         :param rules: SmartPlaylistRules fields as dict.
         :param limit: Maximum number of preview tracks to return.
@@ -524,7 +677,7 @@ class SmartPlaylistProvider(PluginProvider):
             self.logger.debug("Could not resolve playlist id %s: %s", playlist_id, err)
         return None
 
-    def _build_playlist(self, playlist_id: str, rules: SmartPlaylistRules) -> Playlist:
+    async def _build_playlist(self, playlist_id: str, rules: SmartPlaylistRules) -> Playlist:
         """Build a Playlist object from stored rules."""
         name = self._names_store.get(playlist_id, playlist_id)
         playlist = Playlist(
@@ -546,18 +699,18 @@ class SmartPlaylistProvider(PluginProvider):
         playlist.is_dynamic = rules.is_dynamic
         playlist.metadata = MediaItemMetadata(
             description=self._description_for(playlist_id, rules),
-            images=UniqueList(
-                [
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path="icon.svg",
-                        provider=self.instance_id,
-                        remotely_accessible=False,
-                    )
-                ]
-            ),
+            images=await self._images_for(playlist_id),
         )
         return playlist
+
+    async def _images_for(self, playlist_id: str) -> UniqueList[MediaItemImage]:
+        """Return images for the playlist from the library, or empty list if none available."""
+        library_item = await self.mass.music.playlists.get_library_item_by_prov_id(
+            playlist_id, self.instance_id
+        )
+        if library_item and library_item.metadata and library_item.metadata.images:
+            return library_item.metadata.images
+        return UniqueList([])
 
     async def resolve_image(self, path: str) -> str | bytes:
         """Return the smart playlist provider icon as fallback image."""
@@ -577,14 +730,12 @@ class SmartPlaylistProvider(PluginProvider):
         user_provider_filter: list[str] | None = None,
     ) -> list[Track]:
         """Evaluate the rules and return a list of matching Track objects."""
-        has_genre_filter = bool(rules.genre_ids)
-
         seed_uris = rules.all_seed_uris()
         if seed_uris:
             # Seed mode: a similar-tracks pool derived from the seeds is the exclusive source.
             # artist_ids and album_ids are ignored per design.
             tracks = await self._tracks_from_seeds(seed_uris, target_size=rules.limit)
-            tracks = await self._apply_seed_post_filters(tracks, rules, has_genre_filter)
+            tracks = await self._apply_seed_post_filters(tracks, rules)
         else:
             if rules.logic == LOGIC_AND:
                 tracks = await self._evaluate_and(rules, user_provider_filter)
@@ -599,6 +750,8 @@ class SmartPlaylistProvider(PluginProvider):
                     and t.metadata.popularity is not None
                     and t.metadata.popularity >= rules.min_popularity
                 ]
+
+            # Explicit filter is now handled at SQL level via _get_library_tracks()
 
             if rules.year_from is not None or rules.year_to is not None:
                 tracks = [
@@ -616,7 +769,19 @@ class SmartPlaylistProvider(PluginProvider):
                 allowed_album_ids = await self._get_album_ids_for_types(rules.album_types)
                 tracks = self._filter_by_album_ids(tracks, allowed_album_ids)
 
-        # Apply exclusions and dedup regardless of source mode
+            # Apply duration and last_played filters
+            tracks = _filter_by_duration(tracks, rules.min_duration, rules.max_duration)
+            tracks = _filter_by_last_played(
+                tracks, rules.last_played_before_value, rules.last_played_before_unit
+            )
+
+            # In non-seed mode, _evaluate_and/_evaluate_or already query by genre_ids.
+            # Only enrich if excluded_genre_ids is set (needs track.metadata.genres).
+            if rules.excluded_genre_ids:
+                await self._enrich_tracks_with_db_genres(tracks)
+
+        # Apply exclusions regardless of source mode. Recency (don't repeat recently-played) is
+        # no longer handled here: the player queue owns it globally for dynamic playlists.
         excluded_genre_names, excl_album_type_ids = await asyncio.gather(
             self._resolve_excluded_genre_names(rules),
             self._get_album_ids_for_types(rules.excluded_album_types)
@@ -627,29 +792,6 @@ class SmartPlaylistProvider(PluginProvider):
             tracks, rules, excluded_genre_names, excl_album_type_ids or None
         )
         tracks = self._deduplicate_tracks(tracks)
-        if rules.dedup_hours is not None:
-            deduped = await self._apply_dedup(tracks, rules.dedup_hours)
-            if len(deduped) >= rules.limit:
-                tracks = deduped
-            elif deduped:
-                # Pool partially exhausted: fill remainder with least-recently-played tracks
-                # so playback never stops when the dedup window covers most of the library.
-                deduped_uris = {t.uri for t in deduped}
-                played_remainder = sorted(
-                    (t for t in tracks if t.uri not in deduped_uris),
-                    # last_played is 0 for non-library (streaming) tracks; treat 0 as
-                    # "most recent" so just-played streaming tracks aren't filled first.
-                    key=lambda t: t.last_played or float("inf"),
-                )
-                tracks = deduped + played_remainder[: rules.limit - len(deduped)]
-            else:
-                # All matching tracks were played recently — ignore dedup entirely so
-                # the playlist never goes empty.
-                self.logger.debug(
-                    "dedup_hours=%d exhausted the full track pool; ignoring dedup",
-                    rules.dedup_hours,
-                )
-
         random.shuffle(tracks)
         return tracks[: rules.limit]
 
@@ -657,9 +799,10 @@ class SmartPlaylistProvider(PluginProvider):
         self,
         tracks: list[Track],
         rules: SmartPlaylistRules,
-        has_genre_filter: bool,
     ) -> list[Track]:
         """Apply post-filters (popularity, favorites, genre, year) to a seed-derived track list."""
+        has_genre_filter = bool(rules.genre_ids or rules.excluded_genre_ids)
+
         if rules.min_popularity is not None:
             tracks = [
                 t
@@ -670,9 +813,18 @@ class SmartPlaylistProvider(PluginProvider):
             ]
         if rules.favorites_only:
             tracks = [t for t in tracks if t.favorite]
+
+        # Apply explicit filter in seed/discover mode post-filtering
+        tracks = _filter_by_explicit(tracks, rules.explicit)
+
+        if has_genre_filter:
+            await self._enrich_tracks_with_db_genres(tracks)
+
         if has_genre_filter and rules.logic == LOGIC_AND:
-            # Best-effort genre filter: resolve names then match against track genre metadata.
-            # Tracks without genre metadata are kept (don't exclude for missing data).
+            # Genre filter: resolve names and match against track genre metadata.
+            # Note: Library tracks have been enriched with DB genres above.
+            # Non-library streaming tracks may still lack genre metadata and will be kept
+            # (don't exclude for missing data).
             genre_id_to_name = dict(rules.genre_names)
             for genre_id in rules.genre_ids:
                 if genre_id not in genre_id_to_name:
@@ -702,7 +854,12 @@ class SmartPlaylistProvider(PluginProvider):
         if rules.album_types:
             allowed_album_ids = await self._get_album_ids_for_types(rules.album_types)
             tracks = self._filter_by_album_ids(tracks, allowed_album_ids)
-        return tracks
+
+        # Apply duration and last_played filters in seed mode
+        tracks = _filter_by_duration(tracks, rules.min_duration, rules.max_duration)
+        return _filter_by_last_played(
+            tracks, rules.last_played_before_value, rules.last_played_before_unit
+        )
 
     def _apply_exclusions(
         self,
@@ -782,6 +939,7 @@ class SmartPlaylistProvider(PluginProvider):
                 album_types=album_type_enums,
                 limit=chunk,
                 offset=offset,
+                summary=False,
             )
             for a in page:
                 if a.item_id and str(a.item_id).isdigit():
@@ -874,6 +1032,42 @@ class SmartPlaylistProvider(PluginProvider):
 
         return track_id_to_tracks
 
+    async def _enrich_tracks_with_db_genres(self, tracks: list[Track]) -> None:
+        """
+        Enrich library tracks with genre data from the database.
+
+        For tracks missing genre metadata, retrieves genre associations from the database
+        and populates track.metadata.genres.
+        """
+        if not tracks:
+            return
+
+        track_id_to_tracks = await self._build_track_id_map(tracks, skip_tracks_with_genres=True)
+        if not track_id_to_tracks:
+            return
+
+        # Fetch genres for all track IDs in parallel
+        track_ids = list(track_id_to_tracks.keys())
+        genre_results = await asyncio.gather(
+            *(
+                self.mass.music.genres.get_genres_for_media_item(MediaType.TRACK, track_id)
+                for track_id in track_ids
+            )
+        )
+
+        # Apply genres to tracks
+        for track_id, genres in zip(track_ids, genre_results, strict=True):
+            tracks_list = track_id_to_tracks[track_id]
+            if not genres:
+                continue
+            for track in tracks_list:
+                if not track.metadata:
+                    track.metadata = MediaItemMetadata()
+                if not track.metadata.genres:
+                    track.metadata.genres = set()
+                for genre in genres:
+                    track.metadata.genres.add(genre.name)
+
     async def _filter_tracks_with_all_genres(
         self, tracks: list[Track], required_genre_ids: list[int]
     ) -> list[Track]:
@@ -915,37 +1109,6 @@ class SmartPlaylistProvider(PluginProvider):
 
         return result
 
-    async def _recently_played_keys(self, dedup_hours: int) -> set[tuple[str, str]]:
-        """
-        Return ``(provider, item_id)`` keys of tracks fully played within dedup_hours.
-
-        Scoped to the current user. ``recently_played`` resolves the user from the active
-        context; during queue refills the player queue restores the queue owner's user
-        context before evaluating, so the dedup window is per user without resolving here.
-        """
-        cutoff = int(time.time()) - dedup_hours * 3600
-        played = await self.mass.music.recently_played(
-            limit=0,
-            media_types=[MediaType.TRACK],
-            fully_played_only=True,
-            played_after_timestamp=cutoff,
-        )
-        return {(item.provider, item.item_id) for item in played}
-
-    async def _apply_dedup(self, tracks: list[Track], dedup_hours: int) -> list[Track]:
-        """Filter out tracks fully played within dedup_hours (scoped to the current user)."""
-        played_keys = await self._recently_played_keys(dedup_hours)
-        if not played_keys:
-            return list(tracks)
-        return [
-            t
-            for t in tracks
-            if not any(
-                (pm.provider_instance, pm.item_id) in played_keys
-                for pm in (t.provider_mappings or ())
-            )
-        ]
-
     async def _evaluate_and(
         self,
         rules: SmartPlaylistRules,
@@ -962,6 +1125,7 @@ class SmartPlaylistProvider(PluginProvider):
             return await self._get_library_tracks(
                 favorite=None,
                 genre_ids=None,
+                explicit=rules.explicit,
                 limit=min(rules.limit * 3, 2000),
                 user_provider_filter=user_provider_filter,
             )
@@ -971,6 +1135,7 @@ class SmartPlaylistProvider(PluginProvider):
         base_tracks = await self._get_library_tracks(
             favorite=favorite,
             genre_ids=genre_ids,
+            explicit=rules.explicit,
             limit=min(rules.limit * 5, 2000),
             user_provider_filter=user_provider_filter,
         )
@@ -1013,7 +1178,10 @@ class SmartPlaylistProvider(PluginProvider):
 
         if rules.favorites_only:
             for track in await self._get_library_tracks(
-                favorite=True, limit=fetch_limit, user_provider_filter=user_provider_filter
+                favorite=True,
+                explicit=rules.explicit,
+                limit=fetch_limit,
+                user_provider_filter=user_provider_filter,
             ):
                 if track.uri:
                     track_sets[track.uri] = track
@@ -1021,6 +1189,7 @@ class SmartPlaylistProvider(PluginProvider):
         if rules.genre_ids:
             for track in await self._get_library_tracks(
                 genre_ids=rules.genre_ids,
+                explicit=rules.explicit,
                 limit=fetch_limit,
                 user_provider_filter=user_provider_filter,
             ):
@@ -1029,7 +1198,9 @@ class SmartPlaylistProvider(PluginProvider):
 
         if rules.artist_ids or rules.album_ids:
             all_tracks = await self._get_library_tracks(
-                limit=min(fetch_limit * 2, FETCH_LIMIT), user_provider_filter=user_provider_filter
+                explicit=rules.explicit,
+                limit=min(fetch_limit * 2, FETCH_LIMIT),
+                user_provider_filter=user_provider_filter,
             )
             if rules.artist_ids:
                 artist_id_set = set(rules.artist_ids)
@@ -1060,7 +1231,9 @@ class SmartPlaylistProvider(PluginProvider):
         )
         if no_filters:
             for track in await self._get_library_tracks(
-                limit=fetch_limit, user_provider_filter=user_provider_filter
+                explicit=rules.explicit,
+                limit=fetch_limit,
+                user_provider_filter=user_provider_filter,
             ):
                 if track.uri:
                     track_sets[track.uri] = track
@@ -1071,6 +1244,7 @@ class SmartPlaylistProvider(PluginProvider):
         self,
         favorite: bool | None = None,
         genre_ids: list[int] | None = None,
+        explicit: bool | None = None,
         limit: int = 500,
         user_provider_filter: list[str] | None = None,
     ) -> list[Track]:
@@ -1078,13 +1252,15 @@ class SmartPlaylistProvider(PluginProvider):
         return await self.mass.music.tracks.library_items(
             favorite=favorite,
             genre=genre_ids,
+            explicit=explicit,
             limit=limit,
             order_by="random",
             provider=user_provider_filter,
+            summary=False,
         )
 
     async def _tracks_from_seeds(self, seed_uris: list[str], target_size: int) -> list[Track]:
-        """Resolve seed URIs to media items and feed them through the dynamic radio helper."""
+        """Build a pool of each seed's own tracks plus tracks similar to them."""
         seeds: list[MediaItemType] = []
         for uri in seed_uris:
             try:
@@ -1099,15 +1275,37 @@ class SmartPlaylistProvider(PluginProvider):
                 self.logger.warning("Could not resolve seed %s: %s", uri, exc)
         if not seeds:
             return []
-        try:
-            return await self.mass.music.get_dynamic_radio_tracks(
-                seeds,
-                include_base_tracks=True,
-                target_size=target_size,
-            )
-        except Exception as exc:
-            self.logger.warning("Dynamic radio generation failed for seeds %s: %s", seed_uris, exc)
-            return []
+        # round-robin each seed's own pool so seeds contribute evenly; `seen` dedupes across them
+        pool_cap = target_size * 3
+        per_seed_cap = -(-pool_cap // len(seeds))  # ceil, so the pools can still fill the cap
+        seen: set[Track] = set()
+        per_seed_pools: list[list[Track]] = []
+        for seed in seeds:
+            seed_pool: list[Track] = []
+            with suppress(MusicAssistantError):
+                seed_tracks = await self.mass.player_queues.get_tracks_for_playback(seed)
+                # shuffle so seeds are drawn from across the whole playlist, not just its top
+                random.shuffle(seed_tracks)
+                for base in seed_tracks:
+                    if len(seed_pool) >= per_seed_cap:
+                        break
+                    if base not in seen:
+                        seen.add(base)
+                        seed_pool.append(base)
+                    with suppress(MusicAssistantError):
+                        for track in await self.mass.music.tracks.similar_tracks(
+                            base.item_id, base.provider
+                        ):
+                            if len(seed_pool) >= per_seed_cap:
+                                break
+                            if track not in seen:
+                                seen.add(track)
+                                seed_pool.append(track)
+            per_seed_pools.append(seed_pool)
+        pool: list[Track] = []
+        for round_tracks in zip_longest(*per_seed_pools):
+            pool.extend(track for track in round_tracks if track is not None)
+        return pool[:pool_cap]
 
     async def _update_playlist_description(
         self, library_item_id: int | str, description: str

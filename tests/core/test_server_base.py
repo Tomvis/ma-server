@@ -1,11 +1,14 @@
 """Tests for the core Music Assistant server object."""
 
 import asyncio
+from typing import TYPE_CHECKING
 
 from music_assistant_models.enums import EventType
-from music_assistant_models.event import MassEvent
 
 from music_assistant.mass import MusicAssistant
+
+if TYPE_CHECKING:
+    from music_assistant_models.event import MassEvent
 
 
 async def test_start_and_stop_server(mass: MusicAssistant) -> None:
@@ -31,7 +34,7 @@ async def test_events(mass: MusicAssistant) -> None:
     filters: list[tuple[EventType | tuple[EventType, ...] | None, str | tuple[str, ...] | None]] = [
         (None, None),
         (EventType.UNKNOWN, None),
-        ((EventType.UNKNOWN, EventType.AUTH_SESSION), None),
+        ((EventType.UNKNOWN, EventType.PLAYER_ADDED), None),
         (None, "myid1"),
         (None, ("myid1", "myid2")),
         (EventType.UNKNOWN, "myid1"),

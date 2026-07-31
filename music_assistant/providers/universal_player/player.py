@@ -75,9 +75,25 @@ class UniversalPlayer(Player):
     def available(self) -> bool:
         """Return if the player is currently available."""
         return any(
-            (p := self.mass.players.get_player(pid)) and p.available
+            (p := self.mass.players.get_player(pid)) and p.available_for_playback
             for pid in self._protocol_player_ids
         )
+
+    @property
+    def needs_setup(self) -> bool:
+        """Return if the player needs setup (a protocol is connected but not set up)."""
+        if self.available:
+            return False
+        return self._get_protocol_player_needing_setup() is not None
+
+    @property
+    def setup_reason(self) -> str | None:
+        """Return why the player needs setup, or None when it is ready to use."""
+        if self.available:
+            return None
+        if protocol_player := self._get_protocol_player_needing_setup():
+            return protocol_player.setup_reason
+        return None
 
     @property
     def supported_features(self) -> set[PlayerFeature]:
@@ -119,6 +135,12 @@ class UniversalPlayer(Player):
         """Return the current media being played by the player."""
         if ext_player := self._get_protocol_player_with_external_source():
             return ext_player.current_media
+        if protocol_player := self._get_active_output_protocol_player():
+            # while playing through an output protocol player, surface its raw current_media
+            # so consumers of this player's raw value (e.g. a sync group mirroring its leader)
+            # can resolve the active queue item. Reading the protocol player's .state here would
+            # route back through this player's __final_current_media and lose the queue item id.
+            return protocol_player.current_media
         return None
 
     @property
@@ -169,6 +191,20 @@ class UniversalPlayer(Player):
         """Remove a protocol player from this universal player."""
         if protocol_player_id in self._protocol_player_ids:
             self._protocol_player_ids.remove(protocol_player_id)
+
+    def _get_protocol_player_needing_setup(self) -> Player | None:
+        """Return the first connected protocol player that still needs setup, if any."""
+        for pid in self._protocol_player_ids:
+            protocol_player = self.mass.players.get_player(pid)
+            if protocol_player and protocol_player.available and protocol_player.needs_setup:
+                return protocol_player
+        return None
+
+    def _get_active_output_protocol_player(self) -> Player | None:
+        """Return the protocol player currently selected as this player's output, if any."""
+        if self.active_output_protocol and self.active_output_protocol != "native":
+            return self.mass.players.get_player(self.active_output_protocol)
+        return None
 
     def _get_protocol_player_with_external_source(self) -> Player | None:
         """
