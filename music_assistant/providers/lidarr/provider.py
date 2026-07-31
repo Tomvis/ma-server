@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
+from music_assistant_models.auth import Scope
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InvalidDataError
 
@@ -106,7 +107,7 @@ class LidarrProvider(PluginProvider):
         """
         self._unregister_handles.append(
             self.mass.register_api_command(
-                "lidarr/add_album", self.add_album, required_role="admin"
+                "lidarr/add_album", self.add_album, required_scope=Scope.LIBRARY_MANAGE
             )
         )
         try:
