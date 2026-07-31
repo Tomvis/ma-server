@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.enums import MediaType, ProviderFeature, ProviderType
-from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
+from music_assistant_models.errors import (
+    AlreadyInLibraryError,
+    InvalidDataError,
+    MediaNotFoundError,
+)
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -238,7 +242,10 @@ async def test_listen_later_add_rejects_when_album_already_in_library(
     uri = f"{_PROVIDER_INSTANCE}://album/alb-1"
     await mass.music.add_item_to_library(uri)
 
-    with pytest.raises(InvalidDataError, match="already in your library"):
+    # AlreadyInLibraryError is deliberately its own type rather than an InvalidDataError:
+    # it carries a distinct error_code so clients can tell it apart from
+    # AlreadyInListenLaterError, which maps to the same HTTP 409.
+    with pytest.raises(AlreadyInLibraryError, match="already in your library"):
         await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
 
 
