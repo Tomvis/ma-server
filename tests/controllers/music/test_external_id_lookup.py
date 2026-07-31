@@ -39,11 +39,19 @@ async def _get_lookup_rows(music: MusicController, item_id: int | str) -> set[tu
 
 async def test_same_isrc_from_two_providers_dedupes(music: MusicController) -> None:
     """Two providers exposing the same track with an identical ISRC merge into one item."""
-    library_track_1 = await music.tracks.add_item_to_library(create_track("spotify_1", "track_abc"))
-    library_track_2 = await music.tracks.add_item_to_library(create_track("tidal_1", "track_xyz"))
+    # flag the mappings the way the provider sync loop does before adding, so the rows
+    # are actually in-library: library_count mirrors library_items on this branch, and
+    # both are in-library scoped, so an unflagged add would list and count as zero
+    tracks = [create_track("spotify_1", "track_abc"), create_track("tidal_1", "track_xyz")]
+    for track in tracks:
+        for prov_map in track.provider_mappings:
+            prov_map.in_library = True
+    library_track_1 = await music.tracks.add_item_to_library(tracks[0])
+    library_track_2 = await music.tracks.add_item_to_library(tracks[1])
 
     assert library_track_1.item_id == library_track_2.item_id
     assert len(library_track_2.provider_mappings) == 2
+    assert len(await music.tracks.library_items()) == 1
     assert await music.tracks.library_count() == 1
 
 
