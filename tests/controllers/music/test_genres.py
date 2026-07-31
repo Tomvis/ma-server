@@ -455,7 +455,8 @@ class TestGenreCRUD:
         assert fav <= total
 
     async def test_library_count_with_search(self, genre_ctrl: GenreController) -> None:
-        """library_count must accept a search term without erroring.
+        """
+        library_count must accept a search term without erroring.
 
         GenreController overrides _search_filter_clause to match by name and by
         alias, so the clause references both :search and :search_raw.

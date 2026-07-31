@@ -1,4 +1,5 @@
-"""Lidarr Plugin Provider implementation (music-rater bridge).
+"""
+Lidarr Plugin Provider implementation (music-rater bridge).
 
 The "Add to Lidarr" action no longer talks to Lidarr directly; it hands the
 album off to music-rater (operator-run companion service), which orchestrates
@@ -49,7 +50,8 @@ if TYPE_CHECKING:
 def _match_album_id(
     candidates: list[dict[str, Any]], artist_name: str, album_name: str
 ) -> int | None:
-    """Return the id of the first candidate whose artist AND title match the request.
+    """
+    Return the id of the first candidate whose artist AND title match the request.
 
     music-rater's search items carry ``artist_name_raw`` / ``album_title_raw`` (always
     populated). We require both to match the requested artist/album (normalized,
@@ -92,35 +94,9 @@ class LidarrProvider(PluginProvider):
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
 
-    def _host_port(self) -> str | None:
-        """Return the configured URL's hostname[:port] with userinfo stripped, or None.
-
-        urlparse(url).netloc keeps the `user:pass@` userinfo in front of the host, so
-        deriving host:port from it would leak embedded credentials. This rebuilds from
-        hostname/port only, so callers can safely log or toast the result.
-        """
-        parsed = urlparse(str(self.config.get_value(CONF_URL) or ""))
-        if not parsed.hostname:
-            return None
-        if parsed.port is not None:
-            return f"{parsed.hostname}:{parsed.port}"
-        return parsed.hostname
-
-    def _sanitized_url(self) -> str:
-        """Return the configured music-rater URL with any userinfo stripped.
-
-        Reassembled as scheme://host[:port] so logging or toasting the result can
-        never leak credentials embedded in the configured URL.
-        """
-        host = self._host_port()
-        url = str(self.config.get_value(CONF_URL) or "")
-        if host is None:
-            return url
-        scheme = urlparse(url).scheme or "http"
-        return f"{scheme}://{host}"
-
     async def loaded_in_mass(self) -> None:
-        """Register the WebSocket command and probe music-rater for connectivity.
+        """
+        Register the WebSocket command and probe music-rater for connectivity.
 
         The command is registered unconditionally so users still see the action
         in the UI when music-rater is down — invocations will fail with a useful
@@ -153,7 +129,8 @@ class LidarrProvider(PluginProvider):
     # ----- public API command -----
 
     async def add_album(self, item: str) -> dict[str, Any]:
-        """Send an album to Lidarr via music-rater.
+        """
+        Send an album to Lidarr via music-rater.
 
         - Resolves the album from MA (`item` is an MA URI) for the toast labels.
         - Looks up the music-rater album_id by URI; falls back to text search.
@@ -187,6 +164,35 @@ class LidarrProvider(PluginProvider):
         return self._build_result(response, artist_name=artist_name, album_name=album.name)
 
     # ----- helpers -----
+
+    def _host_port(self) -> str | None:
+        """
+        Return the configured URL's hostname[:port] with userinfo stripped, or None.
+
+        urlparse(url).netloc keeps the `user:pass@` userinfo in front of the host, so
+        deriving host:port from it would leak embedded credentials. This rebuilds from
+        hostname/port only, so callers can safely log or toast the result.
+        """
+        parsed = urlparse(str(self.config.get_value(CONF_URL) or ""))
+        if not parsed.hostname:
+            return None
+        if parsed.port is not None:
+            return f"{parsed.hostname}:{parsed.port}"
+        return parsed.hostname
+
+    def _sanitized_url(self) -> str:
+        """
+        Return the configured music-rater URL with any userinfo stripped.
+
+        Reassembled as scheme://host[:port] so logging or toasting the result can
+        never leak credentials embedded in the configured URL.
+        """
+        host = self._host_port()
+        url = str(self.config.get_value(CONF_URL) or "")
+        if host is None:
+            return url
+        scheme = urlparse(url).scheme or "http"
+        return f"{scheme}://{host}"
 
     async def _resolve_album_id(self, *, album_uri: str, artist_name: str, album_name: str) -> int:
         """Resolve a music-rater album_id with URI-then-search fallback."""
@@ -230,7 +236,7 @@ class LidarrProvider(PluginProvider):
             return 0
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0
 
     def _build_result(
@@ -240,7 +246,8 @@ class LidarrProvider(PluginProvider):
         artist_name: str,
         album_name: str,
     ) -> dict[str, Any]:
-        """Map music-rater's LidarrQueueResponse to the frontend's LidarrAddAlbumResult.
+        """
+        Map music-rater's LidarrQueueResponse to the frontend's LidarrAddAlbumResult.
 
         music-rater fields we read:
           artists_added, albums_monitored, skipped, errors, error_log, lidarr_synced
@@ -309,7 +316,8 @@ class LidarrProvider(PluginProvider):
         }
 
     def _music_rater_label(self) -> str:
-        """Human-readable identifier for the music-rater backend that handled this call.
+        """
+        Human-readable identifier for the music-rater backend that handled this call.
 
         Frontend toasts use this to tell the operator which music-rater is
         acting when they've configured several. `self.name` is the MA-side

@@ -1216,130 +1216,6 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         await self.albums.set_listen_later(candidate.item_id, True)
         return await self.albums.get_library_item(candidate.item_id)
 
-    @staticmethod
-    def _name_matches_search(query: str, candidate: str) -> bool:
-        """
-        Asymmetric album-name match for the free-text resolver.
-
-        loose_compare_strings is symmetric — either side may be substring of the
-        other — which lets a short reissue name like "OK Computer" beat a more
-        specific user query like "OK Computer OKNOTOK 1997 2017" (the candidate
-        is a substring of the query). For free-text resolver semantics only the
-        query → candidate direction is meaningful: the user is asking for a
-        specific edition / version and the catalog name should *contain* what
-        they typed.
-        """
-        if len(query) <= 3 or len(candidate) <= 3:
-            return compare_strings(query, candidate, strict=True)
-        word_count = len(query.strip().split(" "))
-        if word_count == 1 and len(query) < 10:
-            return compare_strings(query, candidate, strict=False)
-        query_safe = create_safe_string(query)
-        candidate_safe = create_safe_string(candidate)
-        return bool(query_safe) and query_safe in candidate_safe
-
-    async def _resolve_album_by_artist_title(self, artist: str, album: str) -> Album:
-        """
-        Find the best provider album match for free-text artist + album.
-
-        Searches every loaded music provider that supports search, keeping
-        only candidates whose name and artist loosely match the inputs (so
-        "The Beatles - Abbey Road" still matches a "Beatles - Abbey Road
-        (Remastered)" hit). Streaming-provider hits sort first so the
-        resulting listen-later entry stays playable whenever a streaming
-        catalog has the album; if only local/filesystem providers match,
-        the picked candidate may become unplayable later (file moved /
-        deleted / volume offline). Callers that require playability should
-        verify ``result.is_streaming_provider`` on their side.
-
-        :param artist: Artist name to match against album.artists[*].name.
-        :param album: Album title to match against album.name.
-        """
-        artist = artist.strip()
-        album = album.strip()
-        if not artist or not album:
-            raise InvalidDataError("Both 'artist' and 'album' must be non-blank")
-        search_query = f"{artist} - {album}"
-        searchable_providers = [
-            p
-            for p in self.providers
-            if isinstance(p, MusicProvider) and ProviderFeature.SEARCH in p.supported_features
-        ]
-
-        async def _search_one(prov: MusicProvider) -> SearchResults | None:
-            try:
-                return await asyncio.wait_for(
-                    self._search_provider(
-                        search_query, prov.instance_id, [MediaType.ALBUM], limit=10
-                    ),
-                    timeout=_LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT,
-                )
-            except Exception as err:
-                # asyncio.wait_for raises TimeoutError (an Exception subclass);
-                # anything else from _search_provider is treated identically.
-                self.logger.debug("Album search failed on %s: %s", prov.instance_id, err)
-                return None
-
-        # Fan out so one hung provider can't block the resolver. `self.providers`
-        # is stable for the lifetime of this call, so the gathered order is
-        # deterministic and matches the discovery order used by the tier sort
-        # below.
-        search_results = await asyncio.gather(*[_search_one(p) for p in searchable_providers])
-
-        candidates: list[Album] = []
-        seen: set[tuple[str, str]] = set()
-        for results in search_results:
-            if results is None:
-                continue
-            for result_album in results.albums:
-                # SearchResults.albums is typed Sequence[Album | ItemMapping];
-                # ItemMapping has no `.artists` field, so accessing it below would
-                # AttributeError out of the entire resolver. Skip minimal results —
-                # a provider that emits ItemMappings here just doesn't carry enough
-                # info for our match logic.
-                if not isinstance(result_album, Album):
-                    continue
-                key = (result_album.provider, result_album.item_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                if not result_album.artists:
-                    continue
-                if not self._name_matches_search(album, result_album.name):
-                    continue
-                if not any(loose_compare_strings(artist, a.name) for a in result_album.artists):
-                    continue
-                candidates.append(result_album)
-
-        if not candidates:
-            raise MediaNotFoundError(
-                f"No matching album found for {artist!r} - {album!r} on any loaded music provider"
-            )
-
-        # Prefer Tidal first (operator's primary streaming source), then any
-        # other streaming provider, then everything else. Sort is stable, so
-        # within a tier we keep the discovery order. `is_streaming_provider`
-        # lives on MusicProvider only, so guard with isinstance to avoid the
-        # silently-false getattr fallback hiding misclassification bugs.
-        def _tier(a: Album) -> int:
-            prov = self.mass.get_provider(a.provider)
-            if prov is None:
-                return 2
-            if prov.domain == "tidal":
-                return 0
-            if isinstance(prov, MusicProvider) and prov.is_streaming_provider:
-                return 1
-            return 2
-
-        candidates.sort(key=_tier)
-        chosen = candidates[0]
-        # Re-fetch the full record so we get artists/external_ids/metadata that
-        # search results commonly omit.
-        return cast(
-            "Album",
-            await self.get_item(MediaType.ALBUM, chosen.item_id, chosen.provider),
-        )
-
     @api_command("music/albums/listen_later_remove", required_scope=Scope.LIBRARY_WRITE)
     async def remove_album_from_listen_later(
         self,
@@ -2871,6 +2747,130 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         """Queue the post-sync database cleanup as a managed background task."""
         self._register_database_cleanup_task()
         return self.mass.tasks.run_task(DATABASE_CLEANUP_TASK_ID)
+
+    @staticmethod
+    def _name_matches_search(query: str, candidate: str) -> bool:
+        """
+        Asymmetric album-name match for the free-text resolver.
+
+        loose_compare_strings is symmetric — either side may be substring of the
+        other — which lets a short reissue name like "OK Computer" beat a more
+        specific user query like "OK Computer OKNOTOK 1997 2017" (the candidate
+        is a substring of the query). For free-text resolver semantics only the
+        query → candidate direction is meaningful: the user is asking for a
+        specific edition / version and the catalog name should *contain* what
+        they typed.
+        """
+        if len(query) <= 3 or len(candidate) <= 3:
+            return compare_strings(query, candidate, strict=True)
+        word_count = len(query.strip().split(" "))
+        if word_count == 1 and len(query) < 10:
+            return compare_strings(query, candidate, strict=False)
+        query_safe = create_safe_string(query)
+        candidate_safe = create_safe_string(candidate)
+        return bool(query_safe) and query_safe in candidate_safe
+
+    async def _resolve_album_by_artist_title(self, artist: str, album: str) -> Album:
+        """
+        Find the best provider album match for free-text artist + album.
+
+        Searches every loaded music provider that supports search, keeping
+        only candidates whose name and artist loosely match the inputs (so
+        "The Beatles - Abbey Road" still matches a "Beatles - Abbey Road
+        (Remastered)" hit). Streaming-provider hits sort first so the
+        resulting listen-later entry stays playable whenever a streaming
+        catalog has the album; if only local/filesystem providers match,
+        the picked candidate may become unplayable later (file moved /
+        deleted / volume offline). Callers that require playability should
+        verify ``result.is_streaming_provider`` on their side.
+
+        :param artist: Artist name to match against album.artists[*].name.
+        :param album: Album title to match against album.name.
+        """
+        artist = artist.strip()
+        album = album.strip()
+        if not artist or not album:
+            raise InvalidDataError("Both 'artist' and 'album' must be non-blank")
+        search_query = f"{artist} - {album}"
+        searchable_providers = [
+            p
+            for p in self.providers
+            if isinstance(p, MusicProvider) and ProviderFeature.SEARCH in p.supported_features
+        ]
+
+        async def _search_one(prov: MusicProvider) -> SearchResults | None:
+            try:
+                return await asyncio.wait_for(
+                    self._search_provider(
+                        search_query, prov.instance_id, [MediaType.ALBUM], limit=10
+                    ),
+                    timeout=_LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT,
+                )
+            except Exception as err:
+                # asyncio.wait_for raises TimeoutError (an Exception subclass);
+                # anything else from _search_provider is treated identically.
+                self.logger.debug("Album search failed on %s: %s", prov.instance_id, err)
+                return None
+
+        # Fan out so one hung provider can't block the resolver. `self.providers`
+        # is stable for the lifetime of this call, so the gathered order is
+        # deterministic and matches the discovery order used by the tier sort
+        # below.
+        search_results = await asyncio.gather(*[_search_one(p) for p in searchable_providers])
+
+        candidates: list[Album] = []
+        seen: set[tuple[str, str]] = set()
+        for results in search_results:
+            if results is None:
+                continue
+            for result_album in results.albums:
+                # SearchResults.albums is typed Sequence[Album | ItemMapping];
+                # ItemMapping has no `.artists` field, so accessing it below would
+                # AttributeError out of the entire resolver. Skip minimal results —
+                # a provider that emits ItemMappings here just doesn't carry enough
+                # info for our match logic.
+                if not isinstance(result_album, Album):
+                    continue
+                key = (result_album.provider, result_album.item_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not result_album.artists:
+                    continue
+                if not self._name_matches_search(album, result_album.name):
+                    continue
+                if not any(loose_compare_strings(artist, a.name) for a in result_album.artists):
+                    continue
+                candidates.append(result_album)
+
+        if not candidates:
+            raise MediaNotFoundError(
+                f"No matching album found for {artist!r} - {album!r} on any loaded music provider"
+            )
+
+        # Prefer Tidal first (operator's primary streaming source), then any
+        # other streaming provider, then everything else. Sort is stable, so
+        # within a tier we keep the discovery order. `is_streaming_provider`
+        # lives on MusicProvider only, so guard with isinstance to avoid the
+        # silently-false getattr fallback hiding misclassification bugs.
+        def _tier(a: Album) -> int:
+            prov = self.mass.get_provider(a.provider)
+            if prov is None:
+                return 2
+            if prov.domain == "tidal":
+                return 0
+            if isinstance(prov, MusicProvider) and prov.is_streaming_provider:
+                return 1
+            return 2
+
+        candidates.sort(key=_tier)
+        chosen = candidates[0]
+        # Re-fetch the full record so we get artists/external_ids/metadata that
+        # search results commonly omit.
+        return cast(
+            "Album",
+            await self.get_item(MediaType.ALBUM, chosen.item_id, chosen.provider),
+        )
 
     async def _schedule_provider_mediatype_sync(
         self, provider: MusicProvider, media_type: MediaType, is_initial: bool = False

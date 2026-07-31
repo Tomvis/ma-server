@@ -281,58 +281,6 @@ class GenreController(MediaControllerBase[Genre]):
         FROM (SELECT * FROM {DB_TABLE_GENRES} WHERE is_excluded = 0) AS {DB_TABLE_GENRES}"""
         return query, {}
 
-    def _apply_genre_visibility_filter(
-        self,
-        parts: list[str],
-        params: dict[str, Any],
-        *,
-        search: str | None,
-        content_type: str | None = None,
-        hide_empty: bool | None,
-        media_type: MediaType | None,
-    ) -> None:
-        """
-        Apply the shared genre visibility filter used by library_items and library_count.
-
-        Sets the raw lowered search param (for alias matching, since the normalized
-        :search param strips spaces/special chars) and the media_type / hide_empty
-        clause, so the listing and its count stay in sync.
-
-        :param parts: WHERE-clause fragments to extend in place.
-        :param params: Query params to extend in place.
-        :param search: Free-text search; sets :search_raw for alias matching.
-        :param content_type: Restrict to a single genre taxonomy ("music" means the
-            NULL/general bucket); composes with the media_type / hide_empty clause.
-        :param hide_empty: Only applies when media_type is not set. True: only mapped
-            genres; False: all genres; None: only default genres (translation_key set).
-        :param media_type: When set, restrict to genres with a mapping for this media
-            type (implies non-empty); takes precedence over hide_empty.
-        """
-        if search:
-            params["search_raw"] = f"%{search.strip().lower()}%"
-        if content_type == "music":
-            # the music/general taxonomy is stored as a NULL content_type
-            parts.append(f"{self.db_table}.content_type IS NULL")
-        elif content_type is not None:
-            # restrict to a single taxonomy; composes (AND) with the media_type/hide_empty clause
-            parts.append(f"{self.db_table}.content_type IS :filter_content_type")
-            params["filter_content_type"] = content_type
-        if media_type is not None:
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
-                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
-                "AND gm_mt.media_type = :filter_media_type)"
-            )
-            params["filter_media_type"] = media_type.value
-        elif hide_empty is None:
-            parts.append(f"{self.db_table}.translation_key IS NOT NULL")
-        elif hide_empty:
-            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
-            parts.append(
-                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
-            )
-
     async def library_items(  # noqa: PLR0913
         self,
         favorite: bool | None = None,
@@ -1294,6 +1242,58 @@ class GenreController(MediaControllerBase[Genre]):
             ),
             "last_scan_mapped": self._last_scan_mapped,
         }
+
+    def _apply_genre_visibility_filter(
+        self,
+        parts: list[str],
+        params: dict[str, Any],
+        *,
+        search: str | None,
+        content_type: str | None = None,
+        hide_empty: bool | None,
+        media_type: MediaType | None,
+    ) -> None:
+        """
+        Apply the shared genre visibility filter used by library_items and library_count.
+
+        Sets the raw lowered search param (for alias matching, since the normalized
+        :search param strips spaces/special chars) and the media_type / hide_empty
+        clause, so the listing and its count stay in sync.
+
+        :param parts: WHERE-clause fragments to extend in place.
+        :param params: Query params to extend in place.
+        :param search: Free-text search; sets :search_raw for alias matching.
+        :param content_type: Restrict to a single genre taxonomy ("music" means the
+            NULL/general bucket); composes with the media_type / hide_empty clause.
+        :param hide_empty: Only applies when media_type is not set. True: only mapped
+            genres; False: all genres; None: only default genres (translation_key set).
+        :param media_type: When set, restrict to genres with a mapping for this media
+            type (implies non-empty); takes precedence over hide_empty.
+        """
+        if search:
+            params["search_raw"] = f"%{search.strip().lower()}%"
+        if content_type == "music":
+            # the music/general taxonomy is stored as a NULL content_type
+            parts.append(f"{self.db_table}.content_type IS NULL")
+        elif content_type is not None:
+            # restrict to a single taxonomy; composes (AND) with the media_type/hide_empty clause
+            parts.append(f"{self.db_table}.content_type IS :filter_content_type")
+            params["filter_content_type"] = content_type
+        if media_type is not None:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm_mt "
+                f"WHERE gm_mt.genre_id = {self.db_table}.item_id "
+                "AND gm_mt.media_type = :filter_media_type)"
+            )
+            params["filter_media_type"] = media_type.value
+        elif hide_empty is None:
+            parts.append(f"{self.db_table}.translation_key IS NOT NULL")
+        elif hide_empty:
+            gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
+            parts.append(
+                f"EXISTS(SELECT 1 FROM {gm} gm WHERE gm.genre_id = {self.db_table}.item_id)"
+            )
 
     @staticmethod
     def _get_genre_icon_metadata(

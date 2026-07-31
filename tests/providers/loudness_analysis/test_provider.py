@@ -239,7 +239,8 @@ async def test_post_analysis_skips_when_loudness_missing(
 async def test_post_analysis_skips_when_stream_not_local_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """post_analysis is a no-op when stream_type is not LOCAL_FILE.
+    """
+    post_analysis is a no-op when stream_type is not LOCAL_FILE.
 
     Streaming-provider tracks have a non-empty string `path` (the streaming
     URL), but writing ReplayGain tags into a URL is a contract violation

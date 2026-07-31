@@ -1,4 +1,5 @@
-"""Thin async client for the music-rater album API.
+"""
+Thin async client for the music-rater album API.
 
 We talk to music-rater (operator-run companion service), not Lidarr directly.
 music-rater stamps the Music Assistant URI on every album it has synced to MA,
@@ -42,7 +43,8 @@ _QUEUE_REQUEST_TIMEOUT = ClientTimeout(total=180)
 
 
 class MusicRaterError(InvalidDataError):
-    """Raised for unexpected music-rater API responses.
+    """
+    Raised for unexpected music-rater API responses.
 
     Inherits from InvalidDataError so the global error toast on the frontend
     renders the message (it filters on MusicAssistantError subclasses).
@@ -65,43 +67,6 @@ class MusicRaterClient:
         self._session = session
         self._verify_ssl = verify_ssl
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        timeout: ClientTimeout = _REQUEST_TIMEOUT,
-        **kwargs: Any,
-    ) -> tuple[int, Any]:
-        """Issue a request and return (status, parsed-body-or-text).
-
-        A malformed JSON body — Content-Type claims JSON but the bytes don't
-        parse — is treated like a text response; callers already handle the
-        "body isn't a dict" case and produce a useful error message.
-
-        ``timeout`` defaults to the quick-read cap; the inline /lidarr/queue
-        sync passes the larger ``_QUEUE_REQUEST_TIMEOUT``.
-        """
-        url = f"{self._base}/api/v1/{path.lstrip('/')}"
-        async with self._session.request(
-            method,
-            url,
-            headers=self._headers,
-            ssl=self._verify_ssl,
-            timeout=timeout,
-            **kwargs,
-        ) as resp:
-            status = resp.status
-            if status == 204 or resp.content_length == 0:
-                return status, None
-            ctype = resp.headers.get("Content-Type", "")
-            if "application/json" in ctype:
-                try:
-                    return status, await resp.json()
-                except (ClientResponseError, ValueError):
-                    return status, await resp.text()
-            return status, await resp.text()
-
     async def ping(self) -> None:
         """Cheap connectivity probe: list one album and check the response shape."""
         status, body = await self._request("GET", "albums", params={"limit": "1"})
@@ -121,7 +86,8 @@ class MusicRaterClient:
         )
 
     async def resolve_by_search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
-        """Free-text album search (artist + album). Return up to `limit` candidate dicts.
+        """
+        Free-text album search (artist + album). Return up to `limit` candidate dicts.
 
         Unlike the exact URI resolve, a text search can surface a *different* album
         (a remaster, a live version, a same-titled record), so the caller must verify
@@ -129,33 +95,9 @@ class MusicRaterClient:
         """
         return await self._get_album_items(params={"search": query, "limit": str(int(limit))})
 
-    async def _first_album_id(self, *, params: dict[str, str]) -> int | None:
-        items = await self._get_album_items(params=params)
-        if not items:
-            return None
-        first = items[0]
-        if "id" not in first:
-            raise MusicRaterError(f"music-rater returned malformed album item: {first!r}")
-        try:
-            return int(first["id"])
-        except (TypeError, ValueError) as err:
-            raise MusicRaterError(
-                f"music-rater returned non-numeric album id: {first['id']!r}"
-            ) from err
-
-    async def _get_album_items(self, *, params: dict[str, str]) -> list[dict[str, Any]]:
-        """GET /albums and return the (dict) items list, mapping errors to MA error types."""
-        status, body = await self._request("GET", "albums", params=params)
-        if status >= 500:
-            raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
-        if status >= 400 or not isinstance(body, dict):
-            snippet = body if isinstance(body, str) else str(body)[:200]
-            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
-        items = body.get("items") or []
-        return [item for item in items if isinstance(item, dict)]
-
     async def queue_lidarr(self, album_id: int) -> dict[str, Any]:
-        """POST /albums/{id}/lidarr/queue — flips lidarr_manual_add + inline sync.
+        """
+        POST /albums/{id}/lidarr/queue — flips lidarr_manual_add + inline sync.
 
         Maps documented status codes to MA error types so the global error
         toast carries a useful message.
@@ -209,3 +151,66 @@ class MusicRaterClient:
         raise MusicRaterError(
             f"POST /albums/{album_id}/lidarr/queue failed (status={status}): {snippet[:200]}"
         )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: ClientTimeout = _REQUEST_TIMEOUT,
+        **kwargs: Any,
+    ) -> tuple[int, Any]:
+        """
+        Issue a request and return (status, parsed-body-or-text).
+
+        A malformed JSON body — Content-Type claims JSON but the bytes don't
+        parse — is treated like a text response; callers already handle the
+        "body isn't a dict" case and produce a useful error message.
+
+        ``timeout`` defaults to the quick-read cap; the inline /lidarr/queue
+        sync passes the larger ``_QUEUE_REQUEST_TIMEOUT``.
+        """
+        url = f"{self._base}/api/v1/{path.lstrip('/')}"
+        async with self._session.request(
+            method,
+            url,
+            headers=self._headers,
+            ssl=self._verify_ssl,
+            timeout=timeout,
+            **kwargs,
+        ) as resp:
+            status = resp.status
+            if status == 204 or resp.content_length == 0:
+                return status, None
+            ctype = resp.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                try:
+                    return status, await resp.json()
+                except ClientResponseError, ValueError:
+                    return status, await resp.text()
+            return status, await resp.text()
+
+    async def _first_album_id(self, *, params: dict[str, str]) -> int | None:
+        items = await self._get_album_items(params=params)
+        if not items:
+            return None
+        first = items[0]
+        if "id" not in first:
+            raise MusicRaterError(f"music-rater returned malformed album item: {first!r}")
+        try:
+            return int(first["id"])
+        except (TypeError, ValueError) as err:
+            raise MusicRaterError(
+                f"music-rater returned non-numeric album id: {first['id']!r}"
+            ) from err
+
+    async def _get_album_items(self, *, params: dict[str, str]) -> list[dict[str, Any]]:
+        """GET /albums and return the (dict) items list, mapping errors to MA error types."""
+        status, body = await self._request("GET", "albums", params=params)
+        if status >= 500:
+            raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
+        if status >= 400 or not isinstance(body, dict):
+            snippet = body if isinstance(body, str) else str(body)[:200]
+            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
+        items = body.get("items") or []
+        return [item for item in items if isinstance(item, dict)]

@@ -1,4 +1,5 @@
-"""Lidarr Plugin Provider for Music Assistant (music-rater bridge).
+"""
+Lidarr Plugin Provider for Music Assistant (music-rater bridge).
 
 Adds an "Add to Lidarr" action exposed through the WebSocket API. The action
 hands the album off to music-rater (operator-run companion service), which
@@ -43,7 +44,8 @@ async def get_config_entries(
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """Build the setup form.
+    """
+    Build the setup form.
 
     Just the music-rater base URL plus an optional connectivity probe.
     """
@@ -74,23 +76,10 @@ async def get_config_entries(
         ConfigEntry(
             key="intro",
             type=ConfigEntryType.LABEL,
-            label=(
-                "Connect Music Assistant to your music-rater instance. The "
-                "'Add to Lidarr' context-menu action will POST the album to "
-                "music-rater, which owns the Lidarr sync."
-            ),
-        ),
-        ConfigEntry(
-            key=CONF_URL,
-            type=ConfigEntryType.STRING,
-            label="music-rater URL",
-            required=True,
-            description="e.g. http://192.168.1.10:8000 or https://music-rater.example.com",
         ),
         ConfigEntry(
             key=CONF_VERIFY_SSL,
             type=ConfigEntryType.BOOLEAN,
-            label="Verify SSL",
             required=False,
             advanced=True,
             default_value=True,
@@ -98,21 +87,17 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_ACTION_TEST,
             type=ConfigEntryType.ACTION,
-            label="Test connection",
             action=CONF_ACTION_TEST,
-            action_label="Test connection",
         ),
         ConfigEntry(
             key="test_ok_label",
             type=ConfigEntryType.LABEL,
-            label="Connected to music-rater.",
             required=False,
             hidden=not test_ok,
         ),
         ConfigEntry(
             key="test_error_label",
             type=ConfigEntryType.ALERT,
-            label=f"Couldn't reach music-rater: {test_error}" if test_error else "",
             required=False,
             hidden=test_error is None,
         ),

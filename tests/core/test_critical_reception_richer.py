@@ -1,4 +1,5 @@
-"""Unit tests for `_critical_reception_is_richer`.
+"""
+Unit tests for `_critical_reception_is_richer`.
 
 The function gates wholesale replacement of an album's stored critical_reception
 during sync and listen-later updates. Replacement is whole-CR, so the function
@@ -100,7 +101,8 @@ def test_identical_cr_is_not_richer() -> None:
 
 
 def test_same_source_count_but_field_swap_is_not_richer() -> None:
-    """New has same source count but different fields (lost rating, gained favorite).
+    """
+    New has same source count but different fields (lost rating, gained favorite).
 
     Total field count is equal, so wholesale replacement would lose the rating
     data — must not classify as richer.
@@ -111,7 +113,8 @@ def test_same_source_count_but_field_swap_is_not_richer() -> None:
 
 
 def test_changed_accolade_set_plus_added_links_is_richer() -> None:
-    """A file-tag re-probe that swaps an accolade AND adds review links is richer.
+    """
+    A file-tag re-probe that swaps an accolade AND adds review links is richer.
 
     The accolade set legitimately changes over time (an award revised, a stale one
     dropped, a new honorable mention added in a later year). Such a re-tag is no
@@ -141,7 +144,8 @@ def test_changed_accolade_set_plus_added_links_is_richer() -> None:
 
 
 def test_changed_accolade_set_with_net_loss_is_not_richer() -> None:
-    """A re-tag that swaps an accolade but shrinks the total field count is rejected.
+    """
+    A re-tag that swaps an accolade but shrinks the total field count is rejected.
 
     Even with the superset rule relaxed, the aggregate field-count guard still
     protects against net data loss: dropping two accolades for one, with nothing
@@ -169,7 +173,8 @@ def test_changed_accolade_set_with_net_loss_is_not_richer() -> None:
 
 
 def test_dropping_all_accolades_is_not_richer() -> None:
-    """A new source that keeps the rating but blanks a populated accolades list regresses.
+    """
+    A new source that keeps the rating but blanks a populated accolades list regresses.
 
     The populated-stays-populated guard is independent of the superset relaxation:
     going from accolades=[...] to no accolades erases data on the wholesale replace.

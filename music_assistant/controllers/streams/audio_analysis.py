@@ -372,17 +372,6 @@ class AudioAnalysisController:
             if isinstance(prov, AudioAnalysisProvider) and prov.available
         ]
 
-    def _resolve_aa_provider(self, prov_id: str) -> AudioAnalysisProvider | None:
-        """
-        Return the available AudioAnalysisProvider for the given id, or None.
-
-        :param prov_id: Provider instance id to resolve.
-        """
-        provider = self.mass.get_provider(prov_id)
-        if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
-            return provider
-        return None
-
     @property
     def smart_fades_provider_available(self) -> bool:
         """Return whether the smart fades audio analysis provider is loaded and available."""
@@ -1048,6 +1037,17 @@ class AudioAnalysisController:
         if count:
             await self.mass.music.database.delete(DB_TABLE_AUDIO_ANALYSIS_FAILURES, match)
         return count
+
+    def _resolve_aa_provider(self, prov_id: str) -> AudioAnalysisProvider | None:
+        """
+        Return the available AudioAnalysisProvider for the given id, or None.
+
+        :param prov_id: Provider instance id to resolve.
+        """
+        provider = self.mass.get_provider(prov_id)
+        if provider and isinstance(provider, AudioAnalysisProvider) and provider.available:
+            return provider
+        return None
 
     async def _run_background_scan(self) -> None:
         """Run the scan as decode-once-fan-out streaming over candidate tracks."""

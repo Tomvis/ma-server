@@ -471,7 +471,8 @@ def _parse_sequence(
     *,
     allow_value_convert: bool,
 ) -> Any:
-    """Parse a list/tuple/Sequence param into ``concrete_type``.
+    """
+    Parse a list/tuple/Sequence param into ``concrete_type``.
 
     None elements are skipped unless the element type itself admits None (e.g.
     ``list[int | None]``); for ``list[int]`` / ``list[str]`` a stray None is

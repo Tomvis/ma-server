@@ -248,6 +248,22 @@ if TYPE_CHECKING:
     from .provider import PinPairingSession, SendspinProvider
 
 
+def _queue_position(queue: PlayerQueue | None) -> tuple[int | None, int | None]:
+    """
+    Return the 1-based position of the current queue item and the queue length.
+
+    Both are None when unknown, which is what the trackfields aiosendspin build
+    expects for "do not display" - a 0 would render as an actual position.
+
+    :param queue: The queue being played, if this is a MA queue at all.
+    """
+    if queue is None:
+        return None, None
+    queue_track = queue.current_index + 1 if queue.current_index is not None else None
+    total_tracks = queue.items if queue.items > 0 else None
+    return queue_track, total_tracks
+
+
 class SendspinBasePlayer(Player):
     """
     Base class for Sendspin players in Music Assistant.
@@ -1743,13 +1759,7 @@ class SendspinPlayer(SendspinBasePlayer):
         is_playing = self.state.playback_state == PlaybackState.PLAYING
         track_progress = self._compute_track_progress_ms(current_media, is_playing=is_playing)
 
-        queue_track: int | None = None
-        total_tracks: int | None = None
-        if queue is not None:
-            if queue.current_index is not None:
-                queue_track = queue.current_index + 1
-            if queue.items > 0:
-                total_tracks = queue.items
+        queue_track, total_tracks = _queue_position(queue)
 
         metadata = Metadata(
             title=current_media.title,

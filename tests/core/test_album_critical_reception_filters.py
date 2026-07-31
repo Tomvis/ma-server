@@ -1,4 +1,5 @@
-"""Tests for the critical_reception filter SQL builder in the albums controller.
+"""
+Tests for the critical_reception filter SQL builder in the albums controller.
 
 These verify both the structure of the generated WHERE fragments and that they
 behave correctly against a real (in-memory) SQLite engine using the JSON1 extension.
@@ -126,12 +127,14 @@ def _make_db() -> sqlite3.Connection:
 
 
 def test_no_filters_emits_nothing() -> None:
+    """An unfiltered call contributes no WHERE fragments and binds no params."""
     parts, params = _build()
     assert parts == []
     assert params == {}
 
 
 def test_dr_bucket_excellent_matches_only_album_with_dr_ge_14() -> None:
+    """The excellent bucket selects only albums whose dynamic range is 14 or above."""
     con = _make_db()
     assert _exec_with_filters(con, dr_buckets=["excellent"]) == [1]
 
@@ -143,6 +146,7 @@ def test_dr_bucket_good_includes_dr_only_album() -> None:
 
 
 def test_dr_bucket_poor_below_threshold() -> None:
+    """The poor bucket selects only albums below its upper dynamic-range threshold."""
     con = _make_db()
     assert _exec_with_filters(con, dr_buckets=["poor"]) == [3]
 
@@ -154,6 +158,7 @@ def test_dr_bucket_untagged_keeps_albums_without_dr() -> None:
 
 
 def test_dr_buckets_combine_with_or() -> None:
+    """Multiple DR buckets union rather than intersect, so an album matching either is kept."""
     con = _make_db()
     assert _exec_with_filters(con, dr_buckets=["excellent", "good"]) == [1, 2, 6]
 
@@ -174,12 +179,14 @@ def test_tps_rating_three_step_buckets() -> None:
 
 
 def test_amg_favorite_only() -> None:
+    """The AMG favourite flag keeps only albums whose AMG entry is marked favourite."""
     con = _make_db()
     assert _exec_with_filters(con, amg_favorite=True) == [3]
 
 
 def test_dated_award_kinds_match_by_prefix() -> None:
-    """Dated awards inline their date, so the kind prefix-matches every variant.
+    """
+    Dated awards inline their date, so the kind prefix-matches every variant.
 
     The old AOTM/record_of_the_month split is gone: both album 2 (dated) and album 4
     (undated) carry "Record of the Month…" and match the single record_of_the_month kind.
@@ -242,7 +249,8 @@ def test_unknown_accolade_kind_silently_dropped() -> None:
 
 
 def _make_amg_dr_fallback_db() -> sqlite3.Connection:
-    """Separate fixture so amg_dr-fallback assertions don't perturb the main fixture.
+    """
+    Separate fixture so amg_dr-fallback assertions don't perturb the main fixture.
 
     Mirrors the streaming-album case that motivated the COALESCE: a Listen Later
     row with no measured DR (never played → never analyzed) but with an AMG-tagged
@@ -298,7 +306,8 @@ def test_dr_bucket_untagged_requires_both_null() -> None:
 
 
 def test_sort_keys_are_registered_for_albums() -> None:
-    """The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
+    """
+    The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
 
     They reference albums.metadata JSON paths that only exist on this table, so
     they must not leak into the shared SORT_KEYS table.

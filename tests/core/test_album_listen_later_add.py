@@ -1,4 +1,5 @@
-"""Integration tests for music/albums/listen_later_add.
+"""
+Integration tests for music/albums/listen_later_add.
 
 Exercises the two input modes (URI vs. artist+album), the optional
 critical_reception payload, and the in-library rejection rule. Uses the
@@ -141,7 +142,7 @@ def _make_album(item_id: str, name: str, artist_name: str) -> Album:
 @pytest.fixture
 async def fake_provider(
     mass: MusicAssistant,
-) -> AsyncGenerator[_FakeStreamingProvider, None]:
+) -> AsyncGenerator[_FakeStreamingProvider]:
     """Register a fake streaming provider with a tiny canned catalog."""
     catalog = {
         "alb-1": _make_album("alb-1", "Kid A", "Radiohead"),
@@ -253,7 +254,8 @@ async def test_listen_later_add_rejects_when_album_already_in_library(
 async def test_adding_to_library_graduates_album_out_of_listen_later(
     mass: MusicAssistant,
 ) -> None:
-    """An album moved into the library proper is cleared from the listen-later pile.
+    """
+    An album moved into the library proper is cleared from the listen-later pile.
 
     Library membership and listen-later are mutually exclusive; once the album gains
     an in_library mapping it must leave listen-later instead of lingering in both.
@@ -293,7 +295,8 @@ async def test_listen_later_add_unmatched_artist_album_raises(
 async def test_listen_later_add_persists_cr_on_already_library_candidate(
     mass: MusicAssistant,
 ) -> None:
-    """CR payload must persist when the candidate resolves as `library://`.
+    """
+    CR payload must persist when the candidate resolves as `library://`.
 
     First call seeds the listen-later row (no in_library mappings), so the
     second call sees `candidate.provider == "library"`. A previous version of
@@ -421,7 +424,8 @@ async def test_listen_later_add_folds_legacy_review_url_payload(
 async def test_listen_later_remove_deletes_orphan_row(
     mass: MusicAssistant,
 ) -> None:
-    """A listen-later add followed by remove must not leave an orphan row.
+    """
+    A listen-later add followed by remove must not leave an orphan row.
 
     The row is invisible to every default view once the flag is cleared (no
     in_library mappings, not favorited, never played), so it would otherwise
@@ -462,7 +466,8 @@ async def test_listen_later_remove_keeps_row_with_other_anchor(
 async def test_library_count_excludes_listen_later_only_items(
     mass: MusicAssistant,
 ) -> None:
-    """library_count must mirror library_items' default in_library JOIN.
+    """
+    library_count must mirror library_items' default in_library JOIN.
 
     Without the JOIN, a listen-later-only album (in_library=0 on all mappings)
     inflates the count beyond what /library_items returns at the same call.
