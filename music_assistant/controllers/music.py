@@ -3395,8 +3395,13 @@ class MusicController(CoreController):
                     if "duplicate column" not in str(err):
                         raise
 
-        if prev_version <= 42 and await self.__table_exists(DB_TABLE_ALBUMS):
-            # add listen_later flag + timestamp to albums (Roon-style "save for later")
+        if prev_version <= 46 and await self.__table_exists(DB_TABLE_ALBUMS):
+            # add listen_later flag + timestamp to albums (Roon-style "save for later").
+            # Gated on <= 46 rather than the 42 this originally shipped as: upstream stamps
+            # schema 43 without these columns, so a database arriving from stock Music
+            # Assistant skips a <= 42 gate entirely and then trips the listen_later UPDATE
+            # further down. Both ALTERs swallow "duplicate column", so re-running them on an
+            # enhanced database that already has the columns is a no-op.
             for column_sql in (
                 f"ALTER TABLE {DB_TABLE_ALBUMS} "
                 "ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",

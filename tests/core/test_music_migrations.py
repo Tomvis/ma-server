@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from music_assistant.constants import DB_TABLE_AUDIO_ANALYSIS, DB_TABLE_PLAYLOG
+from music_assistant.constants import (
+    DB_TABLE_ALBUMS,
+    DB_TABLE_AUDIO_ANALYSIS,
+    DB_TABLE_PLAYLOG,
+    DB_TABLE_PROVIDER_MAPPINGS,
+)
 from music_assistant.controllers.music import MusicController
 from music_assistant.helpers.database import DatabaseConnection
 
@@ -158,6 +163,125 @@ async def test_migration_leaves_correct_playlog_untouched(
     assert (await database.get_rows_from_query(table_sql_query))[0]["sql"] == table_sql_before
     rows = await database.get_rows(DB_TABLE_PLAYLOG)
     assert len(rows) == 1
+
+
+async def _create_upstream_album_tables(database: DatabaseConnection) -> None:
+    """
+    Create albums + provider_mappings exactly as upstream stable ships them.
+
+    Copied verbatim from tag 2.9.10, which stamps DB_SCHEMA_VERSION 43. Neither
+    listen_later column exists upstream - they are enhanced-branch additions.
+    """
+    await database.execute(
+        f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_ALBUMS}(
+                [item_id] INTEGER PRIMARY KEY AUTOINCREMENT,
+                [name] TEXT NOT NULL,
+                [sort_name] TEXT NOT NULL,
+                [version] TEXT,
+                [album_type] TEXT NOT NULL,
+                [year] INTEGER,
+                [favorite] BOOLEAN NOT NULL DEFAULT 0,
+                [metadata] json NOT NULL,
+                [external_ids] json NOT NULL,
+                [play_count] INTEGER NOT NULL DEFAULT 0,
+                [last_played] INTEGER NOT NULL DEFAULT 0,
+                [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
+                [timestamp_modified] INTEGER NOT NULL DEFAULT 0,
+                [search_name] TEXT NOT NULL,
+                [search_sort_name] TEXT NOT NULL
+            );"""
+    )
+    await database.execute(
+        f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_PROVIDER_MAPPINGS}(
+            [media_type] TEXT NOT NULL,
+            [item_id] INTEGER NOT NULL,
+            [provider_domain] TEXT NOT NULL,
+            [provider_instance] TEXT NOT NULL,
+            [provider_item_id] TEXT NOT NULL,
+            [available] BOOLEAN NOT NULL DEFAULT 1,
+            [in_library] BOOLEAN NOT NULL DEFAULT 0,
+            [is_unique] BOOLEAN,
+            [url] text,
+            [audio_format] json,
+            [details] TEXT,
+            UNIQUE(media_type, provider_instance, provider_item_id)
+            );"""
+    )
+    await database.execute(
+        f"INSERT INTO {DB_TABLE_ALBUMS} "
+        "(item_id, name, sort_name, album_type, metadata, external_ids, "
+        "search_name, search_sort_name) "
+        "VALUES (1, 'Kid A', 'kid a', 'album', '{}', '[]', 'KID A', 'KID A')"
+    )
+    await database.commit()
+
+
+@pytest.mark.parametrize("prev_version", [43, 44, 45])
+async def test_migration_adds_listen_later_columns_to_upstream_database(
+    mass_minimal: MusicAssistant,
+    database: DatabaseConnection,
+    prev_version: int,
+) -> None:
+    """
+    An upstream-schema database gains the enhanced listen_later columns.
+
+    Upstream stable stamps schema version 43, so a database coming from stock
+    Music Assistant never passed through the enhanced `prev_version <= 42` gate
+    that adds albums.listen_later / listen_later_added_at. A later enhanced block
+    writes to those columns, so if the gate does not cover 43-45 the migration
+    raises "no such column: listen_later" - and _setup_database responds to a
+    failed migration by deleting library.db and rescanning from scratch.
+    """
+    await _create_upstream_album_tables(database)
+
+    await _run_migration(mass_minimal, database, prev_version=prev_version)
+
+    columns = {
+        row["name"]
+        for row in await database.get_rows_from_query(
+            f"SELECT name FROM pragma_table_info('{DB_TABLE_ALBUMS}')"
+        )
+    }
+    assert "listen_later" in columns
+    assert "listen_later_added_at" in columns
+    # the pre-existing row survives and picks up the column default
+    rows = await database.get_rows(DB_TABLE_ALBUMS)
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Kid A"
+    assert rows[0]["listen_later"] == 0
+    assert rows[0]["listen_later_added_at"] is None
+
+
+async def test_migration_keeps_listen_later_data_on_enhanced_database(
+    mass_minimal: MusicAssistant,
+    database: DatabaseConnection,
+) -> None:
+    """
+    Re-running the listen_later ALTERs on a database that already has them is a no-op.
+
+    Widening the gate to <= 46 means enhanced databases (which passed through the
+    original <= 42 gate) now re-enter this block, so the duplicate-column tolerance
+    has to hold and existing listen_later values must survive untouched.
+    """
+    await _create_upstream_album_tables(database)
+    for column_sql in (
+        f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",
+        f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later_added_at] INTEGER;",
+    ):
+        await database.execute(column_sql)
+    await database.execute(
+        f"UPDATE {DB_TABLE_ALBUMS} SET listen_later = 1, listen_later_added_at = 1700000000"
+    )
+    await database.commit()
+
+    await _run_migration(mass_minimal, database, prev_version=46)
+
+    rows = await database.get_rows(DB_TABLE_ALBUMS)
+    assert len(rows) == 1
+    # the album carries no in_library provider mapping, so the mutual-exclusivity
+    # cleanup must leave its listen_later flag alone
+    assert rows[0]["listen_later"] == 1
+    assert rows[0]["listen_later_added_at"] == 1700000000
 
 
 async def test_migration_repairs_null_smart_fades_centroids(
