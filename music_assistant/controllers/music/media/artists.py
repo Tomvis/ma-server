@@ -112,6 +112,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         search: str | None = None,
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        played_only: bool = False,
         favorite_only: bool = False,
         album_artists_only: bool = False,
         artist_type: ArtistType | None = None,
@@ -128,6 +129,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         :param search: Free-text search query.
         :param provider: Filter by provider instance ID (single string or list).
         :param genre: Filter by genre id(s).
+        :param played_only: Only count artists that have been played (last_played > 0).
         :param favorite_only: Legacy alias for ``favorite=True``; kept for older clients.
         :param album_artists_only: Only count artists that have albums.
         :param artist_type: Filter by artist type.
@@ -145,6 +147,7 @@ class ArtistsController(MediaControllerBase[Artist]):
             search=self._preprocess_search(search),
             genre_ids=self._preprocess_genre_ids(genre),
             provider_filter=self._ensure_provider_filter(provider),
+            played_only=played_only,
             in_library_only=True,
         )
         # gated exactly as library_items gates it - upstream's own library_count applied

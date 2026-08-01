@@ -1134,6 +1134,11 @@ class AudioAnalysisController:
                         providers_for_track,
                     )
                     processed += 1
+                except Exception as err:
+                    # A worker that dies stops draining the queue for the rest of the
+                    # run; with a bounded queue the producer's put() would then block
+                    # forever and the whole scan task hangs. Log and keep looping.
+                    self.logger.warning("Background analysis worker error: %s", err)
                 finally:
                     work_queue.task_done()
 
@@ -1485,6 +1490,11 @@ class AudioAnalysisController:
                     provider.name,
                     START_ANALYSIS_TIMEOUT_SECONDS,
                 )
+                # The cancelled start_analysis may already have allocated session state
+                # (e.g. the loudness provider spawns its ffmpeg process before storing
+                # the session). We never add the provider to provider_ids, so nothing
+                # else will ever cancel it - do it here or the process/session leaks.
+                self._cancel_provider_session(provider, session_key)
                 continue
             except Exception as err:
                 # provider.start_analysis is provider-implemented; skip the one that
@@ -1492,6 +1502,9 @@ class AudioAnalysisController:
                 self.logger.warning(
                     "Failed to start analysis on provider %s: %s", provider.name, err
                 )
+                # Same rationale as the timeout arm: a partially-started session must
+                # still be torn down even though we're not tracking this provider.
+                self._cancel_provider_session(provider, session_key)
                 continue
             if accepted:
                 provider_ids.add(provider.instance_id)
@@ -1514,6 +1527,21 @@ class AudioAnalysisController:
         for provider_id in provider_ids:
             if provider := self._resolve_aa_provider(provider_id):
                 self.mass.create_task(provider.cancel(session_key))
+
+    def _cancel_provider_session(self, provider: AudioAnalysisProvider, session_key: str) -> None:
+        """
+        Cancel one provider's session without touching the tracked session set.
+
+        Used for providers whose ``start_analysis`` timed out or raised: they never make
+        it into ``_active_sessions``, so :meth:`_cancel_providers` would never reach them,
+        yet they may already hold session state (buffers, an ffmpeg subprocess).
+
+        :param provider: The audio analysis provider to cancel.
+        :param session_key: The session key the failed start was for.
+        """
+        if not provider.available:
+            return
+        self.mass.create_task(provider.cancel(session_key))
 
     def _evict_realtime_session(self, session_key: str) -> None:
         """Stop a realtime analysis worker and cancel its providers, freeing the session slot."""

@@ -997,16 +997,10 @@ class MusicProvider(Provider):
                         cr_richer = cr_new is not None and critical_reception_is_richer(
                             cr_new, sync_details.critical_reception
                         )
-                        # MediaItemMetadata.update() only overwrites a stored dynamic_range
-                        # with a truthy value, so a provider DR of exactly 0.0 can land only
-                        # while nothing is stored yet. Counting it as pending in any other
-                        # case would re-write this album on every single sync forever, since
-                        # the merge can never persist it and the difference never goes away.
-                        dr_changed = (
-                            dr_new is not None
-                            and dr_new != sync_details.dynamic_range
-                            and (bool(dr_new) or sync_details.dynamic_range is None)
-                        )
+                        # A plain difference is enough to mark the DR pending: the merge
+                        # always persists a non-None incoming value, so the very next sync
+                        # sees the stored DR match and stops re-writing the album.
+                        dr_changed = dr_new is not None and dr_new != sync_details.dynamic_range
                         if (
                             self._library_item_needs_update(sync_details, prov_item)
                             or cr_richer

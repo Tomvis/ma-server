@@ -63,7 +63,7 @@ from music_assistant.helpers.json import json_loads, serialize_to_json
 from music_assistant.helpers.util import guard_single_request, parse_optional_bool, try_parse_int
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Mapping
+    from collections.abc import AsyncGenerator
 
     from music_assistant import MusicAssistant
     from music_assistant.models.music_provider import MusicProvider
@@ -376,6 +376,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         search: str | None = None,
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        played_only: bool = False,
         favorite_only: bool = False,
         **kwargs: Any,
     ) -> int:
@@ -390,6 +391,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         :param search: Free-text search query.
         :param provider: Filter by provider instance ID (single string or list).
         :param genre: Filter by genre id(s).
+        :param played_only: Only count items that have been played (last_played > 0).
         :param favorite_only: Legacy alias for ``favorite=True``; kept for older
             clients.
         """
@@ -404,6 +406,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             search=self._preprocess_search(search),
             genre_ids=self._preprocess_genre_ids(genre),
             provider_filter=self._ensure_provider_filter(provider),
+            played_only=played_only,
             in_library_only=True,
         )
         return await self._execute_count(query_parts, query_params)

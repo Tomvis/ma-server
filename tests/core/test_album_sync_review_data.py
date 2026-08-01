@@ -333,29 +333,28 @@ async def test_sync_writes_once_when_needs_update_and_review_data_both_changed(
 
 
 @pytest.mark.usefixtures("fake_provider")
-async def test_sync_converges_on_provider_dr_of_zero(
+async def test_sync_stores_provider_dr_of_zero_over_stale_value(
     mass: MusicAssistant,
     fake_provider: _FakeSyncProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider DR of exactly 0.0 that can't be stored must not re-write forever."""
+    """A provider DR of exactly 0.0 replaces a stale value, then converges."""
     fake_provider.library_albums = [_make_album(MediaItemMetadata(dynamic_range=11.0))]
     db_ids = await fake_provider._sync_library_albums()
     db_id = next(iter(db_ids))
 
-    # 0.0 is a legitimate parse of a DYNAMIC_RANGE / DR_ALBUM file tag, but
-    # MediaItemMetadata.update() only overwrites a stored DR with a truthy value, so
-    # this value can never land on top of the stored 11.0
+    # 0.0 is a legitimate parse of a DYNAMIC_RANGE / DR_ALBUM file tag, so it must
+    # overwrite the stored 11.0 like any other re-measured value
     fake_provider.library_albums = [_make_album(MediaItemMetadata(dynamic_range=0.0))]
     updates = _record_updates(mass, monkeypatch)
     assert await fake_provider._sync_library_albums() == {db_id}
-    assert await fake_provider._sync_library_albums() == {db_id}
 
-    # nothing changed on the second pass either, so treating the unstorable 0.0 as a
-    # pending change would make every future sync re-write this album
-    assert updates == []
-    stored = await _stored_album(mass, db_id)
-    assert stored.metadata.dynamic_range == 11.0
+    assert len(updates) == 1
+    assert (await _stored_album(mass, db_id)).metadata.dynamic_range == 0.0
+
+    # having landed, the value converges: no further sync re-writes this album
+    assert await fake_provider._sync_library_albums() == {db_id}
+    assert len(updates) == 1
 
 
 @pytest.mark.usefixtures("fake_provider")
@@ -370,9 +369,8 @@ async def test_sync_stores_provider_dr_of_zero_when_nothing_is_stored_yet(
     db_id = next(iter(db_ids))
     assert (await _stored_album(mass, db_id)).metadata.dynamic_range is None
 
-    # the one case the convergence guard deliberately lets through: update()'s
-    # fill-the-gap branch does store a falsy value when nothing is there yet, so
-    # narrowing the guard to `bool(dr_new)` would silently drop this album's DR
+    # gap-fill rather than overwrite: narrowing the pending-change test to
+    # `bool(dr_new)` would silently drop this album's DR
     fake_provider.library_albums = [_make_album(MediaItemMetadata(dynamic_range=0.0))]
     updates = _record_updates(mass, monkeypatch)
     assert await fake_provider._sync_library_albums() == {db_id}

@@ -131,11 +131,18 @@ class RecentPlayedTrack(NamedTuple):
     artists: list[ItemMapping]
 
 
-_DYNAMIC_RADIO_BASE_SAMPLE_SIZE: Final[int] = 5
-_DYNAMIC_RADIO_DYNAMIC_TARGET: Final[int] = 50
 # Per-provider timeout for the listen-later resolver fan-out. A slow provider
 # would otherwise wedge the WS request for the full underlying search timeout.
 _LISTEN_LATER_PROVIDER_SEARCH_TIMEOUT: Final[float] = 10.0
+
+# Preference ordering for the listen-later free-text resolver: when several
+# streaming catalogs carry the same album, the earliest domain listed here wins.
+# MA has no user-facing music-provider priority to derive this from, so it is a
+# static preference, not config: reorder the tuple to steer which catalog gets
+# saved, or empty it to fall back to plain streaming-before-local tiering.
+# Domains not listed still outrank non-streaming providers; they just sort after
+# every listed domain.
+_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS: Final[tuple[str, ...]] = ("tidal",)
 
 
 class MusicController(MusicDatabaseSetupMixin, CoreController):
@@ -2776,10 +2783,12 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         "The Beatles - Abbey Road" still matches a "Beatles - Abbey Road
         (Remastered)" hit). Streaming-provider hits sort first so the
         resulting listen-later entry stays playable whenever a streaming
-        catalog has the album; if only local/filesystem providers match,
-        the picked candidate may become unplayable later (file moved /
-        deleted / volume offline). Callers that require playability should
-        verify ``result.is_streaming_provider`` on their side.
+        catalog has the album, with the domains listed in
+        ``_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS`` ahead of the rest; if
+        only local/filesystem providers match, the picked candidate may
+        become unplayable later (file moved / deleted / volume offline).
+        Callers that require playability should verify
+        ``result.is_streaming_provider`` on their side.
 
         :param artist: Artist name to match against album.artists[*].name.
         :param album: Album title to match against album.name.
@@ -2845,20 +2854,23 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 f"No matching album found for {artist!r} - {album!r} on any loaded music provider"
             )
 
-        # Prefer Tidal first (operator's primary streaming source), then any
-        # other streaming provider, then everything else. Sort is stable, so
-        # within a tier we keep the discovery order. `is_streaming_provider`
-        # lives on MusicProvider only, so guard with isinstance to avoid the
+        # Preferred domains first (in the order they are listed), then any other
+        # streaming provider, then everything else. Sort is stable, so within a
+        # tier we keep the discovery order. `is_streaming_provider` lives on
+        # MusicProvider only, so guard with isinstance to avoid the
         # silently-false getattr fallback hiding misclassification bugs.
+        streaming_tier = len(_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS)
+        fallback_tier = streaming_tier + 1
+
         def _tier(a: Album) -> int:
             prov = self.mass.get_provider(a.provider)
             if prov is None:
-                return 2
-            if prov.domain == "tidal":
-                return 0
+                return fallback_tier
+            if prov.domain in _LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS:
+                return _LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS.index(prov.domain)
             if isinstance(prov, MusicProvider) and prov.is_streaming_provider:
-                return 1
-            return 2
+                return streaming_tier
+            return fallback_tier
 
         candidates.sort(key=_tier)
         chosen = candidates[0]

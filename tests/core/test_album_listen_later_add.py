@@ -33,6 +33,7 @@ from music_assistant_models.media_items.metadata import (
 )
 from music_assistant_models.provider import ProviderManifest
 
+from music_assistant.controllers.music import controller as music_controller
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
 
 _PROVIDER_DOMAIN = "fake_streaming"
 _PROVIDER_INSTANCE = "fake_streaming--instance"
+_RIVAL_DOMAIN = "rival_streaming"
+_RIVAL_INSTANCE = "rival_streaming--instance"
 
 
 class _FakeStreamingProvider(MusicProvider):
@@ -52,9 +55,11 @@ class _FakeStreamingProvider(MusicProvider):
         manifest: ProviderManifest,
         config: ProviderConfig,
         catalog: dict[str, Album],
+        is_streaming: bool = True,
     ) -> None:
         super().__init__(mass, manifest, config)
         self._catalog = catalog
+        self._is_streaming = is_streaming
 
     @property
     def supported_features(self) -> set[ProviderFeature]:
@@ -62,7 +67,7 @@ class _FakeStreamingProvider(MusicProvider):
 
     @property
     def is_streaming_provider(self) -> bool:
-        return True
+        return self._is_streaming
 
     def library_supported(self, media_type: MediaType) -> bool:
         return bool(media_type == MediaType.ALBUM)
@@ -109,34 +114,72 @@ class _FakeStreamingProvider(MusicProvider):
         raise MediaNotFoundError(prov_artist_id)
 
 
-def _make_album(item_id: str, name: str, artist_name: str) -> Album:
+def _make_album(
+    item_id: str,
+    name: str,
+    artist_name: str,
+    domain: str = _PROVIDER_DOMAIN,
+    instance_id: str = _PROVIDER_INSTANCE,
+) -> Album:
     """Compose an Album record carried by the fake provider's catalog."""
     artist = Artist(
         item_id=f"artist-{artist_name}",
-        provider=_PROVIDER_INSTANCE,
+        provider=instance_id,
         name=artist_name,
         provider_mappings={
             ProviderMapping(
                 item_id=f"artist-{artist_name}",
-                provider_domain=_PROVIDER_DOMAIN,
-                provider_instance=_PROVIDER_INSTANCE,
+                provider_domain=domain,
+                provider_instance=instance_id,
             )
         },
     )
     return Album(
         item_id=item_id,
-        provider=_PROVIDER_INSTANCE,
+        provider=instance_id,
         name=name,
         artists=[artist],
         provider_mappings={
             ProviderMapping(
                 item_id=item_id,
-                provider_domain=_PROVIDER_DOMAIN,
-                provider_instance=_PROVIDER_INSTANCE,
+                provider_domain=domain,
+                provider_instance=instance_id,
                 available=True,
             )
         },
     )
+
+
+def _register_provider(
+    mass: MusicAssistant,
+    domain: str,
+    instance_id: str,
+    catalog: dict[str, Album],
+    is_streaming: bool = True,
+) -> _FakeStreamingProvider:
+    """Register a fake music provider serving the given catalog on the mass instance."""
+    manifest = ProviderManifest(
+        type=ProviderType.MUSIC,
+        domain=domain,
+        name="Fake streaming",
+        description="Fake streaming provider for tests",
+        codeowners=["@music-assistant"],
+    )
+    config = ProviderConfig(
+        values={},
+        type=ProviderType.MUSIC,
+        domain=domain,
+        instance_id=instance_id,
+        name="Fake streaming",
+    )
+    # ProviderConfig.get_value() returns None for unset entries; the Provider
+    # base class stringifies that into the logger level and chokes. Force-feed
+    # the "GLOBAL" sentinel so the log level resolution stays valid.
+    config.get_value = lambda *_a, **_k: "GLOBAL"
+    provider = _FakeStreamingProvider(mass, manifest, config, catalog, is_streaming)
+    provider.available = True
+    mass._providers[provider.instance_id] = provider
+    return provider
 
 
 @pytest.fixture
@@ -148,27 +191,27 @@ async def fake_provider(
         "alb-1": _make_album("alb-1", "Kid A", "Radiohead"),
         "alb-2": _make_album("alb-2", "OK Computer", "Radiohead"),
     }
-    manifest = ProviderManifest(
-        type=ProviderType.MUSIC,
-        domain=_PROVIDER_DOMAIN,
-        name="Fake streaming",
-        description="Fake streaming provider for tests",
-        codeowners=["@music-assistant"],
-    )
-    config = ProviderConfig(
-        values={},
-        type=ProviderType.MUSIC,
-        domain=_PROVIDER_DOMAIN,
-        instance_id=_PROVIDER_INSTANCE,
-        name="Fake streaming",
-    )
-    # ProviderConfig.get_value() returns None for unset entries; the Provider
-    # base class stringifies that into the logger level and chokes. Force-feed
-    # the "GLOBAL" sentinel so the log level resolution stays valid.
-    config.get_value = lambda *_a, **_k: "GLOBAL"
-    provider = _FakeStreamingProvider(mass, manifest, config, catalog)
-    provider.available = True
-    mass._providers[provider.instance_id] = provider
+    provider = _register_provider(mass, _PROVIDER_DOMAIN, _PROVIDER_INSTANCE, catalog)
+    try:
+        yield provider
+    finally:
+        mass._providers.pop(provider.instance_id, None)
+
+
+@pytest.fixture
+async def rival_provider(
+    mass: MusicAssistant,
+) -> AsyncGenerator[_FakeStreamingProvider]:
+    """
+    Register a second provider carrying the same album as ``fake_provider``.
+
+    Registered after ``fake_provider`` when both fixtures are requested in that
+    order, so it loses on discovery order alone and only wins on preference.
+    """
+    catalog = {
+        "rival-1": _make_album("rival-1", "Kid A", "Radiohead", _RIVAL_DOMAIN, _RIVAL_INSTANCE),
+    }
+    provider = _register_provider(mass, _RIVAL_DOMAIN, _RIVAL_INSTANCE, catalog)
     try:
         yield provider
     finally:
@@ -487,3 +530,50 @@ async def test_library_count_excludes_listen_later_only_items(
     )
     assert total == 1
     assert listen_later_total == 1
+
+
+@pytest.mark.usefixtures("fake_provider", "rival_provider")
+async def test_resolver_prefers_listed_provider_domains(
+    mass: MusicAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A domain listed in the preference tuple outranks an equally good earlier hit."""
+    # baseline: with no preference at all, both hits are plain streaming hits so
+    # the (stable) discovery order decides — fake_provider is registered first.
+    monkeypatch.setattr(music_controller, "_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS", ())
+    resolved = await mass.music._resolve_album_by_artist_title("Radiohead", "Kid A")
+    assert resolved.provider == _PROVIDER_INSTANCE
+
+    # listing the later-registered provider's domain flips the winner
+    monkeypatch.setattr(
+        music_controller, "_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS", (_RIVAL_DOMAIN,)
+    )
+    resolved = await mass.music._resolve_album_by_artist_title("Radiohead", "Kid A")
+    assert resolved.provider == _RIVAL_INSTANCE
+
+
+async def test_resolver_prefers_streaming_over_local_provider(
+    mass: MusicAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no listed domains, a streaming hit still beats a local one found first."""
+    monkeypatch.setattr(music_controller, "_LISTEN_LATER_PREFERRED_PROVIDER_DOMAINS", ())
+    local = _register_provider(
+        mass,
+        _PROVIDER_DOMAIN,
+        _PROVIDER_INSTANCE,
+        {"alb-1": _make_album("alb-1", "Kid A", "Radiohead")},
+        is_streaming=False,
+    )
+    streaming = _register_provider(
+        mass,
+        _RIVAL_DOMAIN,
+        _RIVAL_INSTANCE,
+        {"rival-1": _make_album("rival-1", "Kid A", "Radiohead", _RIVAL_DOMAIN, _RIVAL_INSTANCE)},
+    )
+    try:
+        resolved = await mass.music._resolve_album_by_artist_title("Radiohead", "Kid A")
+        assert resolved.provider == _RIVAL_INSTANCE
+    finally:
+        mass._providers.pop(local.instance_id, None)
+        mass._providers.pop(streaming.instance_id, None)

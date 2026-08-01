@@ -676,6 +676,7 @@ class AlbumsController(MediaControllerBase[Album]):
         search: str | None = None,
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        played_only: bool = False,
         album_types: list[AlbumType] | None = None,
         listen_later: bool | None = None,
         dr_buckets: list[str] | None = None,
@@ -727,6 +728,7 @@ class AlbumsController(MediaControllerBase[Album]):
             search=None,
             genre_ids=self._preprocess_genre_ids(genre),
             provider_filter=self._ensure_provider_filter(provider),
+            played_only=played_only,
             in_library_only=in_library_only,
         )
         _apply_album_specific_filters(

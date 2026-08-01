@@ -27,11 +27,7 @@ from music_assistant_models.api import CommandMessage
 from music_assistant_models.auth import UserRole
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
-from music_assistant_models.errors import (
-    InsufficientPermissions,
-    InvalidDataError,
-    MusicAssistantError,
-)
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items.metadata import IMAGE_PROXY_ID_RESOLVER
 from music_assistant_models.translations import TRANSLATION_RESOLVER
 
@@ -612,16 +608,14 @@ class WebserverController(CoreController):
             locale = _locale_from_request(request)
             await self.mass.translations.ensure_locale_loaded(locale)
             return self._localized_json_response(result, locale)
-        except InsufficientPermissions as e:
-            return web.Response(status=403, text=str(e))
-        except InvalidDataError as e:
-            return web.Response(status=400, text=str(e))
         except MusicAssistantError as e:
             # Domain errors (album not in library, media not found, etc.) aren't
             # server faults - map to 4xx so clients can distinguish "won't ever
             # work" from "transient server bug" and the WS and HTTP JSON-RPC
-            # paths report failures consistently. Must stay AFTER the two specific
-            # arms above, which subclass it.
+            # paths report failures consistently. InsufficientPermissions and
+            # InvalidDataError used to have their own text/plain arms here; their
+            # http_status is 403/400 so folding them in keeps the status codes
+            # identical while giving every dispatched command one body shape.
             return self._jsonrpc_error_response(command_msg.command, e)
         except Exception as e:
             # inlined (was three locals) to keep this handler under the statement
@@ -633,7 +627,17 @@ class WebserverController(CoreController):
                 type(e).__name__,
                 e,
             )
-            return web.Response(status=500, text="Internal server error")
+            # deliberately opaque: the exception type/message only goes to the log.
+            # code 999 is the same "unknown error" fallback the websocket path uses
+            # and maps back to MusicAssistantError through the models' ERROR_MAP.
+            return web.json_response(
+                {
+                    "error": MusicAssistantError.__name__,
+                    "message": "Internal server error",
+                    "code": 999,
+                },
+                status=500,
+            )
 
     async def _authenticate_api_command(
         self, request: web.Request, handler: APICommandHandler

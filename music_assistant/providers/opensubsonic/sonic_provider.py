@@ -106,9 +106,14 @@ CACHE_CATEGORY_CRITICAL_RECEPTION = 3
 # can't push the metadata past this cap; the cap only bounds the fallback path
 # (non-FLAC, or FLAC whose comment block never completes within the limit).
 CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
-# CR/DR tags are written to the file once and rarely change; cache the extraction
-# result long enough to amortize across the next several syncs.
-CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
+# CR/DR tags are written to the file once by the offline tagger and rarely change, so
+# the extraction result is cached for a month rather than a day: at 24h every album in
+# the library expired and re-probed itself daily (a 5000-album library paid 5000 probes
+# a day) just to rediscover unchanged tags. A retag is still picked up before the TTL
+# runs out — a force refresh (music/refresh_item) sets BYPASS_CACHE, which skips this
+# entry because it is stored non-persistent, and the cache controller's "clear cache"
+# action drops it outright.
+CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
 # How many tracks to ffprobe before giving up. A first track that's a bonus /
 # hidden track may have been written without the album's AMG/TPS/DR tags even
 # when later tracks carry them; sampling a few covers this without blowing up
@@ -608,8 +613,8 @@ class OpenSonicProvider(MusicProvider):
                 sonic_album = None
         if sonic_album is None or not sonic_album.song:
             # Don't cache "no songs" or "fetch failed" — those states can change
-            # (user uploads tracks, server comes back) and a 24h negative cache
-            # would block a follow-up sync from re-probing.
+            # (user uploads tracks, server comes back) and a month-long negative
+            # cache would block a follow-up sync from re-probing.
             return None, None
         # Try a handful of tracks and OR-merge their signals. A bonus / hidden
         # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
@@ -675,8 +680,8 @@ class OpenSonicProvider(MusicProvider):
             return cr, album_dr
         if not probed_clean:
             # Every probe attempt errored transiently (stream/ffprobe failure) rather
-            # than cleanly finding no tags. Don't pin a 24h negative cache — mirror the
-            # "fetch failed" path above so the next sync re-probes once it recovers.
+            # than cleanly finding no tags. Don't pin a month-long negative cache — mirror
+            # the "fetch failed" path above so the next sync re-probes once it recovers.
             return None, None
         await self.mass.cache.set(
             key=cache_key,
