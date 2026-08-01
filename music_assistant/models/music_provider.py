@@ -48,6 +48,7 @@ from .provider import Provider
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from music_assistant_models.media_items.metadata import ReviewSourceEntry
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.controllers.music.media.base import (
@@ -59,7 +60,40 @@ if TYPE_CHECKING:
 CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
 
 
-def _source_filled_field_count(source: Any) -> int:
+# The value-bearing fields of a ReviewSourceEntry, excluding the `source` identifier.
+# Every richness/preservation check below is driven off this one roster, so adding a
+# field to ReviewSourceEntry only has to be recorded here.
+_REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
+    "rating",
+    "favorite",
+    "accolades",
+    "links",
+    "authors",
+)
+# The subset of the above whose values are lists; these compare None and [] as equal.
+_REVIEW_SOURCE_LIST_FIELDS: Final[frozenset[str]] = frozenset({"accolades", "links", "authors"})
+
+
+def _field_weight(value: Any) -> int:
+    """
+    Richness weight of one ReviewSourceEntry field value.
+
+    Scalars count once when set (``favorite=False`` and ``rating=0.0`` are set);
+    list fields count once per element, so gaining an accolade counts as richer.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, list | tuple | set):
+        return len(value)
+    return 1
+
+
+def _field_is_populated(value: Any) -> bool:
+    """Return True when a ReviewSourceEntry field is populated (not None / empty)."""
+    return _field_weight(value) > 0
+
+
+def _source_filled_field_count(source: ReviewSourceEntry | None) -> int:
     """
     Count populated fields on a single ReviewSourceEntry.
 
@@ -69,41 +103,14 @@ def _source_filled_field_count(source: Any) -> int:
     """
     if source is None:
         return 0
-    count = 0
-    if getattr(source, "rating", None) is not None:
-        count += 1
-    if getattr(source, "favorite", None) is not None:
-        count += 1
-    for field in ("accolades", "links", "authors"):
-        val = getattr(source, field, None)
-        if val:
-            count += len(val)
-    return count
+    return sum(_field_weight(getattr(source, field)) for field in _REVIEW_SOURCE_FIELDS)
 
 
-def _total_source_field_count(sources: Any) -> int:
+def _total_source_field_count(sources: Sequence[ReviewSourceEntry] | None) -> int:
     """Sum of filled fields across every entry in a sources iterable."""
     if not sources:
         return 0
     return sum(_source_filled_field_count(s) for s in sources)
-
-
-_REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
-    "rating",
-    "favorite",
-    "accolades",
-    "links",
-    "authors",
-)
-
-
-def _field_is_populated(value: Any) -> bool:
-    """Return True when a ReviewSourceEntry field is populated (not None / empty)."""
-    if value is None:
-        return False
-    if isinstance(value, list | tuple | set):
-        return bool(value)
-    return True
 
 
 def _sources_by_name(sources: Any) -> dict[str, Any]:
@@ -214,17 +221,18 @@ def _critical_reception_is_richer(new: object, existing: object) -> bool:
     )
 
 
-def _source_signature(source: Any) -> tuple[Any, ...]:
+def _source_signature(source: ReviewSourceEntry | None) -> tuple[Any, ...]:
     """Return a comparable snapshot of every value-bearing field on a ReviewSourceEntry."""
     if source is None:
         return ()
     return (
-        getattr(source, "source", None),
-        getattr(source, "rating", None),
-        getattr(source, "favorite", None),
-        tuple(getattr(source, "accolades", None) or ()),
-        tuple(getattr(source, "links", None) or ()),
-        tuple(getattr(source, "authors", None) or ()),
+        source.source,
+        *(
+            tuple(getattr(source, field) or ())
+            if field in _REVIEW_SOURCE_LIST_FIELDS
+            else getattr(source, field)
+            for field in _REVIEW_SOURCE_FIELDS
+        ),
     )
 
 

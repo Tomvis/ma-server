@@ -29,6 +29,7 @@ from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.helpers.compare import compare_strings
+from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
 from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
@@ -233,12 +234,7 @@ class LidarrProvider(PluginProvider):
     @staticmethod
     def _as_count(value: Any) -> int:
         """Coerce a music-rater counter field to int; default to 0 on garbage."""
-        if value is None:
-            return 0
-        try:
-            return int(value)
-        except TypeError, ValueError:
-            return 0
+        return try_parse_int(value) or 0
 
     def _build_result(
         self,

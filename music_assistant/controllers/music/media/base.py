@@ -278,7 +278,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         return library_item
 
     @final
-    @final
     async def update_item_in_library(
         self, item_id: str | int, update: ItemCls, overwrite: bool = False
     ) -> ItemCls:

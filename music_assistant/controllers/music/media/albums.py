@@ -42,6 +42,7 @@ from music_assistant.helpers.compare import (
 )
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.json import json_loads, serialize_to_json
+from music_assistant.helpers.tags import ACCOLADE_KINDS
 from music_assistant.models.music_provider import MusicProvider, _critical_reception_is_richer
 
 from .base import LibraryItemSyncDetails, MediaControllerBase
@@ -67,21 +68,17 @@ _DR_BUCKET_RANGES: dict[str, tuple[float, float | None]] = {
 }
 
 # Map a filter accolade-kind -> how it matches each string in the JSON accolades[]
-# array (3.2.0+ merged shape). Dated honors inline their date in the display string
-# ("Album of the Year (2024)"), so they match by prefix on the bare award name —
-# one kind covers every year/month variant. The undated review-column kinds are exact
-# strings. "review" is intentionally absent: it's the default column, not a filter.
+# array (3.2.0+ merged shape). Derived from the ACCOLADE_KINDS vocabulary that
+# *writes* those strings, so a renamed display name can't silently turn these
+# filters into zero-row queries. Dated honors inline their date in the display
+# string ("Album of the Year (2024)"), so they match by prefix on the bare award
+# name — one kind covers every year/month variant; undated review-column kinds
+# match exactly. "review" is excluded: it's the default column, not a filter.
 # (mode, value): mode is "exact" or "prefix".
 _ACCOLADE_KIND_MATCH: dict[str, tuple[str, str]] = {
-    "aoty": ("prefix", "Album of the Year"),
-    "record_of_the_month": ("prefix", "Record of the Month"),
-    "honorable_mention": ("prefix", "Honorable Mention"),
-    "score_revised": ("exact", "Score Revised"),
-    "tymhm": ("exact", "TYMHM"),
-    "sitf": ("exact", "SITF"),
-    "ymio": ("exact", "YMIO"),
-    "lit": ("exact", "Lost in Time"),
-    "rfu": ("exact", "RFU"),
+    kind: ("prefix" if dated else "exact", display)
+    for kind, (display, dated) in ACCOLADE_KINDS.items()
+    if kind != "review"
 }
 
 

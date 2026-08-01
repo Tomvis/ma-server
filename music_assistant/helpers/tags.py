@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from json import JSONDecodeError
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
 from music_assistant_models.enums import AlbumType
@@ -121,20 +121,37 @@ def _parse_bool_tag(raw: str | list[str] | tuple[str, ...] | None) -> bool | Non
     return None
 
 
-# Prestige-ish ordering for the accolades synthesized from legacy tags; the
-# frontend re-sorts for display, this just keeps stored output stable/readable.
-_ACCOLADE_KIND_ORDER: tuple[str, ...] = (
-    "aoty",
-    "record_of_the_month",
-    "honorable_mention",
-    "score_revised",
-    "lit",
-    "rfu",
-    "tymhm",
-    "sitf",
-    "ymio",
-    "review",
-)
+# The canonical accolade vocabulary: kind -> (display name, is dated).
+#
+# `display` is the exact string this module writes into the stored
+# critical_reception accolades[] array, so it is also what any consumer
+# matching those stored strings has to match on — see ACCOLADE_KINDS users
+# rather than transcribing these strings again. Dated kinds inline their date
+# ("Album of the Year (2024)"), so stored values for those are a *prefix* match
+# on the display name, not an equality match.
+#
+# Iteration order is the prestige-ish ordering used when rendering a stored
+# list; the frontend re-sorts for display, this just keeps output stable.
+ACCOLADE_KINDS: Final[dict[str, tuple[str, bool]]] = {
+    "aoty": ("Album of the Year", True),
+    "record_of_the_month": ("Record of the Month", True),
+    "honorable_mention": ("Honorable Mention", True),
+    "score_revised": ("Score Revised", False),
+    "lit": ("Lost in Time", False),
+    "rfu": ("RFU", False),
+    "tymhm": ("TYMHM", False),
+    "sitf": ("SITF", False),
+    "ymio": ("YMIO", False),
+    "review": ("Review", False),
+}
+
+
+def accolade_display(kind: str) -> str:
+    """Return the canonical (undated) display name for an accolade kind."""
+    return ACCOLADE_KINDS[kind][0]
+
+
+_ACCOLADE_KIND_ORDER: tuple[str, ...] = tuple(ACCOLADE_KINDS)
 
 _MONTH_ABBR: dict[int, str] = {
     1: "Jan",
@@ -151,23 +168,25 @@ _MONTH_ABBR: dict[int, str] = {
     12: "Dec",
 }
 
-# Undated legacy tokens (from either _TYPE or _LABELS) -> (kind, new display string).
-# Case-insensitive lookup; dated tokens (AOTY-YYYY, AOTM-YYYY-MM, HONORABLE_MENTION-YYYY)
-# are handled by regex below so the date can be folded into the display string.
-_LEGACY_ACCOLADE_TOKENS: dict[str, tuple[str, str]] = {
-    "REVIEW": ("review", "Review"),
-    "TYMHM": ("tymhm", "TYMHM"),
-    "SITF": ("sitf", "SITF"),
-    "YMIO": ("ymio", "YMIO"),
-    "RFU": ("rfu", "RFU"),
-    "LIT": ("lit", "Lost in Time"),
-    "LOST IN TIME": ("lit", "Lost in Time"),
-    "CONTRITE": ("score_revised", "Score Revised"),
-    "SCORE_REVISED": ("score_revised", "Score Revised"),
-    "AOTM": ("record_of_the_month", "Record of the Month"),
-    "RECORD_OF_THE_MONTH": ("record_of_the_month", "Record of the Month"),
-    "AOTY": ("aoty", "Album of the Year"),
-    "HONORABLE_MENTION": ("honorable_mention", "Honorable Mention"),
+# Undated legacy tokens (from either _TYPE or _LABELS) -> accolade kind. Several
+# tokens can alias the same kind; the display string always comes from
+# ACCOLADE_KINDS so it is never spelled out twice. Case-insensitive lookup;
+# dated tokens (AOTY-YYYY, AOTM-YYYY-MM, HONORABLE_MENTION-YYYY) are handled by
+# regex below so the date can be folded into the display string.
+_LEGACY_ACCOLADE_TOKENS: dict[str, str] = {
+    "REVIEW": "review",
+    "TYMHM": "tymhm",
+    "SITF": "sitf",
+    "YMIO": "ymio",
+    "RFU": "rfu",
+    "LIT": "lit",
+    "LOST IN TIME": "lit",
+    "CONTRITE": "score_revised",
+    "SCORE_REVISED": "score_revised",
+    "AOTM": "record_of_the_month",
+    "RECORD_OF_THE_MONTH": "record_of_the_month",
+    "AOTY": "aoty",
+    "HONORABLE_MENTION": "honorable_mention",
 }
 
 
@@ -186,17 +205,17 @@ def _classify_legacy_accolade(token: str) -> tuple[str, str] | None:
     if not text:
         return None
     upper = text.upper()
-    if upper in _LEGACY_ACCOLADE_TOKENS:
-        return _LEGACY_ACCOLADE_TOKENS[upper]
+    if kind := _LEGACY_ACCOLADE_TOKENS.get(upper):
+        return kind, accolade_display(kind)
     if m := re.fullmatch(r"AOTY-(\d{4})", upper):
-        return "aoty", _format_dated_accolade("Album of the Year", int(m.group(1)), None)
+        return "aoty", _format_dated_accolade(accolade_display("aoty"), int(m.group(1)), None)
     if m := re.fullmatch(r"AOTM-(\d{4})-(\d{1,2})", upper):
         return "record_of_the_month", _format_dated_accolade(
-            "Record of the Month", int(m.group(1)), int(m.group(2))
+            accolade_display("record_of_the_month"), int(m.group(1)), int(m.group(2))
         )
     if m := re.fullmatch(r"HONORABLE_MENTION-(\d{4})", upper):
         return "honorable_mention", _format_dated_accolade(
-            "Honorable Mention", int(m.group(1)), None
+            accolade_display("honorable_mention"), int(m.group(1)), None
         )
     return None
 

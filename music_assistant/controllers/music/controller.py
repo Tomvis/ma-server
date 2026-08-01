@@ -2753,22 +2753,19 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         """
         Asymmetric album-name match for the free-text resolver.
 
-        loose_compare_strings is symmetric — either side may be substring of the
-        other — which lets a short reissue name like "OK Computer" beat a more
-        specific user query like "OK Computer OKNOTOK 1997 2017" (the candidate
-        is a substring of the query). For free-text resolver semantics only the
-        query → candidate direction is meaningful: the user is asking for a
+        loose_compare_strings already matches in the query → candidate direction
+        only, which is exactly what the resolver wants: the user is asking for a
         specific edition / version and the catalog name should *contain* what
-        they typed.
+        they typed, not the other way round (a short reissue name like
+        "OK Computer" must not beat the more specific user query
+        "OK Computer OKNOTOK 1997 2017").
         """
-        if len(query) <= 3 or len(candidate) <= 3:
-            return compare_strings(query, candidate, strict=True)
-        word_count = len(query.strip().split(" "))
-        if word_count == 1 and len(query) < 10:
-            return compare_strings(query, candidate, strict=False)
-        query_safe = create_safe_string(query)
-        candidate_safe = create_safe_string(candidate)
-        return bool(query_safe) and query_safe in candidate_safe
+        # A query with no alphanumeric content reduces to an empty safe string,
+        # which is a substring of every candidate — reject it up front rather
+        # than letting it match the whole catalog.
+        if not create_safe_string(query):
+            return False
+        return loose_compare_strings(query, candidate)
 
     async def _resolve_album_by_artist_title(self, artist: str, album: str) -> Album:
         """
