@@ -13,9 +13,28 @@ FROM ${UPSTREAM}
 # rating-branch source. The first RM clears the existing site-packages
 # directory so stale upstream files (e.g. removed providers, old controllers)
 # don't shadow rating-branch code.
+#
+# BUT: 2.10 moved the bundled provider credentials out of app_vars.py (where
+# 2.9.x obfuscated them into tracked source, so the overlay carried them) and
+# into helpers/app_secrets.json, injected by upstream's build. That file is
+# gitignored, so it can never be in the overlay - the rm below would delete it
+# and app_var() would silently return "" for all ten providers that use it
+# (tidal, spotify, apple_music, deezer, qobuz, lastfm x2, theaudiodb, fanarttv,
+# acoustid_lookup). Stash it first and put it back afterwards.
+RUN cp /app/venv/lib/python3.14/site-packages/music_assistant/helpers/app_secrets.json \
+       /tmp/app_secrets.json
 RUN rm -rf /app/venv/lib/python3.14/site-packages/music_assistant
 COPY music_assistant_overlay/ \
      /app/venv/lib/python3.14/site-packages/music_assistant/
+RUN mv /tmp/app_secrets.json \
+       /app/venv/lib/python3.14/site-packages/music_assistant/helpers/app_secrets.json
+# Fail the build rather than ship silently credential-less providers: an empty
+# app_var only surfaces later as a confusing 400 from the provider's API.
+RUN /app/venv/bin/python -c "\
+import sys; \
+from music_assistant.helpers.app_vars import app_var; \
+missing = [n for n in ('tidal_client_id', 'spotify_client_id', 'theaudiodb_api_key') if not app_var(n)]; \
+sys.exit('bundled app secrets missing: ' + repr(missing)) if missing else print('app secrets OK')"
 
 # Replace upstream's installed music_assistant_models package with the
 # rating-branch source — needed for the new dataclass fields like
