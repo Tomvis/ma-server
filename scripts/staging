@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+#
+# Stage the *_overlay/ directories that Dockerfile.lidarr COPYs into the image.
+#
+# The overlay dirs are gitignored, regenerable mirrors of things that live
+# elsewhere: this repo's package tree, the sibling models/ and frontend/
+# checkouts, and the aiosendspin wheel built in the aiosendspin fork.
+# Dockerfile.lidarr layers them over the upstream image instead of rebuilding
+# the venv.
+#
+# They were previously staged by hand, which meant a source edit and an image
+# build could silently disagree -- the image shipped whatever the overlay
+# happened to contain last time someone remembered. Run this before any build.
+#
+set -euo pipefail
+
+usage() {
+	cat <<'EOF'
+Stage the *_overlay/ dirs that Dockerfile.lidarr COPYs into the image.
+
+  scripts/staging                stage everything (rebuilds the frontend if stale)
+  scripts/staging --check        verify only; writes nothing, non-zero if stale
+  scripts/staging --no-build     never run the frontend build (warns if stale)
+  scripts/staging --force-build  rebuild the frontend even if it looks current
+EOF
+}
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WORKSPACE="$(cd -- "$REPO_ROOT/.." && pwd -P)"
+MODELS_SRC="$WORKSPACE/models/music_assistant_models"
+FRONTEND_REPO="$WORKSPACE/frontend"
+FRONTEND_SRC="$FRONTEND_REPO/music_assistant_frontend"
+DOCKERFILE="$REPO_ROOT/Dockerfile.lidarr"
+VENV_PY="$REPO_ROOT/.venv/bin/python"
+
+# Injected by upstream's build and gitignored here, so it can never legitimately
+# come from the source tree. Dockerfile.lidarr stashes the image's copy across
+# its `rm -rf` and restores it; an overlay copy would shadow the real one with a
+# stale or empty file and blank ten providers' bundled credentials.
+SECRETS_REL="helpers/app_secrets.json"
+
+CHECK_ONLY=0
+BUILD_MODE=auto # auto | never | force
+
+for arg in "$@"; do
+	case "$arg" in
+	--check) CHECK_ONLY=1 ;;
+	--no-build) BUILD_MODE=never ;;
+	--force-build) BUILD_MODE=force ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "staging: unknown argument '$arg'" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+
+fail() {
+	echo "staging: $*" >&2
+	exit 1
+}
+note() { echo "  $*"; }
+
+command -v rsync >/dev/null || fail "rsync is required but not installed"
+[ -x "$VENV_PY" ] || fail "no venv at $VENV_PY -- run scripts/setup.sh first"
+[ -f "$DOCKERFILE" ] || fail "missing $DOCKERFILE"
+
+# Resolve site-packages from the venv rather than hardcoding python3.14, so a
+# runtime bump doesn't silently stage nothing.
+SITE_PACKAGES="$("$VENV_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+[ -d "$SITE_PACKAGES" ] || fail "site-packages not found at $SITE_PACKAGES"
+
+# Dockerfile.lidarr hardcodes the interpreter dir in all of its COPY targets, so
+# a Python bump here would make every COPY create a dead directory and ship
+# upstream's unpatched packages without erroring anywhere.
+PY_TAG="$("$VENV_PY" -c 'import sys; print("python%d.%d" % sys.version_info[:2])')"
+grep -qF "lib/$PY_TAG/site-packages" "$DOCKERFILE" ||
+	fail "venv is $PY_TAG but $DOCKERFILE has no lib/$PY_TAG/site-packages COPY target.
+       Update the site-packages paths in the Dockerfile to match the venv."
+
+# --- mirror comparison -------------------------------------------------------
+# One definition of "the overlay matches its source", used by --check and by the
+# post-staging verification, so the two can never disagree.
+#
+# rsync -n over diff: it honours the same path-based --exclude the real sync
+# uses (diff --exclude matches basenames, which would mask a same-named file
+# elsewhere in the tree), and it compares permissions, which Docker COPY carries
+# into the image. -rlpD --checksum is -a minus times and ownership: content and
+# mode drift is reported, a mtime-only difference is not, so an overlay staged
+# by some other means is still recognised as correct.
+mirror_diff() {
+	local src="$1" dst="$2" extra="${3:-}"
+	local -a excludes=(--exclude='__pycache__/' --exclude='*.pyc')
+	[ -z "$extra" ] || excludes+=(--exclude="/$extra")
+	rsync -rlpDin --delete --checksum "${excludes[@]}" "$src/" "$dst/"
+}
+
+# --- sync helper -------------------------------------------------------------
+# rsync --delete makes each overlay an exact mirror, so a file deleted at the
+# source stops shadowing the venv copy inside the image. --delete is
+# destructive, so the destination is checked hard: not a symlink, and its real
+# parent is exactly this repo. ($4, when given, is one repo-relative path
+# excluded from both the sync and the comparison.)
+sync_dir() {
+	local label="$1" src="$2" dst="$3" extra="${4:-}"
+	local -a excludes=(--exclude='__pycache__/' --exclude='*.pyc')
+	[ -z "$extra" ] || excludes+=(--exclude="/$extra")
+
+	# A symlinked destination would let rsync --delete tear through it into
+	# whatever it points at, and a lexical test cannot see that. `*` in a case
+	# pattern also matches `/`, so matching against the full path would have
+	# accepted ../../elsewhere_overlay -- compare the resolved parent instead.
+	[ ! -L "$dst" ] || fail "refusing to --delete into '$dst': it is a symlink"
+	case "$(basename "$dst")" in
+	*_overlay) ;;
+	*) fail "refusing to --delete into '$dst': name does not end in _overlay" ;;
+	esac
+	local dst_parent
+	dst_parent="$(cd -- "$(dirname -- "$dst")" && pwd -P)" ||
+		fail "refusing to --delete into '$dst': parent directory does not exist"
+	[ "$dst_parent" = "$REPO_ROOT" ] ||
+		fail "refusing to --delete into '$dst': not directly inside $REPO_ROOT"
+
+	[ -d "$src" ] || fail "$label: source '$src' does not exist"
+	# Count only files the sync would actually copy: a source holding nothing but
+	# __pycache__ (what an interrupted vite build leaves behind) would otherwise
+	# pass this guard, empty the overlay, and still "verify" clean, because the
+	# comparison ignores exactly the same paths.
+	[ -n "$(find "$src" -type f -not -name '*.pyc' -not -path '*/__pycache__/*' -print -quit)" ] ||
+		fail "$label: source '$src' has no stageable files"
+
+	if [ "$CHECK_ONLY" -eq 1 ]; then
+		if [ ! -d "$dst" ]; then
+			note "$label: MISSING"
+			return 1
+		fi
+		if [ -n "$(mirror_diff "$src" "$dst" "$extra")" ]; then
+			note "$label: STALE"
+			return 1
+		fi
+		note "$label: up to date"
+		return 0
+	fi
+
+	# `|| rc=1` at the call sites makes set -e inert inside this function, so
+	# every failure has to be propagated by hand or a broken stage reports success.
+	mkdir -p "$dst" || return 1
+	rsync -a --delete "${excludes[@]}" "$src/" "$dst/" || return 1
+	note "$label: staged from ${src#"$WORKSPACE"/}"
+}
+
+verify() {
+	local label="$1" out
+	# Capture rather than pipe: `mirror_diff | head` under `set -o pipefail`
+	# exits the shell on SIGPIPE before the failure message can be printed.
+	out="$(mirror_diff "$2" "$3" "${4:-}")"
+	if [ -z "$out" ]; then
+		note "$label: verified"
+	else
+		printf '%s\n' "$out" | head -5 >&2
+		fail "$label: overlay does not match source after staging"
+	fi
+}
+
+# --- frontend build ----------------------------------------------------------
+# frontend_overlay is vite output, not source: it cannot be mirrored from a
+# checkout without building first. Chunk filenames are content-hashed, so a
+# stale overlay is not merely old, it is a different set of files -- which is
+# why the sync runs with --delete.
+#
+# public/ is a real build input, not static passthrough: it holds the PWA
+# service-worker source that VitePWA's injectManifest processes, plus the
+# __init__.py and py.typed that make the output an importable Python package.
+frontend_is_stale() {
+	[ -f "$FRONTEND_SRC/index.html" ] || return 0
+	local watched
+	for watched in "$FRONTEND_REPO/src" "$FRONTEND_REPO/public" \
+		"$FRONTEND_REPO/vite.config.ts" "$FRONTEND_REPO/package.json" \
+		"$FRONTEND_REPO/pnpm-lock.yaml" "$FRONTEND_REPO/index.html" \
+		"$FRONTEND_REPO/tsconfig.json" "$FRONTEND_REPO/tsconfig.node.json" \
+		"$FRONTEND_REPO/env.d.ts"; do
+		[ -e "$watched" ] || continue
+		if [ -n "$(find "$watched" -newer "$FRONTEND_SRC/index.html" -print -quit)" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+build_frontend() {
+	local bin="$FRONTEND_REPO/node_modules/.bin"
+	[ -x "$bin/vite" ] || fail "frontend deps missing -- run 'pnpm install' in $FRONTEND_REPO"
+	note "frontend: building (vue-tsc && vite build)..."
+	(cd "$FRONTEND_REPO" && "$bin/vue-tsc" --noEmit && "$bin/vite" build >/dev/null)
+	note "frontend: build ok"
+}
+
+echo "staging overlays for Dockerfile.lidarr"
+
+rc=0
+if frontend_is_stale; then
+	if [ "$CHECK_ONLY" -eq 1 ]; then
+		# The overlay can mirror the build output perfectly and still be wrong,
+		# because the build output itself predates the sources. Nothing below
+		# detects that, so --check has to fail here or it green-lights a build
+		# whose bundle is older than the code.
+		note "frontend: build output is STALE (sources are newer)"
+		rc=1
+	elif [ "$BUILD_MODE" = never ]; then
+		echo "staging: WARNING frontend build output is stale and --no-build was given;" >&2
+		echo "         frontend_overlay will ship an outdated bundle." >&2
+	else
+		build_frontend
+	fi
+elif [ "$BUILD_MODE" = force ] && [ "$CHECK_ONLY" -eq 0 ]; then
+	build_frontend
+fi
+
+# --- aiosendspin -------------------------------------------------------------
+# The enhanced providers need the local trackfields build, and its version is
+# baked into the .dist-info directory name Dockerfile.lidarr COPYs to. If the
+# two ever disagree the image gets a dist-info whose name lies about its
+# contents, and MA's provider loader tears the package out for failing its pin.
+#
+# Source is the built WHEEL, not site-packages. uv's install adds INSTALLER,
+# REQUESTED, uv_cache.json and a direct_url.json holding an absolute host path,
+# and rewrites RECORD to list them -- none of which belongs in a shipped image.
+# The wheel's own dist-info is what upstream's pip install would have produced.
+shopt -s nullglob
+dist_info_dirs=("$SITE_PACKAGES"/aiosendspin-*.dist-info)
+shopt -u nullglob
+[ "${#dist_info_dirs[@]}" -eq 1 ] ||
+	fail "expected exactly one aiosendspin dist-info in $SITE_PACKAGES, found ${#dist_info_dirs[@]}"
+AIOSENDSPIN_VERSION="$(basename "${dist_info_dirs[0]}")"
+AIOSENDSPIN_VERSION="${AIOSENDSPIN_VERSION#aiosendspin-}"
+AIOSENDSPIN_VERSION="${AIOSENDSPIN_VERSION%.dist-info}"
+
+# Match the COPY targets specifically: comments are stripped first so a stale
+# version mentioned in prose cannot satisfy the check, the `rm -rf` glob is
+# dropped, and more than one distinct target is itself a failure (a second,
+# older COPY would silently win by landing last).
+copy_targets="$(sed 's/#.*//' "$DOCKERFILE" |
+	grep -oE 'aiosendspin-[^/ ]+\.dist-info' | grep -Fv '*' | sort -u || true)"
+if [ "$copy_targets" != "aiosendspin-${AIOSENDSPIN_VERSION}.dist-info" ]; then
+	fail "installed aiosendspin is ${AIOSENDSPIN_VERSION}, but $DOCKERFILE COPYs to:
+       ${copy_targets:-<no dist-info target found>}
+       Update the COPY target in the Dockerfile, or reinstall the matching wheel."
+fi
+
+# The installed version is authoritative -- it is what this checkout actually
+# runs against -- so require a wheel matching it rather than picking whichever
+# wheel happens to be newest in dist/.
+AIOSENDSPIN_REPO="${AIOSENDSPIN_REPO:-$WORKSPACE/../aiosendspin}"
+AIOSENDSPIN_WHEEL="$AIOSENDSPIN_REPO/dist/aiosendspin-${AIOSENDSPIN_VERSION}-py3-none-any.whl"
+[ -f "$AIOSENDSPIN_WHEEL" ] || fail "no wheel for the installed aiosendspin ${AIOSENDSPIN_VERSION} at
+       $AIOSENDSPIN_WHEEL
+       Build it in the aiosendspin fork, or set AIOSENDSPIN_REPO to its checkout."
+
+WHEEL_TMP="$(mktemp -d)"
+trap 'rm -rf "$WHEEL_TMP"' EXIT
+"$VENV_PY" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+	"$AIOSENDSPIN_WHEEL" "$WHEEL_TMP"
+AIOSENDSPIN_PKG="$WHEEL_TMP/aiosendspin"
+AIOSENDSPIN_DIST="$WHEEL_TMP/aiosendspin-${AIOSENDSPIN_VERSION}.dist-info"
+{ [ -d "$AIOSENDSPIN_PKG" ] && [ -d "$AIOSENDSPIN_DIST" ]; } ||
+	fail "wheel $AIOSENDSPIN_WHEEL did not contain the expected aiosendspin/ and dist-info/ dirs"
+note "aiosendspin version: ${AIOSENDSPIN_VERSION} (wheel matches installed + Dockerfile.lidarr)"
+
+# --- stage -------------------------------------------------------------------
+sync_dir "music_assistant" "$REPO_ROOT/music_assistant" \
+	"$REPO_ROOT/music_assistant_overlay" "$SECRETS_REL" || rc=1
+sync_dir "models" "$MODELS_SRC" "$REPO_ROOT/models_overlay" || rc=1
+sync_dir "frontend" "$FRONTEND_SRC" "$REPO_ROOT/frontend_overlay" || rc=1
+sync_dir "aiosendspin" "$AIOSENDSPIN_PKG" "$REPO_ROOT/aiosendspin_overlay" || rc=1
+sync_dir "aiosendspin dist-info" "$AIOSENDSPIN_DIST" \
+	"$REPO_ROOT/aiosendspin_dist_info_overlay" || rc=1
+
+# --delete does not remove an excluded path, so a copy staged before this script
+# existed would survive every future run. Clear it explicitly.
+SECRETS="$REPO_ROOT/music_assistant_overlay/$SECRETS_REL"
+if [ -e "$SECRETS" ]; then
+	if [ "$CHECK_ONLY" -eq 1 ]; then
+		note "app_secrets.json: PRESENT in overlay (must not be)"
+		rc=1
+	else
+		rm -f "$SECRETS"
+		note "app_secrets.json: removed from overlay (comes from the upstream image)"
+	fi
+fi
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+	if [ "$rc" -eq 0 ]; then
+		echo "all overlays up to date"
+	else
+		echo "overlays are stale -- run scripts/staging" >&2
+	fi
+	exit "$rc"
+fi
+
+[ "$rc" -eq 0 ] || fail "one or more overlays failed to stage (see errors above)"
+
+# Prove the mirrors really match rather than trusting rsync's exit code alone.
+verify "music_assistant" "$REPO_ROOT/music_assistant" \
+	"$REPO_ROOT/music_assistant_overlay" "$SECRETS_REL"
+verify "models" "$MODELS_SRC" "$REPO_ROOT/models_overlay"
+verify "frontend" "$FRONTEND_SRC" "$REPO_ROOT/frontend_overlay"
+verify "aiosendspin" "$AIOSENDSPIN_PKG" "$REPO_ROOT/aiosendspin_overlay"
+verify "aiosendspin dist-info" "$AIOSENDSPIN_DIST" "$REPO_ROOT/aiosendspin_dist_info_overlay"
+
+echo "overlays staged -- ready for: docker build -f Dockerfile.lidarr ."

@@ -51,10 +51,12 @@ COPY frontend_overlay/ \
      /app/venv/lib/python3.14/site-packages/music_assistant_frontend/
 
 # Replace upstream's released aiosendspin with the enhanced-branch local-wheel
-# build (6.0.5+trackfields = upstream 6.0.5 plus the trackfields split). The
-# merged MA server expects the aiosendspin 6.x API, and the trackfields shape
+# build (7.0.0+trackfields = upstream 7.0.0 plus the trackfields split). The
+# merged MA server expects the aiosendspin 7.x API, and the trackfields shape
 # (album_track / queue_track / total_tracks) is required by the enhanced
 # sendspin/airplay/chromecast providers — without this overlay they fail to import.
+# The version below is not free-form: scripts/staging cross-checks it against the
+# wheel it stages and fails the build rather than ship a mislabelled dist-info.
 RUN rm -rf /app/venv/lib/python3.14/site-packages/aiosendspin \
            /app/venv/lib/python3.14/site-packages/aiosendspin-*.dist-info
 COPY aiosendspin_overlay/ \
