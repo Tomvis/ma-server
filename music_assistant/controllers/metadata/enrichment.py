@@ -66,6 +66,24 @@ class MetadataEnrichmentMixin:
             fanart: bool = False,
         ) -> MediaItemImage | None: ...
 
+    async def _prefer_local_genres(
+        self, media_type: MediaType, item_id: str, has_local_genres: bool
+    ) -> bool:
+        """
+        Return whether online genres must not be merged on top of source-supplied ones.
+
+        Propagation-derived genres also count as a local source, so they survive
+        metadata refreshes.
+
+        :param media_type: Media type of the item being refreshed.
+        :param item_id: Library item id of the item being refreshed.
+        :param has_local_genres: Whether the item already carries genres from a local source.
+        """
+        return bool(self.config.get_value(CONF_PREFER_LOCAL_GENRES)) and (
+            has_local_genres
+            or await self.mass.music.genres.has_derived_genre_mappings(media_type, item_id)
+        )
+
     async def _update_artist_metadata(self, artist: Artist, force_refresh: bool = False) -> None:
         """Get/update rich metadata for an artist."""
         # collect metadata from all (online) music + metadata providers
@@ -123,13 +141,8 @@ class MetadataEnrichmentMixin:
             if mbid := await self._get_artist_mbid(artist):
                 artist.mbid = mbid
 
-        # don't merge online genres on top of source-supplied ones; propagation-derived
-        # genres also count as a local source so they survive metadata refreshes
-        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
-            bool(artist.metadata.genres)
-            or await self.mass.music.genres.has_derived_genre_mappings(
-                MediaType.ARTIST, artist.item_id
-            )
+        prefer_local_genres = await self._prefer_local_genres(
+            MediaType.ARTIST, artist.item_id, bool(artist.metadata.genres)
         )
 
         # collect metadata from all (online)[metadata] providers
@@ -241,13 +254,8 @@ class MetadataEnrichmentMixin:
                 if album.album_type == AlbumType.UNKNOWN:
                     album.album_type = prov_item.album_type
 
-        # don't merge online genres on top of source-supplied ones; propagation-derived
-        # genres also count as a local source so they survive metadata refreshes
-        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
-            bool(album.metadata.genres)
-            or await self.mass.music.genres.has_derived_genre_mappings(
-                MediaType.ALBUM, album.item_id
-            )
+        prefer_local_genres = await self._prefer_local_genres(
+            MediaType.ALBUM, album.item_id, bool(album.metadata.genres)
         )
 
         # collect metadata from all (online) [metadata] providers
@@ -322,15 +330,11 @@ class MetadataEnrichmentMixin:
                     local_provided_genres = True
                 track.metadata.update(prov_item.metadata)
 
-        # don't merge online genres on top of source-supplied ones; a local music
-        # provider's genres or propagation-derived genres count as a local source and
-        # survive metadata refreshes (mirrors _update_album_metadata, except streaming-
-        # provider genres are intentionally not treated as local here)
-        prefer_local_genres = self.config.get_value(CONF_PREFER_LOCAL_GENRES) and (
-            local_provided_genres
-            or await self.mass.music.genres.has_derived_genre_mappings(
-                MediaType.TRACK, track.item_id
-            )
+        # only a local music provider's genres count as local here (mirrors
+        # _update_album_metadata, except streaming-provider genres are
+        # intentionally not treated as local for tracks)
+        prefer_local_genres = await self._prefer_local_genres(
+            MediaType.TRACK, track.item_id, local_provided_genres
         )
 
         # collect metadata from all [metadata] providers

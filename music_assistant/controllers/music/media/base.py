@@ -397,7 +397,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             favorite = True
         query_params: dict[str, Any] = {}
         query_parts: list[str] = []
-        join_parts: list[str] = []
         self._apply_filters(
             query_parts=query_parts,
             query_params=query_params,
@@ -407,7 +406,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             provider_filter=self._ensure_provider_filter(provider),
             in_library_only=True,
         )
-        return await self._execute_count(query_parts, join_parts, query_params)
+        return await self._execute_count(query_parts, query_params)
 
     if TYPE_CHECKING:
 
@@ -903,10 +902,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         library_item = await self.get_library_item(db_id)
         if library_item.favorite == favorite:
             return
-        match = {"item_id": db_id}
-        await self.mass.music.database.update(self.db_table, match, {"favorite": favorite})
-        library_item = await self.get_library_item(db_id)
-        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+        await self._set_flag_columns(db_id, {"favorite": favorite})
 
     @final
     async def has_play_history(self, item_id: str | int) -> bool:
@@ -1637,28 +1633,46 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         """Clean the query parts list by removing duplicate where statements."""
         return [x[5:] if x.lower().startswith("where ") else x for x in query_parts]
 
+    async def _set_flag_columns(self, db_id: int, values: dict[str, Any]) -> None:
+        """
+        Write user-flag columns on a library row and announce the change.
+
+        Shared by :meth:`set_favorite` and the media-type specific flag setters so
+        every flag lands through the same write / re-read / signal_event contract.
+
+        :param db_id: Library item id (database id) of the row to update.
+        :param values: Column -> value mapping to write.
+        """
+        await self.mass.music.database.update(self.db_table, {"item_id": db_id}, values)
+        library_item = await self.get_library_item(db_id)
+        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+
     @final
     async def _execute_count(
         self,
         query_parts: list[str],
-        join_parts: list[str],
         query_params: dict[str, Any],
+        join_parts: list[str] | None = None,
     ) -> int:
         """
         Assemble and execute a deduplicated COUNT over this controller's table.
 
         :param query_parts: WHERE-clause fragments (combined with AND).
-        :param join_parts: JOIN fragments appended after the FROM clause.
         :param query_params: Bound query parameters.
+        :param join_parts: Optional JOIN fragments appended after the FROM clause.
         """
         sql_query = f"SELECT {self.db_table}.item_id FROM {self.db_table}"
         if join_parts:
             sql_query += f" {' '.join(join_parts)}"
         if query_parts:
             sql_query += " WHERE " + " AND ".join(self._clean_query_parts(query_parts))
-        # A provider_mappings JOIN can fan a row out per-mapping — dedupe so the
-        # count stays media-item-level.
-        sql_query += f" GROUP BY {self.db_table}.item_id"
+        if join_parts:
+            # A JOIN can fan a row out per matched child row — dedupe so the count
+            # stays media-item-level. Only needed when a JOIN is actually present:
+            # _apply_filters expresses every filter as a correlated EXISTS, so the
+            # join-less query is already one row per item and the GROUP BY would
+            # just add a temp b-tree to a plain COUNT.
+            sql_query += f" GROUP BY {self.db_table}.item_id"
         return await self.mass.music.database.get_count_from_query(sql_query, query_params)
 
     @final

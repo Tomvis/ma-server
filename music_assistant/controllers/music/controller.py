@@ -1184,7 +1184,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             # Land CR on the in-memory album so _add_library_item persists it on
             # the initial insert. For an existing listen-later row the merge
             # path in _update_library_item replaces CR when the new payload is
-            # strictly richer (see _critical_reception_is_richer).
+            # strictly richer (see critical_reception_is_richer).
             if candidate.metadata is None:
                 candidate.metadata = MediaItemMetadata()
             candidate.metadata.critical_reception = critical_reception

@@ -136,7 +136,6 @@ class ArtistsController(MediaControllerBase[Artist]):
             favorite = True
         query_params: dict[str, Any] = {}
         query_parts: list[str] = []
-        join_parts: list[str] = []
         if artist_type:
             query_parts.append(f"artist_type = '{artist_type}'")
         self._apply_filters(
@@ -155,7 +154,7 @@ class ArtistsController(MediaControllerBase[Artist]):
                 f"{self.db_table}.item_id in "
                 f"(select {DB_TABLE_ALBUM_ARTISTS}.artist_id FROM {DB_TABLE_ALBUM_ARTISTS})"
             )
-        return await self._execute_count(query_parts, join_parts, query_params)
+        return await self._execute_count(query_parts, query_params)
 
     async def library_items(  # noqa: PLR0913
         self,

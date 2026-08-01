@@ -42,6 +42,11 @@ _REQUEST_TIMEOUT = ClientTimeout(total=30)
 _QUEUE_REQUEST_TIMEOUT = ClientTimeout(total=180)
 
 
+def _snippet(body: Any) -> str:
+    """Render a response body as a short, log/error-safe excerpt."""
+    return (body if isinstance(body, str) else str(body))[:200]
+
+
 class MusicRaterError(InvalidDataError):
     """
     Raised for unexpected music-rater API responses.
@@ -73,10 +78,9 @@ class MusicRaterClient:
         if status >= 500:
             raise ProviderUnavailableError(f"music-rater returned {status} on connectivity probe")
         if status >= 400 or not isinstance(body, dict) or "items" not in body:
-            snippet = body if isinstance(body, str) else str(body)[:200]
             raise MusicRaterError(
                 f"Unexpected response from music-rater /albums?limit=1 "
-                f"(status={status}): {snippet[:200]}"
+                f"(status={status}): {_snippet(body)}"
             )
 
     async def resolve_by_uri(self, music_assistant_uri: str) -> int | None:
@@ -116,14 +120,12 @@ class MusicRaterClient:
             # rather than silently treating it as a benign no-op (which
             # _build_result would then re-raise as a misleading error anyway).
             if not isinstance(body, dict):
-                snippet = body if isinstance(body, str) else str(body)[:200]
                 raise MusicRaterError(
                     f"music-rater POST /albums/{album_id}/lidarr/queue returned "
-                    f"status={status} with no JSON body: {snippet[:200] or '(empty)'}"
+                    f"status={status} with no JSON body: {_snippet(body) or '(empty)'}"
                 )
             return body
         # Per music-rater's documented error surface.
-        snippet = body if isinstance(body, str) else str(body)[:200]
         if status == 404:
             raise MediaNotFoundError(f"music-rater no longer has album_id={album_id} (deleted?)")
         if status == 409:
@@ -146,10 +148,10 @@ class MusicRaterClient:
         if status >= 500:
             raise ProviderUnavailableError(
                 f"music-rater POST /albums/{album_id}/lidarr/queue failed "
-                f"(status={status}): {snippet[:200]}"
+                f"(status={status}): {_snippet(body)}"
             )
         raise MusicRaterError(
-            f"POST /albums/{album_id}/lidarr/queue failed (status={status}): {snippet[:200]}"
+            f"POST /albums/{album_id}/lidarr/queue failed (status={status}): {_snippet(body)}"
         )
 
     async def _request(
@@ -210,7 +212,6 @@ class MusicRaterClient:
         if status >= 500:
             raise ProviderUnavailableError(f"music-rater returned {status} from /albums")
         if status >= 400 or not isinstance(body, dict):
-            snippet = body if isinstance(body, str) else str(body)[:200]
-            raise MusicRaterError(f"GET /albums failed (status={status}): {snippet[:200]}")
+            raise MusicRaterError(f"GET /albums failed (status={status}): {_snippet(body)}")
         items = body.get("items") or []
         return [item for item in items if isinstance(item, dict)]

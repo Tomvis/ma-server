@@ -800,12 +800,7 @@ async def migrate_database(  # noqa: PLR0915
         ):
             # tables (re)created by an earlier migration step already use the current
             # schema (no external_ids column) and have nothing to backfill
-            table_columns = {
-                column["name"]
-                for column in await database.get_rows_from_query(
-                    f"PRAGMA table_info({table})", limit=0
-                )
-            }
+            table_columns = await _table_columns(database, table)
             if "external_ids" not in table_columns:
                 continue
             # the column must not be indexed for DROP COLUMN to succeed
@@ -824,12 +819,7 @@ async def migrate_database(  # noqa: PLR0915
             await database.execute(f"ALTER TABLE {table} DROP COLUMN external_ids")
 
     if prev_version <= 52:
-        audio_analysis_table_exists = await database.get_rows_from_query(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table_name",
-            {"table_name": DB_TABLE_AUDIO_ANALYSIS},
-            limit=1,
-        )
-        if audio_analysis_table_exists:
+        if await _table_exists(database, DB_TABLE_AUDIO_ANALYSIS):
             # SQLite does not guarantee WHERE-term evaluation order, so a bare
             # json_valid() term cannot reliably shield json_each()/json_type()
             # from raising on malformed rows - guard their input directly instead.
@@ -879,12 +869,7 @@ async def migrate_database(  # noqa: PLR0915
     if prev_version <= 53:
         # normalize stored synced lyrics: strip LRC ID tags and expand multi-timestamp
         # (repeating) lines into one line per timestamp
-        tracks_columns = {
-            x["name"]
-            for x in await database.get_rows_from_query(
-                f"PRAGMA table_info({DB_TABLE_TRACKS})", limit=0
-            )
-        }
+        tracks_columns = await _table_columns(database, DB_TABLE_TRACKS)
         repaired_lyrics_rows = 0
         if "metadata" in tracks_columns:
             # guard against (test) databases with stand-in tables
@@ -923,10 +908,7 @@ async def migrate_database(  # noqa: PLR0915
             (DB_TABLE_TRACKS, "track"),
             (DB_TABLE_PLAYLISTS, "playlist"),
         ):
-            table_columns = {
-                x["name"]
-                for x in await database.get_rows_from_query(f"PRAGMA table_info({table})", limit=0)
-            }
+            table_columns = await _table_columns(database, table)
             if "metadata" not in table_columns:
                 # guard against (test) databases with stand-in tables
                 continue
@@ -1094,10 +1076,7 @@ async def migrate_database(  # noqa: PLR0915
     # this both populates them on first migration to the FTS-enabled schema and
     # repairs them after any migration that rewrote rows without the sync triggers active
     for table in MEDIA_ITEM_DB_TABLES:
-        table_columns = {
-            x["name"]
-            for x in await database.get_rows_from_query(f"PRAGMA table_info({table})", limit=0)
-        }
+        table_columns = await _table_columns(database, table)
         if "search_name" not in table_columns:
             # guard against (test) databases with stand-in tables
             continue

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Final, cast
 
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.enums import MediaType, ProviderFeature
@@ -42,15 +42,16 @@ from music_assistant.controllers.tasks.context import (
     report_current_task_failure,
     update_current_task_progress_text,
 )
+from music_assistant.helpers.critical_reception import critical_reception_is_richer
 
 from .provider import Provider
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from music_assistant_models.media_items.metadata import ReviewSourceEntry
     from music_assistant_models.streamdetails import StreamDetails
 
+    from music_assistant.controllers.music.media.albums import AlbumSyncDetails
     from music_assistant.controllers.music.media.base import (
         AudiobookSyncDetails,
         LibraryItemSyncDetails,
@@ -58,182 +59,6 @@ if TYPE_CHECKING:
     )
 
 CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
-
-
-# The value-bearing fields of a ReviewSourceEntry, excluding the `source` identifier.
-# Every richness/preservation check below is driven off this one roster, so adding a
-# field to ReviewSourceEntry only has to be recorded here.
-_REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
-    "rating",
-    "favorite",
-    "accolades",
-    "links",
-    "authors",
-)
-# The subset of the above whose values are lists; these compare None and [] as equal.
-_REVIEW_SOURCE_LIST_FIELDS: Final[frozenset[str]] = frozenset({"accolades", "links", "authors"})
-
-
-def _field_weight(value: Any) -> int:
-    """
-    Richness weight of one ReviewSourceEntry field value.
-
-    Scalars count once when set (``favorite=False`` and ``rating=0.0`` are set);
-    list fields count once per element, so gaining an accolade counts as richer.
-    """
-    if value is None:
-        return 0
-    if isinstance(value, list | tuple | set):
-        return len(value)
-    return 1
-
-
-def _field_is_populated(value: Any) -> bool:
-    """Return True when a ReviewSourceEntry field is populated (not None / empty)."""
-    return _field_weight(value) > 0
-
-
-def _source_filled_field_count(source: ReviewSourceEntry | None) -> int:
-    """
-    Count populated fields on a single ReviewSourceEntry.
-
-    Used as a per-source richness signal so a refresh that gains a rating,
-    favorite flag, or extra accolade label wins over the stored copy even when
-    the total source count hasn't changed.
-    """
-    if source is None:
-        return 0
-    return sum(_field_weight(getattr(source, field)) for field in _REVIEW_SOURCE_FIELDS)
-
-
-def _total_source_field_count(sources: Sequence[ReviewSourceEntry] | None) -> int:
-    """Sum of filled fields across every entry in a sources iterable."""
-    if not sources:
-        return 0
-    return sum(_source_filled_field_count(s) for s in sources)
-
-
-def _sources_by_name(sources: Any) -> dict[str, Any]:
-    """
-    Map source identifier -> ReviewSourceEntry for a sources iterable.
-
-    Drops empty / blank source names. On duplicate source names (which the
-    downstream SQL filters assume away), keep the FIRST entry — the strict
-    richness check then compares each cur entry against the same stable
-    reference. A dict comprehension would otherwise keep the *last* entry,
-    making the richness check asymmetric on inputs that violate the
-    "one entry per source" invariant.
-    """
-    result: dict[str, Any] = {}
-    for s in sources or []:
-        if s is None:
-            continue
-        name = getattr(s, "source", "") or ""
-        if not name or name in result:
-            continue
-        result[name] = s
-    return result
-
-
-def _source_preserves_data(new_source: Any, cur_source: Any) -> bool:
-    """
-    Return True when `new_source` keeps every populated field from `cur_source`.
-
-    A field that's populated on the stored copy must still be populated on the
-    incoming one — losing a rating, dropping all accolades, etc. would erase data
-    on the caller's wholesale `metadata.critical_reception = new` assignment.
-
-    List-valued fields (accolades, links, authors) only have to stay non-empty,
-    not stay a superset. For file-tag-derived CR the provider re-probe is
-    authoritative: an accolade set that legitimately changes over time (an award
-    revised, a new honorable mention added in a later year, a stale one dropped)
-    is a valid refresh, not a regression — and gating it behind a strict superset
-    would also block an additive refresh (e.g. one that adds review links) whenever
-    the set happened to change. Net data loss across the whole CR is still guarded
-    by the aggregate field-count check in `_critical_reception_is_richer`.
-    """
-    if cur_source is None:
-        return True
-    if new_source is None:
-        return False
-    for field in _REVIEW_SOURCE_FIELDS:
-        cur_val = getattr(cur_source, field, None)
-        new_val = getattr(new_source, field, None)
-        if not _field_is_populated(cur_val):
-            continue
-        if not _field_is_populated(new_val):
-            return False
-    return True
-
-
-def _sources_preserve_data(new_sources: Any, cur_sources: Any) -> bool:
-    """Return True when every existing source's populated fields survive on the new side."""
-    new_by_name = _sources_by_name(new_sources)
-    for cur in cur_sources or []:
-        name = getattr(cur, "source", "")
-        if not _source_preserves_data(new_by_name.get(name), cur):
-            return False
-    return True
-
-
-def _critical_reception_is_richer(new: object, existing: object) -> bool:
-    """
-    Return True if `new` carries more or fresher critical_reception data than `existing`.
-
-    "Richer" means either strictly more populated fields, or the same shape with at
-    least one field value that actually changed (e.g. a refreshed rating). The replace
-    step on the caller side is wholesale (`metadata.critical_reception = new`), so any
-    regression — a lost amg_dr, a dropped source, or a per-source field that goes from
-    populated to blank — has to be rejected; the stored copy stays in that case.
-    """
-    if new is None:
-        return False
-    if existing is None:
-        return True
-    new_amg_dr = getattr(new, "amg_dr", None)
-    cur_amg_dr = getattr(existing, "amg_dr", None)
-    new_sources = getattr(new, "sources", None) or []
-    cur_sources = getattr(existing, "sources", None) or []
-    # Regression on either dimension would erase data on wholesale replace.
-    if cur_amg_dr is not None and new_amg_dr is None:
-        return False
-    if len(new_sources) < len(cur_sources):
-        return False
-    # Per-source field-level regression check: same source name on both sides,
-    # populated field on `existing` must still be populated on `new`.
-    if not _sources_preserve_data(new_sources, cur_sources):
-        return False
-    new_total = (1 if new_amg_dr is not None else 0) + _total_source_field_count(new_sources)
-    cur_total = (1 if cur_amg_dr is not None else 0) + _total_source_field_count(cur_sources)
-    if new_total > cur_total:
-        return True
-    if new_total < cur_total:
-        return False
-    # Same field count and no field-level regression: accept when at least one
-    # value actually changed (refreshed rating, swapped accolade, new amg_dr) so
-    # meaningful updates don't get stuck behind an equal-shape stored copy.
-    if new_amg_dr != cur_amg_dr:
-        return True
-    new_by_name = _sources_by_name(new_sources)
-    return any(
-        _source_signature(new_by_name.get(getattr(s, "source", ""))) != _source_signature(s)
-        for s in cur_sources
-    )
-
-
-def _source_signature(source: ReviewSourceEntry | None) -> tuple[Any, ...]:
-    """Return a comparable snapshot of every value-bearing field on a ReviewSourceEntry."""
-    if source is None:
-        return ()
-    return (
-        source.source,
-        *(
-            tuple(getattr(source, field) or ())
-            if field in _REVIEW_SOURCE_LIST_FIELDS
-            else getattr(source, field)
-            for field in _REVIEW_SOURCE_FIELDS
-        ),
-    )
 
 
 class MusicProvider(Provider):
@@ -992,16 +817,19 @@ class MusicProvider(Provider):
                         # renaming a local file) would cascade through
                         # remove_item_from_library and wipe the playlog, killing
                         # play_count/last_played for that user.
-                        has_user_anchor = (
+                        # Evaluated only once the cheap conditions already point at a
+                        # full delete - has_play_history is a DB round-trip per item
+                        # and is irrelevant for streaming providers or when another
+                        # provider still has the item in library.
+                        delete_candidate = (
+                            not remaining_providers_in_library and not self.is_streaming_provider
+                        )
+                        has_user_anchor = delete_candidate and (
                             library_item.favorite
                             or library_item.listen_later
                             or await controller.has_play_history(db_id)
                         )
-                        if (
-                            not remaining_providers_in_library
-                            and not self.is_streaming_provider
-                            and not has_user_anchor
-                        ):
+                        if delete_candidate and not has_user_anchor:
                             # for non-streaming providers (local files, library-middlemen
                             # like subsonic/jellyfin/plex) an item removed from the provider
                             # is actually gone; fully remove it to avoid dangling records
@@ -1139,8 +967,11 @@ class MusicProvider(Provider):
         async for prov_item in self.get_library_albums():
             item_count += 1
             self._update_sync_task_item_status(MediaType.ALBUM, item_count, prov_item.name)
-            sync_details = await self.mass.music.albums.get_library_item_sync_details(
-                prov_item.provider_mappings,
+            sync_details = cast(
+                "AlbumSyncDetails | None",
+                await self.mass.music.albums.get_library_item_sync_details(
+                    prov_item.provider_mappings,
+                ),
             )
             try:
                 # batch all writes for this item into a single commit
@@ -1152,15 +983,43 @@ class MusicProvider(Provider):
                         library_item = await self.mass.music.albums.add_item_to_library(prov_item)
                         db_id = int(library_item.item_id)
                         favorite = library_item.favorite
-                    elif self._library_item_needs_update(sync_details, prov_item):
-                        library_item = await self.mass.music.albums.update_item_in_library(
-                            sync_details.item_id, prov_item
-                        )
-                        db_id = int(library_item.item_id)
-                        favorite = library_item.favorite
                     else:
-                        db_id = sync_details.item_id
-                        favorite = sync_details.favorite
+                        # Enhanced: refresh review data when the provider surfaced something
+                        # richer. critical_reception and dynamic_range are independent, so
+                        # widen the update condition with whichever changed and let the single
+                        # update_item_in_library call below persist both - separate arms meant
+                        # a sync refreshing both in one pass only landed one. The authoritative
+                        # merge lives in albums._update_library_item, so what gets stored is
+                        # that merge's result, not the raw provider values assigned wholesale.
+                        prov_meta = prov_item.metadata
+                        cr_new = prov_meta.critical_reception if prov_meta else None
+                        dr_new = prov_meta.dynamic_range if prov_meta else None
+                        cr_richer = cr_new is not None and critical_reception_is_richer(
+                            cr_new, sync_details.critical_reception
+                        )
+                        # MediaItemMetadata.update() only overwrites a stored dynamic_range
+                        # with a truthy value, so a provider DR of exactly 0.0 can land only
+                        # while nothing is stored yet. Counting it as pending in any other
+                        # case would re-write this album on every single sync forever, since
+                        # the merge can never persist it and the difference never goes away.
+                        dr_changed = (
+                            dr_new is not None
+                            and dr_new != sync_details.dynamic_range
+                            and (bool(dr_new) or sync_details.dynamic_range is None)
+                        )
+                        if (
+                            self._library_item_needs_update(sync_details, prov_item)
+                            or cr_richer
+                            or dr_changed
+                        ):
+                            library_item = await self.mass.music.albums.update_item_in_library(
+                                sync_details.item_id, prov_item
+                            )
+                            db_id = int(library_item.item_id)
+                            favorite = library_item.favorite
+                        else:
+                            db_id = sync_details.item_id
+                            favorite = sync_details.favorite
                     if not favorite and prov_item.favorite:
                         # existing library item not favorite but should be
                         await self.mass.music.albums.set_favorite(db_id, True)
@@ -1175,29 +1034,6 @@ class MusicProvider(Provider):
                         db_id,
                         fallback_genres,
                     )
-                    # Enhanced: refresh review data when the provider surfaced something
-                    # richer. critical_reception and dynamic_range are independent, so
-                    # apply whichever changed and persist once - separate arms meant a
-                    # sync refreshing both in one pass only landed one. The authoritative
-                    # merge lives in albums._update_library_item; mutating the item and
-                    # calling update_item_in_library is what persists it.
-                    prov_meta = prov_item.metadata
-                    cr_new = prov_meta.critical_reception if prov_meta else None
-                    dr_new = prov_meta.dynamic_range if prov_meta else None
-                    cr_richer = cr_new is not None and _critical_reception_is_richer(
-                        cr_new, getattr(sync_details, "critical_reception", None)
-                    )
-                    dr_changed = dr_new is not None and dr_new != getattr(
-                        sync_details, "dynamic_range", None
-                    )
-                    if sync_details is not None and (cr_richer or dr_changed):
-                        library_item = await self.mass.music.albums.get_library_item(db_id)
-                        if library_item.metadata is not None:
-                            if cr_richer:
-                                library_item.metadata.critical_reception = cr_new
-                            if dr_changed:
-                                library_item.metadata.dynamic_range = dr_new
-                            await self.mass.music.albums.update_item_in_library(db_id, library_item)
                     # Promote: a sync that flips in_library=True on an album previously
                     # sitting on listen-later means the user now has it in their proper
                     # library, so clear the flag or it shows up in both views. The

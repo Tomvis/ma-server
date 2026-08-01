@@ -389,7 +389,6 @@ class GenreController(MediaControllerBase[Genre]):
         # library_items hides soft-deleted entries; the raw FROM below bypasses
         # that view, so filter explicitly here or counts include excluded rows.
         query_parts: list[str] = [f"{self.db_table}.is_excluded = 0"]
-        join_parts: list[str] = []
         self._apply_filters(
             query_parts=query_parts,
             query_params=query_params,
@@ -411,7 +410,7 @@ class GenreController(MediaControllerBase[Genre]):
             hide_empty=hide_empty,
             media_type=media_type,
         )
-        return await self._execute_count(query_parts, join_parts, query_params)
+        return await self._execute_count(query_parts, query_params)
 
     async def tracks(
         self,

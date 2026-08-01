@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -13,7 +12,6 @@ from typing import TYPE_CHECKING, Any, cast
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import (
     AlbumType,
-    EventType,
     ExternalID,
     MediaType,
     ProviderFeature,
@@ -29,7 +27,7 @@ from music_assistant_models.media_items import (
     Track,
     UniqueList,
 )
-from music_assistant_models.media_items.metadata import CriticalReception
+from music_assistant_models.media_items.metadata import CriticalReception, MediaItemMetadata
 
 from music_assistant.constants import DB_TABLE_ALBUM_ARTISTS, DB_TABLE_ALBUM_TRACKS, DB_TABLE_ALBUMS
 from music_assistant.controllers.music.helpers import search_name_match_clause
@@ -40,10 +38,13 @@ from music_assistant.helpers.compare import (
     create_safe_string,
     loose_compare_strings,
 )
+from music_assistant.helpers.critical_reception import critical_reception_is_richer
 from music_assistant.helpers.database import UNSET
+from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.helpers.json import json_loads, serialize_to_json
 from music_assistant.helpers.tags import ACCOLADE_KINDS
-from music_assistant.models.music_provider import MusicProvider, _critical_reception_is_richer
+from music_assistant.helpers.util import try_parse_int
+from music_assistant.models.music_provider import MusicProvider
 
 from .base import LibraryItemSyncDetails, MediaControllerBase
 
@@ -87,6 +88,19 @@ _ACCOLADE_KIND_MATCH: dict[str, tuple[str, str]] = {
 # future schema move only needs a single edit.
 _CR_SOURCES_EACH = "json_each(albums.metadata, '$.critical_reception.sources')"
 
+# The canonical (measured) album dynamic range. Extracted for the same reason as
+# _CR_SOURCES_EACH: it feeds the DR bucket filter, both dr sort keys, the summary
+# query and the sync-details query, so a schema move stays a single edit.
+_DR_JSON = "json_extract(albums.metadata, '$.dynamic_range')"
+
+# Rating-bucket vocabulary per CR source: the selector values a client may send and
+# the width of the bucket each selector spans. AMG rates in whole stars (selector N
+# covers [N, N+1), i.e. floor(rating) == N); TPS selectors step in twos.
+_CR_RATING_SPECS: dict[str, tuple[frozenset[int], int]] = {
+    "AMG": (frozenset(range(1, 6)), 1),
+    "TPS": (frozenset({1, 3, 5, 7, 9}), 2),
+}
+
 
 def _cr_source_exists(source_sql: str, extra_sql: str = "") -> str:
     """
@@ -128,35 +142,27 @@ def _coerce_int_list(values: list[Any] | None) -> list[int]:
     The api command parses these as ``list[int]``, but the JSON deserializer
     preserves stray ``null`` / non-numeric entries; without this filter a
     malformed payload would raise out of the bucket-clause builders.
+
+    The ``bool`` guard is not redundant: ``try_parse_int(True)`` returns 1.
     """
-    result: list[int] = []
-    for v in values or ():
-        if v is None or isinstance(v, bool):
-            continue
-        try:
-            result.append(int(v))
-        except TypeError, ValueError:
-            continue
-    return result
+    return [
+        i
+        for v in (values or ())
+        if not isinstance(v, bool) and (i := try_parse_int(v, None)) is not None
+    ]
 
 
-def _amg_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
-    """Build the WHERE fragment for AMG rating buckets (1..5; floor(rating) == N)."""
-    int_values = sorted({v for v in _coerce_int_list(values) if 1 <= v <= 5})
-    if not int_values:
-        return "", {}
-    params = {f"{param_prefix}_{i}": v for i, v in enumerate(int_values)}
-    bind_list = ", ".join(f":{k}" for k in params)
-    sub = _cr_source_exists(
-        "'AMG'",
-        f" AND CAST(json_extract(value, '$.rating') AS INTEGER) IN ({bind_list})",
-    )
-    return sub, params
+def _rating_bucket_clause(
+    source: str, values: list[int], param_prefix: str
+) -> tuple[str, dict[str, Any]]:
+    """
+    Build the WHERE fragment for the given source's rating buckets.
 
-
-def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str, dict[str, Any]]:
-    """Build WHERE fragment for TPS rating buckets (selectors 1,3,5,7,9 → [N, N+2))."""
-    valid = sorted({v for v in _coerce_int_list(values) if v in (1, 3, 5, 7, 9)})
+    Selectors outside the source's vocabulary (see ``_CR_RATING_SPECS``) are dropped;
+    each surviving selector N matches the half-open range [N, N + width).
+    """
+    allowed, width = _CR_RATING_SPECS[source]
+    valid = sorted({v for v in _coerce_int_list(values) if v in allowed})
     if not valid:
         return "", {}
     bucket_clauses: list[str] = []
@@ -164,13 +170,13 @@ def _tps_rating_bucket_clause(values: list[int], param_prefix: str) -> tuple[str
     for i, lo in enumerate(valid):
         lo_key, hi_key = f"{param_prefix}_lo_{i}", f"{param_prefix}_hi_{i}"
         params[lo_key] = lo
-        params[hi_key] = lo + 2
+        params[hi_key] = lo + width
         bucket_clauses.append(
             f"(json_extract(value, '$.rating') >= :{lo_key} "
             f"AND json_extract(value, '$.rating') < :{hi_key})"
         )
     inner = " OR ".join(bucket_clauses)
-    sub = _cr_source_exists("'TPS'", f" AND ({inner})")
+    sub = _cr_source_exists(f"'{source}'", f" AND ({inner})")
     return sub, params
 
 
@@ -231,7 +237,7 @@ def _source_untagged_clause(source: str, param_prefix: str) -> tuple[str, dict[s
     return sub, {src_key: source}
 
 
-def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
+def _apply_critical_reception_filters(  # noqa: PLR0913
     *,
     query_parts: list[str],
     query_params: dict[str, Any],
@@ -278,7 +284,7 @@ def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
         if kinds:
             dr_path = (
                 "COALESCE("
-                "json_extract(albums.metadata, '$.dynamic_range'), "
+                f"{_DR_JSON}, "
                 "json_extract(albums.metadata, '$.critical_reception.amg_dr')"
                 ")"
             )
@@ -297,48 +303,32 @@ def _apply_critical_reception_filters(  # noqa: PLR0913, PLR0915
                     or_parts.append(f"({dr_path} >= :{lo_key} AND {dr_path} < :{hi_key})")
             local_parts.append("(" + " OR ".join(or_parts) + ")")
 
-    # AMG / TPS rating buckets
-    if amg_ratings:
-        clause, params = _amg_rating_bucket_clause(list(amg_ratings), "amg_rb")
-        if clause:
-            local_parts.append(clause)
-            query_params.update(params)
-    if tps_ratings:
-        clause, params = _tps_rating_bucket_clause(list(tps_ratings), "tps_rb")
-        if clause:
-            local_parts.append(clause)
-            query_params.update(params)
-
-    # AMG / TPS favorite flag
-    if amg_favorite:
-        clause, params = _source_favorite_clause("AMG", "amg_fav")
-        local_parts.append(clause)
-        query_params.update(params)
-    if tps_favorite:
-        clause, params = _source_favorite_clause("TPS", "tps_fav")
-        local_parts.append(clause)
-        query_params.update(params)
-
-    # AMG / TPS accolade-kind filters (merged review-column types + award labels).
-    for source, accolades_list, prefix in (
-        ("AMG", amg_accolades, "amg_acc"),
-        ("TPS", tps_accolades, "tps_acc"),
+    # Per-source review filters: rating buckets, the favorite flag, accolade-kind
+    # filters (merged review-column types + award labels) and the untagged flag.
+    # Both sources take the identical shape, so drive them from one tuple instead
+    # of keeping a literal AMG/TPS twin of every block.
+    for source, ratings, favorite, accolades_list, untagged, prefix in (
+        ("AMG", amg_ratings, amg_favorite, amg_accolades, amg_untagged, "amg"),
+        ("TPS", tps_ratings, tps_favorite, tps_accolades, tps_untagged, "tps"),
     ):
-        if accolades_list:
-            clause, params = _source_accolades_clause(source, list(accolades_list), prefix)
+        if ratings:
+            clause, params = _rating_bucket_clause(source, list(ratings), f"{prefix}_rb")
             if clause:
                 local_parts.append(clause)
                 query_params.update(params)
-
-    # untagged-source flags
-    if amg_untagged:
-        clause, params = _source_untagged_clause("AMG", "amg_unt")
-        local_parts.append(clause)
-        query_params.update(params)
-    if tps_untagged:
-        clause, params = _source_untagged_clause("TPS", "tps_unt")
-        local_parts.append(clause)
-        query_params.update(params)
+        if favorite:
+            clause, params = _source_favorite_clause(source, f"{prefix}_fav")
+            local_parts.append(clause)
+            query_params.update(params)
+        if accolades_list:
+            clause, params = _source_accolades_clause(source, list(accolades_list), f"{prefix}_acc")
+            if clause:
+                local_parts.append(clause)
+                query_params.update(params)
+        if untagged:
+            clause, params = _source_untagged_clause(source, f"{prefix}_unt")
+            local_parts.append(clause)
+            query_params.update(params)
 
     if not local_parts:
         return
@@ -430,8 +420,8 @@ class AlbumsController(MediaControllerBase[Album]):
             # NULLS LAST so albums without a measured DR don't float to the top of
             # an ASC sort (a long tail of un-analyzed albums would otherwise hide
             # the entries the user actually wants to see).
-            "dr": "json_extract(albums.metadata, '$.dynamic_range') ASC NULLS LAST",
-            "dr_desc": "json_extract(albums.metadata, '$.dynamic_range') DESC NULLS LAST",
+            "dr": f"{_DR_JSON} ASC NULLS LAST",
+            "dr_desc": f"{_DR_JSON} DESC NULLS LAST",
             "amg_rating": _cr_rating_sort_key("AMG", "ASC"),
             "amg_rating_desc": _cr_rating_sort_key("AMG", "DESC"),
             "tps_rating": _cr_rating_sort_key("TPS", "ASC"),
@@ -483,7 +473,7 @@ class AlbumsController(MediaControllerBase[Album]):
             albums.listen_later,
             albums.listen_later_added_at,
             json_extract(albums.metadata, '$.critical_reception') AS critical_reception,
-            json_extract(albums.metadata, '$.dynamic_range') AS dynamic_range,
+            {_DR_JSON} AS dynamic_range,
             {self._provider_mappings_query()} AS provider_mappings,
             {artists_query} AS artists
             FROM albums"""
@@ -765,7 +755,7 @@ class AlbumsController(MediaControllerBase[Album]):
             parts = base_parts + (extra_parts or [])
             params = {**base_params, **(extra_params_extra or {})}
             joins = base_joins + (extra_joins or [])
-            return await self._execute_count(parts, joins, params)
+            return await self._execute_count(parts, params, joins)
 
         # No search → single count with the base filters.
         if not search:
@@ -778,16 +768,24 @@ class AlbumsController(MediaControllerBase[Album]):
             artist_str, title_str = search.split(" - ", 1)
             title_safe = create_safe_string(title_str, True, True)
             artist_safe = create_safe_string(artist_str, True, True)
+            # Reuse the shared matcher rather than hand-rolling LIKE: it picks the
+            # FTS5 index or a LIKE scan depending on term length, and library_items
+            # builds its clauses the same way — spelling it out here would desync
+            # the count from the list the moment that helper changes.
+            search_params: dict[str, Any] = {}
+            title_clause = search_name_match_clause(
+                "albums", title_safe, "search_title", search_params
+            )
+            artist_clause = search_name_match_clause(
+                "artists", artist_safe, "search_artist", search_params
+            )
             return await _count(
-                extra_parts=["albums.search_name LIKE :search_title"],
-                extra_params_extra={
-                    "search_title": f"%{title_safe}%",
-                    "search_artist": f"%{artist_safe}%",
-                },
+                extra_parts=[title_clause],
+                extra_params_extra=search_params,
                 extra_joins=[
                     "JOIN album_artists ON album_artists.album_id = albums.item_id "
                     "JOIN artists ON artists.item_id = album_artists.artist_id "
-                    "AND artists.search_name LIKE :search_artist"
+                    f"AND {artist_clause}"
                 ],
             )
 
@@ -800,10 +798,11 @@ class AlbumsController(MediaControllerBase[Album]):
         #     |title ∪ artist| == |title| + |artist \ title|, which is exactly  # noqa: RUF003
         #     what the user sees, so the union count is right.
         search_safe = create_safe_string(search, True, True)
-        search_params = {"search": f"%{search_safe}%"}
+        bare_params: dict[str, Any] = {}
+        title_clause = search_name_match_clause("albums", search_safe, "search", bare_params)
         title_count = await _count(
-            extra_parts=["albums.search_name LIKE :search"],
-            extra_params_extra=search_params,
+            extra_parts=[title_clause],
+            extra_params_extra=bare_params,
         )
         # `limit` mirrors library_items' remaining_limit: the artist top-up never
         # fires once page 1 is already full of title hits, so a caller paging at
@@ -814,15 +813,19 @@ class AlbumsController(MediaControllerBase[Album]):
         )
         if title_count >= effective_cutoff:
             return title_count
+        union_params: dict[str, Any] = dict(bare_params)
+        artist_clause = search_name_match_clause(
+            "artists", search_safe, "search_artist", union_params
+        )
         return await _count(
             extra_parts=[
-                "(albums.search_name LIKE :search "
+                f"({title_clause} "
                 "OR EXISTS(SELECT 1 FROM album_artists "
                 "JOIN artists ON artists.item_id = album_artists.artist_id "
                 "WHERE album_artists.album_id = albums.item_id "
-                "AND artists.search_name LIKE :search))"
+                f"AND {artist_clause}))"
             ],
-            extra_params_extra=search_params,
+            extra_params_extra=union_params,
         )
 
     async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
@@ -854,14 +857,13 @@ class AlbumsController(MediaControllerBase[Album]):
         library_item = await self.get_library_item(db_id)
         if library_item.listen_later == listen_later:
             return
-        update: dict[str, Any] = {"listen_later": listen_later}
-        if listen_later:
-            update["listen_later_added_at"] = int(time.time())
-        else:
-            update["listen_later_added_at"] = None
-        await self.mass.music.database.update(self.db_table, {"item_id": db_id}, update)
-        library_item = await self.get_library_item(db_id)
-        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+        await self._set_flag_columns(
+            db_id,
+            {
+                "listen_later": listen_later,
+                "listen_later_added_at": int(utc_timestamp()) if listen_later else None,
+            },
+        )
 
     async def set_release_group(
         self,
@@ -1182,7 +1184,12 @@ class AlbumsController(MediaControllerBase[Album]):
         # the payload's CR replaces stored CR even when it's empty / less rich, silently
         # wiping filesystem-tag-derived CR, so we restore stored_cr there too when the
         # incoming payload isn't richer.
-        stored_cr = cur_item.metadata.critical_reception if cur_item.metadata else None
+        if cur_item.metadata is None:
+            # `metadata` has a default_factory so this should never happen, but the
+            # stored_cr read below already guarded for it — keep the two consistent
+            # instead of guarding one line and dereferencing on the next.
+            cur_item.metadata = MediaItemMetadata()
+        stored_cr = cur_item.metadata.critical_reception
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
         if update.metadata is not None:
             # Judge the candidate CR: the deep-merged superset on the merge branch,
@@ -1190,7 +1197,7 @@ class AlbumsController(MediaControllerBase[Album]):
             candidate_cr = (
                 update.metadata.critical_reception if overwrite else metadata.critical_reception
             )
-            if not _critical_reception_is_richer(candidate_cr, stored_cr):
+            if not critical_reception_is_richer(candidate_cr, stored_cr):
                 metadata.critical_reception = stored_cr
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
@@ -1345,7 +1352,7 @@ class AlbumsController(MediaControllerBase[Album]):
             , {DB_TABLE_ALBUMS}.listen_later
             , json_extract({DB_TABLE_ALBUMS}.metadata, '$.critical_reception')
                 AS critical_reception
-            , json_extract({DB_TABLE_ALBUMS}.metadata, '$.dynamic_range') AS dynamic_range
+            , {_DR_JSON} AS dynamic_range
         """
         return extra_columns, "", {}
 

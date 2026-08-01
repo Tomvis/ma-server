@@ -25,14 +25,19 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 from music_assistant_models.auth import Scope
-from music_assistant_models.enums import MediaType
+from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.enums import ConfigEntryType, MediaType
 from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
-from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
+from music_assistant.providers.lidarr.constants import (
+    CONF_ACTION_TEST,
+    CONF_URL,
+    CONF_VERIFY_SSL,
+)
 
 # How many search candidates to pull when the exact MA-URI resolve misses. The
 # top hit isn't trusted blindly (it can be a different edition / same-titled
@@ -90,11 +95,75 @@ class LidarrProvider(PluginProvider):
         """Initialize the provider with a bound music-rater client."""
         super().__init__(mass, manifest, config)
         self._unregister_handles = []
+        self._test_ok = False
+        self._test_error: str | None = None
         self._client = MusicRaterClient(
             url=cast("str", config.get_value(CONF_URL)),
             session=mass.http_session,
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """
+        Return the options entries shown for this (loaded) instance.
+
+        CONF_URL is collected by the setup flow but must be declared here as well:
+        the framework re-parses the stored config against exactly these entries
+        after construction, so a key that is missing from this tuple reads back as
+        None for the rest of the instance's life.
+        """
+        return (
+            ConfigEntry(
+                key="intro",
+                type=ConfigEntryType.LABEL,
+            ),
+            ConfigEntry(
+                key=CONF_URL,
+                type=ConfigEntryType.STRING,
+                required=True,
+                default_value=self.config.get_value(CONF_URL),
+            ),
+            ConfigEntry(
+                key=CONF_VERIFY_SSL,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                advanced=True,
+                default_value=True,
+            ),
+            ConfigEntry(
+                key=CONF_ACTION_TEST,
+                type=ConfigEntryType.ACTION,
+                action=CONF_ACTION_TEST,
+            ),
+            ConfigEntry(
+                key="test_ok_label",
+                type=ConfigEntryType.LABEL,
+                required=False,
+                hidden=not self._test_ok,
+            ),
+            ConfigEntry(
+                key="test_error_label",
+                type=ConfigEntryType.ALERT,
+                required=False,
+                hidden=self._test_error is None,
+                description=self._test_error,
+            ),
+        )
+
+    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
+        """Run the connectivity probe behind the 'Test connection' button."""
+        if action != CONF_ACTION_TEST:
+            return await super().handle_config_action(action)
+        self._test_ok = False
+        self._test_error = None
+        try:
+            await self._client.ping()
+            self._test_ok = True
+        except MusicRaterError as err:
+            self._test_error = str(err)
+        except Exception as err:
+            self._test_error = f"{type(err).__name__}: {err}"
+        return await self.get_config_entries()
 
     async def loaded_in_mass(self) -> None:
         """
@@ -139,9 +208,6 @@ class LidarrProvider(PluginProvider):
         - POSTs to music-rater's lidarr/queue endpoint and maps the response
           back to the frontend's LidarrAddAlbumResult shape.
         """
-        if not isinstance(item, str):
-            raise InvalidDataError("lidarr/add_album expects an MA URI string")
-
         media_item = await self.mass.music.get_item_by_uri(item)
         if media_item.media_type != MediaType.ALBUM:
             raise InvalidDataError(
@@ -155,7 +221,7 @@ class LidarrProvider(PluginProvider):
             raise InvalidDataError(f"Album {item!r} has no usable title")
         if not album.artists:
             raise InvalidDataError(f"Album {album.name!r} has no artist information")
-        artist_name = getattr(album.artists[0], "name", None)
+        artist_name = album.artists[0].name
         if not artist_name:
             raise InvalidDataError(f"Album {album.name!r} has no usable artist name")
 

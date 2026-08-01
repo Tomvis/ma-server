@@ -12,19 +12,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from music_assistant_models.config_entries import ConfigEntry
-from music_assistant_models.enums import ConfigEntryType
-
-from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
-from music_assistant.providers.lidarr.constants import (
-    CONF_ACTION_TEST,
-    CONF_URL,
-    CONF_VERIFY_SSL,
-)
 from music_assistant.providers.lidarr.provider import LidarrProvider
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -36,69 +27,3 @@ async def setup(
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
     return LidarrProvider(mass, manifest, config)
-
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,  # noqa: ARG001 — required by framework signature
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """
-    Build the setup form.
-
-    Just the music-rater base URL plus an optional connectivity probe.
-    """
-    values = dict(values or {})
-
-    url = str(values.get(CONF_URL) or "").strip()
-    verify_ssl = bool(values.get(CONF_VERIFY_SSL, True))
-
-    test_ok = False
-    test_error: str | None = None
-
-    # Probe only when the user explicitly clicks "Test connection". Including
-    # `instance_id is not None` would trigger a 30s blocking HTTP probe every
-    # time the config dialog opens for an existing instance — if music-rater
-    # is down, the form takes the full timeout to render.
-    should_probe = bool(url) and action == CONF_ACTION_TEST
-    if should_probe:
-        client = MusicRaterClient(url, mass.http_session, verify_ssl=verify_ssl)
-        try:
-            await client.ping()
-            test_ok = True
-        except MusicRaterError as err:
-            test_error = str(err)
-        except Exception as err:
-            test_error = f"{type(err).__name__}: {err}"
-
-    return (
-        ConfigEntry(
-            key="intro",
-            type=ConfigEntryType.LABEL,
-        ),
-        ConfigEntry(
-            key=CONF_VERIFY_SSL,
-            type=ConfigEntryType.BOOLEAN,
-            required=False,
-            advanced=True,
-            default_value=True,
-        ),
-        ConfigEntry(
-            key=CONF_ACTION_TEST,
-            type=ConfigEntryType.ACTION,
-            action=CONF_ACTION_TEST,
-        ),
-        ConfigEntry(
-            key="test_ok_label",
-            type=ConfigEntryType.LABEL,
-            required=False,
-            hidden=not test_ok,
-        ),
-        ConfigEntry(
-            key="test_error_label",
-            type=ConfigEntryType.ALERT,
-            required=False,
-            hidden=test_error is None,
-        ),
-    )

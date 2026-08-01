@@ -1,9 +1,11 @@
 """
-Unit tests for `_critical_reception_is_richer`.
+Unit tests for `critical_reception_is_richer`.
 
-The function gates wholesale replacement of an album's stored critical_reception
-during sync and listen-later updates. Replacement is whole-CR, so the function
-must reject any change that loses data on either dimension (amg_dr or sources)
+The function decides whether an incoming critical_reception is worth acting on: the
+album library sync uses it to widen the update condition (write the row at all), and
+`AlbumsController._update_library_item` uses it to decide whether to restore the stored
+CR over the deep-merge result. A False answer means "keep what is stored", so the
+function must reject any change that loses data on either dimension (amg_dr or sources)
 — otherwise that field would silently disappear.
 """
 
@@ -15,7 +17,7 @@ from music_assistant_models.media_items.metadata import (
     ReviewSourceEntry,
 )
 
-from music_assistant.models.music_provider import _critical_reception_is_richer
+from music_assistant.helpers.critical_reception import critical_reception_is_richer
 
 
 def _cr(
@@ -27,13 +29,13 @@ def _cr(
 def test_returns_false_when_new_is_none() -> None:
     """`new is None` never replaces an existing CR (would erase data)."""
     existing = _cr(amg_dr=12.5)
-    assert _critical_reception_is_richer(None, existing) is False
+    assert critical_reception_is_richer(None, existing) is False
 
 
 def test_returns_true_when_existing_is_none() -> None:
     """Any populated CR is richer than nothing."""
     new = _cr(amg_dr=12.5)
-    assert _critical_reception_is_richer(new, None) is True
+    assert critical_reception_is_richer(new, None) is True
 
 
 def test_regresses_when_new_drops_amg_dr() -> None:
@@ -46,7 +48,7 @@ def test_regresses_when_new_drops_amg_dr() -> None:
             ReviewSourceEntry(source="TPS", rating=8.5),
         ],
     )
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False
 
 
 def test_regresses_when_new_drops_a_source() -> None:
@@ -59,14 +61,14 @@ def test_regresses_when_new_drops_a_source() -> None:
         ],
     )
     new = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False
 
 
 def test_amg_dr_added_with_same_sources_is_richer() -> None:
     """A fresh amg_dr on an otherwise-identical CR is a strict upgrade."""
     existing = _cr(amg_dr=None, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     new = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
-    assert _critical_reception_is_richer(new, existing) is True
+    assert critical_reception_is_richer(new, existing) is True
 
 
 def test_extra_source_added_is_richer() -> None:
@@ -79,7 +81,7 @@ def test_extra_source_added_is_richer() -> None:
             ReviewSourceEntry(source="TPS", rating=8.5),
         ],
     )
-    assert _critical_reception_is_richer(new, existing) is True
+    assert critical_reception_is_richer(new, existing) is True
 
 
 def test_same_source_gains_field_is_richer() -> None:
@@ -90,14 +92,14 @@ def test_same_source_gains_field_is_richer() -> None:
             ReviewSourceEntry(source="AMG", rating=4.5, accolades=["Album of the Year (2024)"])
         ]
     )
-    assert _critical_reception_is_richer(new, existing) is True
+    assert critical_reception_is_richer(new, existing) is True
 
 
 def test_identical_cr_is_not_richer() -> None:
     """No-change refresh must not trigger replacement."""
     existing = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     new = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False
 
 
 def test_same_source_count_but_field_swap_is_not_richer() -> None:
@@ -109,7 +111,7 @@ def test_same_source_count_but_field_swap_is_not_richer() -> None:
     """
     existing = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     new = _cr(sources=[ReviewSourceEntry(source="AMG", favorite=True)])
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False
 
 
 def test_changed_accolade_set_plus_added_links_is_richer() -> None:
@@ -140,7 +142,7 @@ def test_changed_accolade_set_plus_added_links_is_richer() -> None:
             )
         ]
     )
-    assert _critical_reception_is_richer(new, existing) is True
+    assert critical_reception_is_richer(new, existing) is True
 
 
 def test_changed_accolade_set_with_net_loss_is_not_richer() -> None:
@@ -169,7 +171,7 @@ def test_changed_accolade_set_with_net_loss_is_not_richer() -> None:
             ReviewSourceEntry(source="AMG", rating=4.5, accolades=["Honorable Mention (2022)"])
         ]
     )
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False
 
 
 def test_dropping_all_accolades_is_not_richer() -> None:
@@ -185,4 +187,4 @@ def test_dropping_all_accolades_is_not_richer() -> None:
         ]
     )
     new = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
-    assert _critical_reception_is_richer(new, existing) is False
+    assert critical_reception_is_richer(new, existing) is False

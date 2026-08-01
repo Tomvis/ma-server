@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import re
 from collections.abc import Iterable
@@ -32,7 +31,7 @@ MIN_DURATION_SECONDS = 10
 # Cap on how long we'll wait for ffmpeg to flush after EOF. Truncated streams
 # or libebur128 edge cases can leave the process hanging indefinitely, and
 # finalize() is a fire-and-forget task with no outer timeout.
-_FFMPEG_FINALIZE_TIMEOUT_SECONDS = 30.0
+_FFMPEG_FINALIZE_TIMEOUT_SECONDS = 30
 
 CONF_WRITE_REPLAYGAIN_TAGS = "write_replaygain_tags"
 
@@ -162,7 +161,7 @@ class LoudnessAnalysisProvider(AudioAnalysisProvider):
         try:
             await self._send_eof(data)
             try:
-                await asyncio.wait_for(data.ffmpeg.wait(), timeout=_FFMPEG_FINALIZE_TIMEOUT_SECONDS)
+                await data.ffmpeg.wait_with_timeout(_FFMPEG_FINALIZE_TIMEOUT_SECONDS)
             except TimeoutError:
                 self.logger.warning(
                     "Loudness analysis ffmpeg did not exit within %ss after EOF; killing",

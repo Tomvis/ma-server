@@ -42,7 +42,7 @@ def _make_session_data() -> tuple[LoudnessSessionData, MagicMock]:
     streamdetails.media_type = MediaType.TRACK
 
     ffmpeg = MagicMock()
-    ffmpeg.wait = AsyncMock()
+    ffmpeg.wait_with_timeout = AsyncMock()
     ffmpeg.close = AsyncMock()
     ffmpeg.write_eof = AsyncMock()
     ffmpeg.log_history = []

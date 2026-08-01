@@ -46,11 +46,13 @@ LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.tags")
 # artists actually containing a slash in the name, such as AC/DC
 TAG_SPLITTER = ";"
 
-# Outer cap on the synchronous ffprobe call inside parse_tags. The upstream
-# caller often wraps the async wrapper in asyncio.wait_for, but that only
-# cancels the await, not the executor thread running subprocess.check_output —
-# so a wedged ffprobe would leak threads until the pool saturates. 30s is well
-# above the worst case for a healthy file and short enough to bound damage.
+# Outer cap on the synchronous ffprobe call inside parse_tags. This is the only
+# thing that bounds that call: async_parse_tags hands parse_tags to an executor
+# thread, and nothing outside can stop a running thread — an asyncio.wait_for
+# around the await would cancel the await and leave the thread wedged, so a
+# stuck ffprobe would leak threads until the pool saturates. Hence the subprocess
+# must time itself out. Do not remove this as redundant. 30s is well above the
+# worst case for a healthy file and short enough to bound the damage.
 PARSE_TAGS_TIMEOUT_SECONDS = 30
 
 
@@ -1060,10 +1062,11 @@ def parse_tags(
     )
     try:
         # Bound the subprocess so a wedged ffprobe (malformed media, server-side
-        # stall when input_file is a URL) can't leak the worker thread. Without
-        # the timeout, `asyncio.wait_for` upstream can cancel its await but the
-        # underlying executor thread keeps running forever, eventually
-        # saturating the default thread pool.
+        # stall when input_file is a URL) can't leak the worker thread. Callers
+        # reach this via async_parse_tags, i.e. on an executor thread, and no
+        # caller-side cancellation can stop that thread once it is running — so
+        # without this timeout the thread keeps running forever, eventually
+        # saturating the default thread pool. The bound has to live here.
         res = subprocess.check_output(  # noqa: S603
             args, timeout=PARSE_TAGS_TIMEOUT_SECONDS, stderr=subprocess.PIPE
         )

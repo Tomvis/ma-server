@@ -6,8 +6,6 @@ import asyncio
 import hashlib
 import os
 import tempfile
-from asyncio import TaskGroup
-from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
@@ -58,6 +56,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.tags import async_parse_tags
+from music_assistant.helpers.util import TaskManager, remove_file
 from music_assistant.models.music_provider import MusicProvider
 
 from .parsers import (
@@ -107,8 +106,6 @@ CACHE_CATEGORY_CRITICAL_RECEPTION = 3
 # can't push the metadata past this cap; the cap only bounds the fallback path
 # (non-FLAC, or FLAC whose comment block never completes within the limit).
 CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
-# How long ffprobe is allowed to run on the temp file. Bounds total sync cost.
-CRITICAL_RECEPTION_PROBE_TIMEOUT = 12.0
 # CR/DR tags are written to the file once and rarely change; cache the extraction
 # result long enough to amortize across the next several syncs.
 CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
@@ -117,6 +114,17 @@ CRITICAL_RECEPTION_CACHE_TTL = 86400  # 24h
 # when later tracks carry them; sampling a few covers this without blowing up
 # sync cost.
 _CR_PROBE_SONG_ATTEMPTS = 3
+# Wall-clock budget for the whole per-album probe loop (all attempts together).
+# The attempts run sequentially and each can burn the full PARSE_TAGS_TIMEOUT_SECONDS
+# inside ffprobe, so without this the per-album worst case is ~90s — and get_album()
+# awaits this path inline, so that is user-facing stall time. 30s keeps the bound no
+# worse than the ~36s ceiling this code effectively had back when each probe carried
+# its own 12s timeout, while still leaving room for two or three slow-but-working
+# probes (stream fetch + ffprobe) to finish.
+# This bounds CALLER LATENCY, not the work: cancelling cannot stop the asyncio.to_thread
+# worker running ffprobe, so an orphaned probe keeps occupying a default-executor thread
+# until its own PARSE_TAGS_TIMEOUT_SECONDS kills the subprocess.
+_CR_PROBE_ALBUM_BUDGET_SECONDS = 30.0
 # Max albums enriched concurrently per library-sync page. Bounds simultaneous
 # conn.get_album round-trips and ffprobe subprocesses so a page of cache misses
 # overlaps latency without saturating the network or the default thread pool.
@@ -124,34 +132,6 @@ _CR_ENRICH_CONCURRENCY = 4
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
-
-
-def _serialize_cr_cache_entry(
-    extracted: tuple[CriticalReception | None, float | None] | None,
-) -> dict[str, Any]:
-    """Encode a CR-extraction result for cache storage."""
-    if extracted is None:
-        return {"ok": False}
-    cr, album_dr = extracted
-    return {"ok": True, "cr": cr.to_dict() if cr is not None else None, "dr": album_dr}
-
-
-def _deserialize_cr_cache_entry(
-    entry: Any,
-) -> tuple[CriticalReception | None, float | None] | None:
-    """Decode a cached CR-extraction entry; returns None if the prior probe failed."""
-    if not isinstance(entry, dict) or not entry.get("ok"):
-        return None
-    cr_data = entry.get("cr")
-    cr = CriticalReception.from_dict(cr_data) if cr_data is not None else None
-    dr = entry.get("dr")
-    return cr, (float(dr) if dr is not None else None)
-
-
-def _silent_unlink(path: str) -> None:
-    """Remove a temp file, swallowing OS errors."""
-    with suppress(OSError):
-        Path(path).unlink()
 
 
 def _flac_tag_prefix(data: bytes | bytearray) -> bytes | None:
@@ -547,10 +527,11 @@ class OpenSonicProvider(MusicProvider):
             # failures (non-fatal — the album still syncs, just without
             # critical_reception), so one album can't abort the page.
             parsed_page = [parse_album(self.logger, self.instance_id, album) for album in albums]
-            semaphore = asyncio.Semaphore(_CR_ENRICH_CONCURRENCY)
-            async with TaskGroup() as tg:
+            async with TaskManager(self.mass, _CR_ENRICH_CONCURRENCY) as tm:
                 for parsed, album in zip(parsed_page, albums, strict=True):
-                    tg.create_task(self._enrich_cr_guarded(semaphore, parsed, album.id))
+                    await tm.create_task_with_limit(
+                        self._enrich_album_with_critical_reception(parsed, album.id)
+                    )
             # Yield in the original page order after enrichment.
             for parsed in parsed_page:
                 yield parsed
@@ -571,43 +552,33 @@ class OpenSonicProvider(MusicProvider):
             that already paid for ``conn.get_album`` skip a redundant round-trip on cache miss.
         """
         try:
-            extracted = await self._get_album_critical_reception(prov_album_id, sonic_album)
+            cr, album_dr = await self._get_album_critical_reception(prov_album_id, sonic_album)
         except Exception as err:
             self.logger.debug(
                 "critical_reception extraction failed for album %s: %s", prov_album_id, err
             )
             return
-        if extracted is None:
-            return
-        cr, album_dr = extracted
         if cr is not None:
             album.metadata.critical_reception = cr
         if album_dr is not None:
             album.metadata.dynamic_range = album_dr
 
-    async def _enrich_cr_guarded(
-        self, semaphore: asyncio.Semaphore, album: Album, prov_album_id: str
-    ) -> None:
-        """
-        Semaphore-bounded CR enrichment for one album within a TaskGroup.
-
-        :param semaphore: Caps how many albums on the page enrich concurrently.
-        """
-        async with semaphore:
-            await self._enrich_album_with_critical_reception(album, prov_album_id)
-
     async def _get_album_critical_reception(
         self,
         prov_album_id: str,
         sonic_album: SonicAlbum | None = None,
-    ) -> tuple[CriticalReception | None, float | None] | None:
+    ) -> tuple[CriticalReception | None, float | None]:
         """
-        Fetch one track of an album, ffprobe it, return (CR, album_dr) or None.
+        Fetch one track of an album, ffprobe it, return (CR, album_dr).
 
         Cached per album_id for ``CRITICAL_RECEPTION_CACHE_TTL`` so bulk library sync
-        doesn't re-ffprobe every album on each run. Both positive and negative outcomes
-        (album with no songs, failed probe, no tags) are cached to avoid redoing the
-        ``conn.get_album`` round-trip.
+        doesn't re-ffprobe every album on each run. Only outcomes of a cleanly completed
+        probe are cached (including the clean "no tags" negative); transient outcomes —
+        album fetch failure, every probe erroring, or the whole-album probe budget of
+        ``_CR_PROBE_ALBUM_BUDGET_SECONDS`` running out — return (possibly partial) results
+        without writing this cache, so a later sync re-probes. Note that only *this* cache
+        is skipped: ``get_album`` carries its own ``@use_cache``, so a transient result
+        reached through it is still served from that cache for its own, shorter TTL.
 
         :param sonic_album: Pre-fetched album record; lets callers that already paid
             for ``conn.get_album`` skip the round-trip on cache miss.
@@ -623,7 +594,13 @@ class OpenSonicProvider(MusicProvider):
             default=None,
         )
         if cached is not None:
-            return _deserialize_cr_cache_entry(cached)
+            # A stored entry is itself proof that a probe ran cleanly; legacy
+            # {"ok": False} entries decode to (None, None), the same cached
+            # clean negative they always meant.
+            return (
+                CriticalReception.from_dict(cr_data) if (cr_data := cached.get("cr")) else None,
+                float(dr_data) if (dr_data := cached.get("dr")) is not None else None,
+            )
         if sonic_album is None:
             try:
                 sonic_album = await self.conn.get_album(prov_album_id)
@@ -633,45 +610,82 @@ class OpenSonicProvider(MusicProvider):
             # Don't cache "no songs" or "fetch failed" — those states can change
             # (user uploads tracks, server comes back) and a 24h negative cache
             # would block a follow-up sync from re-probing.
-            return None
+            return None, None
         # Try a handful of tracks and OR-merge their signals. A bonus / hidden
         # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
         # later track carries DR but no CR — break out only once both have been
-        # observed (or probe budget is exhausted) so neither signal is lost.
+        # observed (or we run out of attempts or time) so neither signal is lost.
+        # Cost note: these probes run SEQUENTIALLY and each one can burn the full
+        # PARSE_TAGS_TIMEOUT_SECONDS inside ffprobe on top of its stream fetch, so the
+        # loop as a whole — not each attempt — is bounded by _CR_PROBE_ALBUM_BUDGET_SECONDS,
+        # independent of _CR_PROBE_SONG_ATTEMPTS. Scope is deliberately just this loop: the
+        # cache round-trips and the conn.get_album fetch above sit outside it, so the budget
+        # bounds the probing, not this method end-to-end. Nothing here can stop an ffprobe
+        # already running in an executor thread; the budget bounds the caller's wait, not
+        # the work, and a probe abandoned by the timeout runs on until PARSE_TAGS_TIMEOUT_SECONDS
+        # kills it. Its temp file is still cleaned up: the `finally` in the probe helper is
+        # entered by the CancelledError and gets to run its own awaits, because
+        # asyncio.timeout cancels exactly once at the deadline — though those are two more
+        # default-executor hops, so a saturated pool can stretch the unwind past the budget.
         cr: CriticalReception | None = None
         album_dr: float | None = None
         # Distinguish "probe ran cleanly and found nothing" from "every probe attempt
         # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
         # a transient failure returns bare None and is skipped below.
         probed_clean = False
-        for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
-            probe = await self._extract_critical_reception_from_song(sonic_song.id)
-            if probe is None:
-                continue
-            probed_clean = True
-            probe_cr, probe_dr = probe
-            if cr is None and probe_cr is not None:
-                cr = probe_cr
-            if album_dr is None and probe_dr is not None:
-                album_dr = probe_dr
-            if cr is not None and album_dr is not None:
-                break
-        extracted: tuple[CriticalReception | None, float | None] | None = (
-            (cr, album_dr) if (cr is not None or album_dr is not None) else None
-        )
-        if extracted is None and not probed_clean:
+        started_at = asyncio.get_running_loop().time()
+        try:
+            async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
+                for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
+                    probe = await self._extract_critical_reception_from_song(sonic_song.id)
+                    if probe is None:
+                        continue
+                    probed_clean = True
+                    probe_cr, probe_dr = probe
+                    if cr is None and probe_cr is not None:
+                        cr = probe_cr
+                    if album_dr is None and probe_dr is not None:
+                        album_dr = probe_dr
+                    if cr is not None and album_dr is not None:
+                        break
+        except TimeoutError:
+            # Either the budget ran out, or a probe raised a TimeoutError of its own —
+            # aiohttp's ServerTimeoutError subclasses it, and conn.stream errors are not
+            # covered by the probe helper's `except Exception`. Both abort the loop, so
+            # distinguish them by elapsed time rather than logging a budget we may not
+            # have spent. Transient either way: hand back whatever earlier probes already
+            # produced (possibly (None, None)) but do NOT write the CR cache, or a
+            # partial/empty result gets pinned for CRITICAL_RECEPTION_CACHE_TTL. The next
+            # sync re-probes and can complete the picture.
+            elapsed = asyncio.get_running_loop().time() - started_at
+            if elapsed >= _CR_PROBE_ALBUM_BUDGET_SECONDS:
+                self.logger.debug(
+                    "critical_reception probe budget of %ss exhausted for album %s",
+                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
+                    prov_album_id,
+                )
+            else:
+                self.logger.debug(
+                    "critical_reception probe for album %s timed out after %.1fs "
+                    "(inside the %ss budget — likely a stalled stream read)",
+                    prov_album_id,
+                    elapsed,
+                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
+                )
+            return cr, album_dr
+        if not probed_clean:
             # Every probe attempt errored transiently (stream/ffprobe failure) rather
             # than cleanly finding no tags. Don't pin a 24h negative cache — mirror the
             # "fetch failed" path above so the next sync re-probes once it recovers.
-            return None
+            return None, None
         await self.mass.cache.set(
             key=cache_key,
-            data=_serialize_cr_cache_entry(extracted),
+            data={"cr": cr.to_dict() if cr is not None else None, "dr": album_dr},
             provider=self.instance_id,
             category=CACHE_CATEGORY_CRITICAL_RECEPTION,
             expiration=CRITICAL_RECEPTION_CACHE_TTL,
         )
-        return extracted
+        return cr, album_dr
 
     def _cr_cache_namespace(self) -> str:
         """
@@ -745,17 +759,24 @@ class OpenSonicProvider(MusicProvider):
             if not probe_bytes:
                 return None
             await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
+            # No outer asyncio.wait_for here: async_parse_tags runs parse_tags via
+            # asyncio.to_thread, so cancelling the await would abandon — not stop —
+            # the executor thread. The work is bounded from the inside instead:
+            # the ffprobe subprocess is capped by PARSE_TAGS_TIMEOUT_SECONDS (a hung
+            # ffprobe is killed there and surfaces here as an exception), and the
+            # parse_tags_mutagen pass that follows — which always runs, since
+            # tmp_path is a local existing file — is untimed but is a pure in-memory
+            # parse of a prefix of at most CRITICAL_RECEPTION_PROBE_BYTES. The caller's
+            # wait is bounded separately, per album rather than per probe, by
+            # _CR_PROBE_ALBUM_BUDGET_SECONDS.
             try:
-                tags = await asyncio.wait_for(
-                    async_parse_tags(tmp_path),
-                    timeout=CRITICAL_RECEPTION_PROBE_TIMEOUT,
-                )
+                tags = await async_parse_tags(tmp_path)
             except Exception:
                 return None
             return tags.critical_reception, tags.album_dynamic_range
         finally:
             if tmp_path is not None:
-                await asyncio.to_thread(_silent_unlink, tmp_path)
+                await remove_file(tmp_path)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
         """Provide a generator for library playlists."""
