@@ -43,7 +43,7 @@ from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.helpers.json import json_loads, serialize_to_json
 from music_assistant.helpers.tags import ACCOLADE_KINDS
-from music_assistant.helpers.util import try_parse_int
+from music_assistant.helpers.util import try_parse_float
 from music_assistant.models.music_provider import MusicProvider
 
 from .base import LibraryItemSyncDetails, MediaControllerBase
@@ -94,11 +94,13 @@ _CR_SOURCES_EACH = "json_each(albums.metadata, '$.critical_reception.sources')"
 _DR_JSON = "json_extract(albums.metadata, '$.dynamic_range')"
 
 # Rating-bucket vocabulary per CR source: the selector values a client may send and
-# the width of the bucket each selector spans. AMG rates in whole stars (selector N
-# covers [N, N+1), i.e. floor(rating) == N); TPS selectors step in twos.
-_CR_RATING_SPECS: dict[str, tuple[frozenset[int], int]] = {
-    "AMG": (frozenset(range(1, 6)), 1),
-    "TPS": (frozenset({1, 3, 5, 7, 9}), 2),
+# the width of the bucket each selector spans. AMG rates in half stars, the full 0.5-5.0
+# scale it publishes (Unlistenable .. Iconic), so a selector is one exact step: 4.5 covers
+# [4.5, 5.0) and 4 covers [4.0, 4.5), keeping 4-star and 4.5-star albums separable. TPS
+# selectors step in twos over its /10 scale.
+_CR_RATING_SPECS: dict[str, tuple[frozenset[float], float]] = {
+    "AMG": (frozenset(n / 2 for n in range(1, 11)), 0.5),
+    "TPS": (frozenset({1.0, 3.0, 5.0, 7.0, 9.0}), 2.0),
 }
 
 
@@ -135,34 +137,39 @@ def _like_prefix(value: str) -> str:
     return f"{escaped}%"
 
 
-def _coerce_int_list(values: list[Any] | None) -> list[int]:
+def _coerce_float_list(values: Iterable[Any] | None) -> list[float]:
     """
-    Coerce a heterogeneous list to ints; drop entries that won't survive int().
+    Coerce a heterogeneous list to floats; drop entries that won't survive float().
 
-    The api command parses these as ``list[int]``, but the JSON deserializer
-    preserves stray ``null`` / non-numeric entries; without this filter a
-    malformed payload would raise out of the bucket-clause builders.
+    The api commands annotate these as ``list[float | int]``, and the int arm is not
+    redundant: JSON has no float literal, so a client picking the 4-star bucket sends
+    ``4``, and against a strict ``list[float]`` the api parser fails the union and
+    silently drops the *whole* argument (turning the filter off) rather than widening
+    the value. The JSON deserializer also preserves stray ``null`` / non-numeric
+    entries; without this filter a malformed payload would raise out of the
+    bucket-clause builders.
 
-    The ``bool`` guard is not redundant: ``try_parse_int(True)`` returns 1.
+    The ``bool`` guard is not redundant: ``try_parse_float(True)`` returns 1.0.
     """
     return [
-        i
+        f
         for v in (values or ())
-        if not isinstance(v, bool) and (i := try_parse_int(v, None)) is not None
+        if not isinstance(v, bool) and (f := try_parse_float(v, None)) is not None
     ]
 
 
 def _rating_bucket_clause(
-    source: str, values: list[int], param_prefix: str
+    source: str, values: Iterable[float], param_prefix: str
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the WHERE fragment for the given source's rating buckets.
 
     Selectors outside the source's vocabulary (see ``_CR_RATING_SPECS``) are dropped;
-    each surviving selector N matches the half-open range [N, N + width).
+    each surviving selector N matches the half-open range [N, N + width) — one exact
+    half-star step for AMG, a two-point band for TPS.
     """
     allowed, width = _CR_RATING_SPECS[source]
-    valid = sorted({v for v in _coerce_int_list(values) if v in allowed})
+    valid = sorted({v for v in _coerce_float_list(values) if v in allowed})
     if not valid:
         return "", {}
     bucket_clauses: list[str] = []
@@ -242,11 +249,11 @@ def _apply_critical_reception_filters(  # noqa: PLR0913
     query_parts: list[str],
     query_params: dict[str, Any],
     dr_buckets: list[str] | None,
-    amg_ratings: list[int] | None,
+    amg_ratings: list[float | int] | None,
     amg_favorite: bool | None,
     amg_accolades: list[str] | None,
     amg_untagged: bool | None,
-    tps_ratings: list[int] | None,
+    tps_ratings: list[float | int] | None,
     tps_favorite: bool | None,
     tps_accolades: list[str] | None,
     tps_untagged: bool | None,
@@ -347,11 +354,11 @@ def _apply_album_specific_filters(  # noqa: PLR0913
     album_types: list[AlbumType] | None,
     listen_later: bool | None,
     dr_buckets: list[str] | None,
-    amg_ratings: list[int] | None,
+    amg_ratings: list[float | int] | None,
     amg_favorite: bool | None,
     amg_accolades: list[str] | None,
     amg_untagged: bool | None,
-    tps_ratings: list[int] | None,
+    tps_ratings: list[float | int] | None,
     tps_favorite: bool | None,
     tps_accolades: list[str] | None,
     tps_untagged: bool | None,
@@ -523,11 +530,11 @@ class AlbumsController(MediaControllerBase[Album]):
         album_types: list[AlbumType] | None = None,
         listen_later: bool | None = None,
         dr_buckets: list[str] | None = None,
-        amg_ratings: list[int] | None = None,
+        amg_ratings: list[float | int] | None = None,
         amg_favorite: bool | None = None,
         amg_accolades: list[str] | None = None,
         amg_untagged: bool | None = None,
-        tps_ratings: list[int] | None = None,
+        tps_ratings: list[float | int] | None = None,
         tps_favorite: bool | None = None,
         tps_accolades: list[str] | None = None,
         tps_untagged: bool | None = None,
@@ -550,7 +557,9 @@ class AlbumsController(MediaControllerBase[Album]):
         :param summary: When True (default), return slim summary items containing only the
             fields needed for a list view. Set to False to get fully hydrated items.
         :param dr_buckets: Filter by DR quality bucket (excellent/good/fair/poor/untagged).
-        :param amg_ratings / tps_ratings: Filter by review-source rating buckets.
+        :param amg_ratings / tps_ratings: Filter by review-source rating buckets
+            (AMG: half stars 0.5..5.0, each selector one exact step; TPS: 1/3/5/7/9,
+            each selector a two-point band on the /10 scale).
         :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
         :param amg_accolades / tps_accolades: Filter by accolade kind (aoty,
             record_of_the_month, honorable_mention, score_revised, tymhm, sitf,
@@ -680,11 +689,11 @@ class AlbumsController(MediaControllerBase[Album]):
         album_types: list[AlbumType] | None = None,
         listen_later: bool | None = None,
         dr_buckets: list[str] | None = None,
-        amg_ratings: list[int] | None = None,
+        amg_ratings: list[float | int] | None = None,
         amg_favorite: bool | None = None,
         amg_accolades: list[str] | None = None,
         amg_untagged: bool | None = None,
-        tps_ratings: list[int] | None = None,
+        tps_ratings: list[float | int] | None = None,
         tps_favorite: bool | None = None,
         tps_accolades: list[str] | None = None,
         tps_untagged: bool | None = None,

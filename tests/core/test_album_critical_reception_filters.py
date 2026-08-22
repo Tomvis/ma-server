@@ -5,14 +5,17 @@ These verify both the structure of the generated WHERE fragments and that they
 behave correctly against a real (in-memory) SQLite engine using the JSON1 extension.
 """
 
+import inspect
 import json
 import sqlite3
+from typing import get_type_hints
 
 from music_assistant.controllers.music.media.albums import (
     AlbumsController,
     _apply_critical_reception_filters,
 )
 from music_assistant.controllers.music.media.base import SORT_KEYS
+from music_assistant.helpers.api import parse_arguments
 
 
 def _build(**kwargs: object) -> tuple[list[str], dict[str, object]]:
@@ -163,11 +166,41 @@ def test_dr_buckets_combine_with_or() -> None:
     assert _exec_with_filters(con, dr_buckets=["excellent", "good"]) == [1, 2, 6]
 
 
-def test_amg_rating_floor_buckets() -> None:
-    """AMG rating 4.5 lives in selector 4 (floor), not selector 5."""
+def test_amg_rating_half_star_buckets() -> None:
+    """AMG selectors are exact half-star steps: 4.5 is its own bucket, not part of 4."""
     con = _make_db()
-    assert _exec_with_filters(con, amg_ratings=[4]) == [1]
+    assert _exec_with_filters(con, amg_ratings=[4.5]) == [1]
+    assert _exec_with_filters(con, amg_ratings=[4]) == []
     assert _exec_with_filters(con, amg_ratings=[5]) == []
+    # picking both halves of a star spans what the old whole-star selector covered
+    assert _exec_with_filters(con, amg_ratings=[4, 4.5]) == [1]
+
+
+def test_rating_selectors_survive_the_api_parse_layer() -> None:
+    """
+    A JSON payload mixing ints and half stars must reach the controller intact.
+
+    JSON has no float literal, so the 4-star bucket arrives as ``4``; against a
+    strict ``list[float]`` annotation the api parser fails the union and drops the
+    whole argument, silently turning the filter off. Hence ``list[float | int]``.
+    """
+    func = AlbumsController.library_items
+    sig = inspect.signature(func)
+    sig = sig.replace(parameters=[p for n, p in sig.parameters.items() if n != "self"])
+    parsed = parse_arguments(
+        sig, get_type_hints(func), {"amg_ratings": [4, 4.5], "tps_ratings": [7]}
+    )
+    assert parsed["amg_ratings"] == [4, 4.5]
+    assert parsed["tps_ratings"] == [7]
+
+
+def test_amg_rating_selector_vocabulary() -> None:
+    """The whole 0.5..5.0 half-star scale binds; off-step values are dropped."""
+    _, params = _build(amg_ratings=[0.5])
+    assert params == {"amg_rb_lo_0": 0.5, "amg_rb_hi_0": 1.0}
+    parts, params = _build(amg_ratings=[4.3])
+    assert parts == []
+    assert params == {}
 
 
 def test_tps_rating_three_step_buckets() -> None:
