@@ -5,8 +5,11 @@
 # replaced wholesale with the rating-branch checkout, so server-side features
 # like critical_reception filters and listen_later are present.
 # 2.10 line: `latest` is the 2.9.x stable image and lacks the deps 2.10 providers
-# need, so the base must come from the nightly/dev stream until 2.10.0 is tagged.
-ARG UPSTREAM=ghcr.io/music-assistant/server:nightly
+# need. Now that this branch is merged to a tagged rc, pin the base to the same
+# tag rather than tracking `nightly`: the overlay replaces the music_assistant
+# source wholesale, so a base that has drifted past the merged source ships a
+# venv resolved for different pins than the code layered over it.
+ARG UPSTREAM=ghcr.io/music-assistant/server:2.10.0rc4
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
@@ -51,10 +54,12 @@ COPY frontend_overlay/ \
      /app/venv/lib/python3.14/site-packages/music_assistant_frontend/
 
 # Replace upstream's released aiosendspin with the enhanced-branch local-wheel
-# build (7.0.0+trackfields = upstream 7.0.0 plus the trackfields split). The
-# merged MA server expects the aiosendspin 7.x API, and the trackfields shape
-# (album_track / queue_track / total_tracks) is required by the enhanced
-# sendspin/airplay/chromecast providers — without this overlay they fail to import.
+# build (9.1.0+trackfields = upstream 9.1.0 plus the trackfields split). The
+# merged MA server pins aiosendspin[server]==9.1.0 (requirements_all.txt and
+# providers/sendspin/manifest.json), which a PEP 440 public-version specifier
+# matches regardless of the local label, and the trackfields shape (album_track /
+# queue_track / total_tracks) is required by the enhanced sendspin/airplay/
+# chromecast providers — without this overlay they fail on the metadata push.
 # The version below is not free-form: scripts/staging cross-checks it against the
 # wheel it stages and fails the build rather than ship a mislabelled dist-info.
 RUN rm -rf /app/venv/lib/python3.14/site-packages/aiosendspin \
@@ -62,7 +67,7 @@ RUN rm -rf /app/venv/lib/python3.14/site-packages/aiosendspin \
 COPY aiosendspin_overlay/ \
      /app/venv/lib/python3.14/site-packages/aiosendspin/
 COPY aiosendspin_dist_info_overlay/ \
-     /app/venv/lib/python3.14/site-packages/aiosendspin-7.0.0+trackfields.dist-info/
+     /app/venv/lib/python3.14/site-packages/aiosendspin-9.1.0+trackfields.dist-info/
 
 # The 2.9.0/py3.14 base now ships everything the rating branch needs beyond
 # the overlays: libportaudio2 plus the former pip deltas (torch/torchaudio
