@@ -21,6 +21,7 @@ from music_assistant_models.enums import (
     RepeatMode,
 )
 from music_assistant_models.errors import (
+    InvalidDataError,
     MediaNotFoundError,
     MusicAssistantError,
     PlayerUnavailableError,
@@ -32,7 +33,6 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemType,
     PlayableMediaItemType,
-    Playlist,
     PodcastEpisode,
     Track,
     UniqueList,
@@ -49,19 +49,23 @@ from music_assistant.controllers.player_queues.base import _PlayerQueuesBase
 from music_assistant.controllers.player_queues.constants import (
     CONF_DEFAULT_ENQUEUE_OPTION_LIVE_SOURCES,
     MANAGED_POOL_MAX,
+    ORDERED_MEDIA_TYPES,
+    PROBED_DURATION_MEDIA_TYPES,
 )
 from music_assistant.controllers.player_queues.helpers import (
     build_queue_item,
     handle_play_action,
     has_dynamic_source,
+    is_dynamic_source,
 )
 from music_assistant.controllers.player_queues.managed_pool import gate_tracks
-from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     set_current_user,
 )
+from music_assistant.helpers.audio import get_probed_duration, store_probed_duration
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
+from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.media_items.metadata import MediaItemImage
@@ -97,8 +101,10 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # item. ADD never starts playback by itself.
         continues_ended_queue = queue.ended and option == QueueOption.ADD
         items_before_add = len(self._queue_data[queue_id].items)
-        if queue.ended and not continues_ended_queue:
-            self.clear(queue_id, skip_stop=True)
+        if queue.ended and not continues_ended_queue and option != QueueOption.REPLACE:
+            # mechanical clear: the shuffle state for this batch was already settled by the caller.
+            # Replace is exempt: it swaps the whole queue below without ever emptying it.
+            self._clear(queue_id, skip_stop=True)
         if queue.state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
             cur_index = (
                 queue.index_in_buffer
@@ -113,8 +119,18 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # front of the shuffled rest instead of letting the shuffle move it to a random slot
         pin_first = pin_first and shuffle
 
-        # handle replace: clear all items and replace with the new items
+        # handle replace: swap the queue's contents for the new items in one step
         if option == QueueOption.REPLACE:
+            # Release the audio the outgoing items hold while they are still on the queue: the
+            # track being started needs their source slot, and once they are swapped out nothing
+            # reaches them any more.
+            await self._cleanup_queue_audio_data(queue_id)
+            # the player is still on the old index, so drop it: the swap would otherwise hand it a
+            # "next" item taken from the new list at that position. play_index sets the real one.
+            queue.index_in_buffer = None
+            # playback starts over below, and play_index reads this to decide whether to honour a
+            # stored resume position
+            queue.ended = False
             if pin_first:
                 await self._load_pinned_first(
                     queue_id,
@@ -222,18 +238,15 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         :param keep_remaining: Keep the queue's existing items from the insert index onwards.
         :param keep_played: Keep the queue's existing items before the insert index.
         """
+        # a single load, so the queue is never published holding just the pinned item
         await self.load(
             queue_id,
-            queue_items=queue_items[:1],
+            queue_items=queue_items,
             insert_at_index=insert_at_index,
             keep_remaining=keep_remaining,
             keep_played=keep_played,
-        )
-        await self.load(
-            queue_id,
-            queue_items=queue_items[1:],
-            insert_at_index=insert_at_index + 1,
             shuffle=True,
+            pin_first=True,
         )
 
     def _ensure_current_index(self, queue_id: str) -> None:
@@ -371,6 +384,10 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                         *org_images,
                     ]
                 )
+        if is_start:
+            # a track skip should hand its source slot to the item the user is starting
+            await self._abort_superseded_source_buffers(queue_item)
+
         # Fetch streamdetails (reuses existing if buffer is still valid for the seek).
         queue_item.streamdetails = await self.mass.streams.audio.get_stream_details(
             queue_item=queue_item,
@@ -379,9 +396,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             prefer_album_loudness=bool(playing_album_tracks),
         )
         # update queue_item.duration from streamdetails if we got a better value
-        if queue_item.streamdetails.duration and not queue_item.duration:
-            queue_item.duration = queue_item.streamdetails.duration
-            self.signal_update(queue_id, items_changed=True)
+        self._apply_probed_duration(queue_item)
 
         # pre-initialize the AudioBuffer so audio is ready
         # when the player requests it. For the current/first track this ensures
@@ -389,13 +404,67 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # initialize the buffer ~30s before the current track ends instead.
         # AudioSource items are realtime/live and bypass the AudioBuffer.
         if is_start and queue_item.streamdetails.media_type != MediaType.AUDIO_SOURCE:
-            await AudioBuffer.get_buffer(
-                self.mass,
-                queue_item.streamdetails,
+            await self.mass.streams.audio.get_audio_buffer(
+                queue_item,
                 seek_position_ms=int(seek_position * 1000),
-                wait_ready=True,
                 reason="prepare",
             )
+            # the first chunk is in, so the source has been probed and a duration the
+            # provider did not report is known before playback starts
+            self._apply_probed_duration(queue_item)
+
+    def _apply_probed_duration(self, queue_item: QueueItem) -> None:
+        """
+        Apply a duration determined while streaming to the queue item and its media item.
+
+        :param queue_item: The queue item whose streamdetails to take the duration from.
+        """
+        streamdetails = queue_item.streamdetails
+        if streamdetails is None or not streamdetails.duration:
+            return
+        duration = int(streamdetails.duration)
+        if not self._set_missing_duration(queue_item, duration):
+            return
+        if uri := getattr(queue_item.media_item, "uri", None):
+            # store it so listings and later playbacks have it up front
+            self.mass.create_task(store_probed_duration(self.mass, uri, duration))
+
+    async def _restore_probed_duration(self, queue_item: QueueItem) -> None:
+        """
+        Apply the duration determined during an earlier playback to an item that lacks one.
+
+        :param queue_item: The queue item to fill the duration of.
+        """
+        if queue_item.media_type not in PROBED_DURATION_MEDIA_TYPES:
+            return
+        if not (uri := getattr(queue_item.media_item, "uri", None)):
+            return
+        if queue_item.duration and getattr(queue_item.media_item, "duration", None):
+            return
+        if duration := await get_probed_duration(self.mass, uri):
+            self._set_missing_duration(queue_item, duration)
+
+    def _set_missing_duration(self, queue_item: QueueItem, duration: int) -> bool:
+        """
+        Fill in the duration of a queue item and its media item, leaving known ones alone.
+
+        :param queue_item: The queue item to fill the duration of.
+        :param duration: The duration in seconds.
+        :return: True if the item (or its media item) did not have a duration yet.
+        """
+        if queue_item.media_type not in PROBED_DURATION_MEDIA_TYPES:
+            return False
+        media_item = queue_item.media_item
+        # an ItemMapping or any other reference without a duration is left untouched
+        media_item_duration = getattr(media_item, "duration", None)
+        if queue_item.duration and media_item_duration != 0:
+            return False
+        if not queue_item.duration:
+            queue_item.duration = duration
+        if media_item_duration == 0:
+            media_item.duration = duration  # type: ignore[union-attr]
+        self.signal_update(queue_item.queue_id, items_changed=True)
+        return True
 
     def _get_next_index(
         self,
@@ -603,6 +672,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         start_item: PlayableMediaItemType | str | None = None,
         sort_by: str | None = None,
         start_from_beginning: bool = False,
+        shuffle: bool | None = None,
     ) -> None:
         """Handle play media without acquiring the queue lock."""
         # cancel any pending play_index calls for this queue to prevent conflicts
@@ -650,13 +720,9 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             ]
             radio_mode = False
 
-        # clear queue if needed
-        if option == QueueOption.REPLACE:
-            self.clear(queue_id, skip_stop=True)
         # Clear the 'enqueued media item' list when a new queue is requested
         if option not in (QueueOption.ADD, QueueOption.NEXT):
             queue_data.enqueued_media_items.clear()
-
         # An ADD/NEXT onto a queue that is already a managed pool (has a dynamic source): a finite
         # item is kept only as a source (the bounded pool materializes it) instead of being expanded
         # into the queue. Any other enqueue (PLAY/REPLACE, or onto a linear queue) expands finite
@@ -665,6 +731,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
 
         media_items: list[MediaItemType] = []
         source_items: list[MediaItemType] = []
+        shuffle_settled = False
         # resolve all media items
         for item in media_list:
             try:
@@ -683,35 +750,30 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                     # item is MediaItemType | ItemMapping at this point
                     media_item = item
 
-                if (
-                    isinstance(media_item, ItemMapping)
-                    and media_item.media_type == MediaType.PLAYLIST
-                ):
-                    # Resolve ItemMapping for a playlist so the full Playlist object
-                    # so we have access to details such as 'is_dynamic'
-                    with suppress(MusicAssistantError):
-                        media_item = await self.mass.music.playlists.get(
-                            media_item.item_id,
-                            media_item.provider,
-                        )
+                if isinstance(media_item, ItemMapping):
+                    # Resolve any ItemMapping to its full media item, exactly as the str-uri
+                    # form above already does. Everything below needs the real object: the
+                    # enqueued/source bookkeeping only accepts full items (so a mapping would
+                    # otherwise never count as a user-initiated play), and the dynamic check
+                    # needs details such as a playlist's 'is_dynamic'.
+                    if media_item.uri is None:
+                        raise InvalidDataError("ItemMapping has no URI")
+                    media_item = await self.mass.music.get_item_by_uri(media_item.uri)
 
                 # Save requested media item to play on the queue so we can use it as a seed
                 # for Autoplay's music refill (the podcast/audiobook continuations resolve
                 # their successor from the queue's last item instead).
                 # Use FIFO list to keep track of the last 10 played items
                 # Skip ItemMapping and BrowseFolder - only queue full MediaItemType objects
-                if not isinstance(
-                    media_item, (ItemMapping, BrowseFolder)
-                ) and media_item.media_type in (
-                    MediaType.TRACK,
-                    MediaType.ALBUM,
-                    MediaType.PLAYLIST,
-                    MediaType.ARTIST,
+                if not isinstance(media_item, BrowseFolder) and (
+                    is_dynamic_source(media_item)
+                    or media_item.media_type
+                    in (MediaType.TRACK, MediaType.ALBUM, MediaType.PLAYLIST, MediaType.ARTIST)
                 ):
                     queue_data.enqueued_media_items.append(media_item)
                     if len(queue_data.enqueued_media_items) > 10:
                         queue_data.enqueued_media_items.pop(0)
-                    if isinstance(media_item, Playlist) and media_item.is_dynamic:
+                    if is_dynamic_source(media_item):
                         # a dynamic playlist/station is always a self-managing dynamic source
                         source_items.append(media_item)
 
@@ -726,11 +788,25 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                         config_key = f"default_enqueue_option_{media_item.media_type.value}"
                     config_value = self.get_config_value(config_key, return_type=str)
                     option = QueueOption(config_value)
-                    if option == QueueOption.REPLACE:
-                        self.clear(queue_id, skip_stop=True)
+
+                # The shuffle state has to be settled before the items are resolved below: a
+                # shuffled queue keeps the items preceding a start_item (chosen track pinned
+                # first) instead of dropping them. The first item that resolves decides for the
+                # whole batch, because it is the only media type known this early.
+                if not shuffle_settled:
+                    shuffle_settled = True
+                    await self._apply_shuffle(
+                        queue_id,
+                        option,
+                        # an explicit request always wins; only an unset one defers to the
+                        # media's own order
+                        False
+                        if shuffle is None and media_item.media_type in ORDERED_MEDIA_TYPES
+                        else shuffle,
+                    )
 
                 # collect media_items to play
-                if isinstance(media_item, Playlist) and media_item.is_dynamic:
+                if is_dynamic_source(media_item):
                     # a dynamic playlist/station supplies its own tracks on demand; just mark it
                     # played. The queue goes dynamic below and the bounded pool seeds its batch from
                     # all sources, so there is no need to fetch a batch here.
@@ -744,15 +820,13 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                     )
                 elif already_dynamic:
                     # feed the already-active pool: keep the finite item as a (materialized) source
-                    if not isinstance(media_item, (ItemMapping, BrowseFolder)):
+                    if not isinstance(media_item, BrowseFolder):
                         source_items.append(media_item)
                 else:
                     # not (yet) a managed pool: record the finite parent as a source (kept for a
                     # later dynamic transition and for similar/autoplay seeds) and expand it into
                     # the linear queue
-                    if not isinstance(
-                        media_item, (ItemMapping, BrowseFolder)
-                    ) and media_item.media_type in (
+                    if not isinstance(media_item, BrowseFolder) and media_item.media_type in (
                         MediaType.TRACK,
                         MediaType.ALBUM,
                         MediaType.PLAYLIST,
@@ -782,6 +856,11 @@ class QueueLoaderMixin(_PlayerQueuesBase):
                 # invalid MA uri or item not found error
                 self.logger.warning("Skipping %s: %s", item, str(err))
 
+        if not shuffle_settled and option is not None:
+            # nothing resolved, so no media type ever decided - but the sources are replaced
+            # below all the same, and a dynamic queue's imposed shuffle must not survive that
+            await self._apply_shuffle(queue_id, option, shuffle)
+
         # overwrite or append the queue's source items
         replace_sources = option not in (QueueOption.ADD, QueueOption.NEXT)
         if replace_sources:
@@ -790,6 +869,8 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             self.store_sources(queue, self._queue_data[queue_id].source_items + source_items)
         source_items = self._queue_data[queue_id].source_items
         queue.is_dynamic = has_dynamic_source(source_items)
+        # a queue that just gained or lost its dynamic source resolves smart shuffle differently
+        queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
 
         if queue.is_dynamic:
             # the queue has (or just gained) a dynamic source: (re)build the upcoming tail into a
@@ -808,7 +889,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         ]
 
         if not queue_items:
-            raise MediaNotFoundError("No playable items found")
+            raise MediaNotFoundError("No playable items found", translation_key="no_playable_items")
 
         await self._enqueue_with_option(
             queue_id, queue_items, option, pin_first=start_item is not None
@@ -841,26 +922,52 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             queue.index_in_buffer if queue.index_in_buffer is not None else queue.current_index
         )
         insert_at = 0 if base_index is None else base_index + 1
+        if option == QueueOption.REPLACE:
+            # A replace is a fresh queue, so the pool takes the place of the old items rather than
+            # being appended behind the one that is playing (as PLAY, which shares start_playing,
+            # deliberately does). Zeroed before the truncation below so the pool is sized against
+            # an empty queue and none of the discarded tracks are held back from it.
+            insert_at = 0
+            # as on the linear path: release the outgoing audio while its items are still on the
+            # queue, and drop the stale position
+            await self._cleanup_queue_audio_data(queue_id)
+            queue.index_in_buffer = None
+            queue.ended = False
         # PLAY/REPLACE start playback on the rebuilt pool; ADD/NEXT/REPLACE_NEXT only stage it and
         # never start playback (an idle/empty queue stays idle on an add, just like the linear path)
         start_playing = option in (QueueOption.PLAY, QueueOption.REPLACE)
-        # drop the finite upcoming tail up front so the pool is sized and deduped against the kept
-        # head only (the tail we are discarding must not exclude its own tracks from the new pool)
-        queue_data.items = queue_data.items[:insert_at]
-        queue.items = len(queue_data.items)
-        pool_tracks = await self._managed_pool.fill(queue_id, is_initial=False)
-        queue_items = [
-            build_queue_item(queue_id, track) for track in pool_tracks if track.available
-        ]
-        if not queue_items:
-            raise MediaNotFoundError("No playable items found")
-        # the managed pool already interleaved the sources in a recency-aware order; load as-is
-        await self.load(queue_id, queue_items, insert_at_index=insert_at, keep_remaining=False)
-        if start_playing:
-            await self.play_index(queue_id, insert_at)
-        else:
-            # give an idle/empty queue a current item without starting playback
-            self._ensure_current_index(queue_id)
+        # The tail is dropped before the pool is fetched, so the pool is sized and deduped against
+        # the kept head only (the tail we are discarding must not exclude its own tracks from it).
+        # That leaves the queue holding less than it plays - for a replace, nothing at all - across
+        # the fetch, so hold player reconciliation off until the new items are in: it would
+        # otherwise publish that half-built state, which is exactly the empty queue this avoids.
+        self._set_transitioning(queue_id, True)
+        try:
+            queue_data.items = queue_data.items[:insert_at]
+            queue.items = len(queue_data.items)
+            pool_tracks = await self._managed_pool.fill(queue_id, is_initial=False)
+            queue_items = [
+                build_queue_item(queue_id, track) for track in pool_tracks if track.available
+            ]
+            if not queue_items:
+                raise MediaNotFoundError(
+                    "No playable items found", translation_key="no_playable_items"
+                )
+            # the managed pool already interleaved the sources in a recency-aware order; load as-is
+            await self.load(
+                queue_id,
+                queue_items,
+                insert_at_index=insert_at,
+                keep_remaining=False,
+                keep_played=option != QueueOption.REPLACE,
+            )
+            if start_playing:
+                await self.play_index(queue_id, insert_at)
+            else:
+                # give an idle/empty queue a current item without starting playback
+                self._ensure_current_index(queue_id)
+        finally:
+            self._set_transitioning(queue_id, False)
 
     async def _get_similar_tracks(
         self,
@@ -933,3 +1040,70 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # Drop anything already queued/played
         queued_set = set(queue_track_items)
         return [track for track in dynamic_tracks if track not in queued_set]
+
+    async def _abort_superseded_source_buffers(self, queue_item: QueueItem) -> None:
+        """
+        Abort the still-filling source buffers of other items in the same queue.
+
+        :param queue_item: The queue item that is about to start playing.
+        """
+        queue_data = self._queue_data.get(queue_item.queue_id)
+        items = tuple(queue_data.items) if queue_data else ()
+        successor: QueueItem | None = None
+        for index, item in enumerate(items):
+            if item.queue_item_id == queue_item.queue_item_id and index + 1 < len(items):
+                successor = items[index + 1]
+                break
+        # the started item keeps its own buffer, and its direct successor keeps the prewarm
+        # for the upcoming crossfade unless the aborts below leave the provider without a slot
+        spared_item_ids = {queue_item.queue_item_id}
+        if successor is not None:
+            spared_item_ids.add(successor.queue_item_id)
+        for item in items:
+            if item.queue_item_id in spared_item_ids:
+                continue
+            await self._abort_source_buffer(item, queue_item)
+        if successor is not None:
+            await self._abort_source_buffer(successor, queue_item, only_when_saturated=True)
+
+    async def _abort_source_buffer(
+        self,
+        item: QueueItem,
+        started_item: QueueItem,
+        only_when_saturated: bool = False,
+    ) -> None:
+        """
+        Cancel one item's still-filling source so its provider stream slot is handed over.
+
+        :param item: The queue item whose source buffer should be aborted.
+        :param started_item: The queue item that is about to start playing.
+        :param only_when_saturated: Only abort while the provider has no free slot left.
+        """
+        if item.streamdetails is None:
+            return
+        audio_buffer = item.streamdetails.buffer
+        if audio_buffer is None or not audio_buffer.is_buffering:
+            return
+        provider = self.mass.get_provider(item.streamdetails.provider, return_unavailable=True)
+        if not isinstance(provider, MusicProvider) or provider.max_concurrent_streams is None:
+            return
+        if only_when_saturated:
+            if provider.has_available_stream_slot:
+                # an abort above already freed a slot, so this prewarm can stay
+                return
+            self.logger.debug(
+                "Aborting the prewarm of %s: %s has no free stream slot left for %s",
+                item.name,
+                provider.name,
+                started_item.name,
+            )
+        else:
+            self.logger.debug(
+                "Aborting the source of %s to free a %s stream slot for %s",
+                item.name,
+                provider.name,
+                started_item.name,
+            )
+        # the cancelled buffer stays attached: it marks the source as aborted for
+        # the flow stream's accounting and fails is_valid() for any later reuse
+        await audio_buffer.clear()

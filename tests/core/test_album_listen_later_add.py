@@ -57,9 +57,11 @@ class _FakeStreamingProvider(MusicProvider):
         catalog: dict[str, Album],
         is_streaming: bool = True,
     ) -> None:
+        # assigned before super().__init__: 2.10 reads is_streaming_provider during
+        # construction (max_concurrent_streams), which resolves through this attribute
+        self._is_streaming = is_streaming
         super().__init__(mass, manifest, config)
         self._catalog = catalog
-        self._is_streaming = is_streaming
 
     @property
     def supported_features(self) -> set[ProviderFeature]:

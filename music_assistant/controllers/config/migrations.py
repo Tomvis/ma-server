@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import logging
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.constants import PLAYER_CONTROL_NATIVE, PLAYER_CONTROL_NONE
 from music_assistant_models.enums import CrossfadeMode
+from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.constants import (
     CONF_CORE,
     CONF_CROSSFADE_DURATION,
     CONF_CROSSFADE_MODE,
+    CONF_HTTP_PROFILE,
+    CONF_ICON,
     CONF_LINKED_PROTOCOL_IDS,
+    CONF_NFS_SUBFOLDER_MIGRATED,
     CONF_PLAYER_DSP,
     CONF_PLAYER_QUEUES,
     CONF_PLAYERS,
@@ -34,6 +39,8 @@ from music_assistant.controllers.player_queues.constants import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from music_assistant_models.config_entries import ConfigValueType
+
 LOGGER = logging.getLogger(__name__)
 
 # removed player config key, only referenced by its migration
@@ -41,6 +48,277 @@ LEGACY_CONF_OUTPUT_LIMITER = "output_limiter"
 
 # shared prefix of the removed per-player Bose SoundTouch preset keys
 LEGACY_BOSE_PRESET_KEY_PREFIX = "preset_"
+
+# removed hass provider config keys, only referenced by their migration
+LEGACY_CONF_TTS_ENTITY = "tts_entity"
+LEGACY_CONF_AI_TASK_ENTITY = "ai_task_entity"
+
+# engine selection keys of the providers that consume the plugin engines
+CONF_AI_ENGINE = "ai_engine"
+CONF_TTS_ENGINE = "tts_engine"
+
+
+# Canonical ids of the shared icon set (music-assistant/shared-icons v0.3.0);
+# stored icon values already in this set are never touched by the icon migration.
+_CANONICAL_ICON_IDS: frozenset[str] = frozenset(
+    (
+        "homepod-mini",
+        "sonos",
+        "mac",
+        "apple-tv",
+        "google-nest",
+        "voice-pe",
+        "wiim",
+        "speaker",
+        "speakers",
+        "soundbar",
+        "radio",
+        "tv",
+        "monitor",
+        "laptop",
+        "smartphone",
+        "tablet",
+        "headphones",
+        "bluetooth",
+        "airplay",
+        "cast",
+        "car",
+        "music",
+        "vinyl",
+        "mic",
+        "volume",
+        "living-room",
+        "bedroom",
+        "bathroom",
+        "toilet",
+        "kitchen",
+        "office",
+        "hallway",
+        "garden",
+        "outdoor",
+        "sun",
+        "home",
+        "building",
+    )
+)
+
+# Legacy stored player icon values (mdi-* names and pre-1.0 picker names) mapped to
+# the closest canonical id of the shared icon set. Sourced from
+# https://github.com/music-assistant/shared-icons/blob/main/migration/legacy-map.json
+_LEGACY_ICON_MAP: dict[str, str] = {
+    "apple-homepod-mini": "homepod-mini",
+    "appletv": "apple-tv",
+    "armchair": "living-room",
+    "audio-lines": "volume",
+    "bath": "bathroom",
+    "bed": "bedroom",
+    "bed-double": "bedroom",
+    "bed-single": "bedroom",
+    "bluetooth-speaker": "bluetooth",
+    "boom-box": "radio",
+    "boombox": "radio",
+    "briefcase": "office",
+    "building-2": "building",
+    "cassette-tape": "music",
+    "chef-hat": "kitchen",
+    "cooking-pot": "kitchen",
+    "disc": "vinyl",
+    "disc-2": "vinyl",
+    "disc-3": "vinyl",
+    "disc-album": "vinyl",
+    "door-closed": "hallway",
+    "door-open": "hallway",
+    "drum": "music",
+    "flower": "garden",
+    "flower-2": "garden",
+    "guitar": "music",
+    "headset": "headphones",
+    "homepod": "homepod-mini",
+    "hotel": "building",
+    "house": "home",
+    "lamp-desk": "office",
+    "lamp-floor": "living-room",
+    "laptop-2": "laptop",
+    "laptop-minimal": "laptop",
+    "leaf": "garden",
+    "mdi-airplay": "airplay",
+    "mdi-album": "vinyl",
+    "mdi-amplifier": "speaker",
+    "mdi-antenna": "radio",
+    "mdi-apple": "apple-tv",
+    "mdi-apple-airplay": "airplay",
+    "mdi-audio-video": "speaker",
+    "mdi-audio-video-remote": "speaker",
+    "mdi-balcony": "outdoor",
+    "mdi-bathtub": "bathroom",
+    "mdi-bathtub-outline": "bathroom",
+    "mdi-bed": "bedroom",
+    "mdi-bed-empty": "bedroom",
+    "mdi-bed-king": "bedroom",
+    "mdi-bed-queen": "bedroom",
+    "mdi-bluetooth": "bluetooth",
+    "mdi-bluetooth-audio": "bluetooth",
+    "mdi-bookshelf": "office",
+    "mdi-boombox": "radio",
+    "mdi-briefcase": "office",
+    "mdi-bullhorn": "volume",
+    "mdi-bunk-bed": "bedroom",
+    "mdi-car": "car",
+    "mdi-car-estate": "car",
+    "mdi-car-hatchback": "car",
+    "mdi-car-side": "car",
+    "mdi-cast": "cast",
+    "mdi-cast-audio": "cast",
+    "mdi-cast-connected": "cast",
+    "mdi-cast-variant": "airplay",
+    "mdi-cellphone": "smartphone",
+    "mdi-cellphone-sound": "smartphone",
+    "mdi-cellphone-wireless": "smartphone",
+    "mdi-chair-rolling": "office",
+    "mdi-chef-hat": "kitchen",
+    "mdi-city": "building",
+    "mdi-coat-rack": "hallway",
+    "mdi-coffee": "kitchen",
+    "mdi-coffee-maker": "kitchen",
+    "mdi-countertop": "kitchen",
+    "mdi-desk": "office",
+    "mdi-desk-lamp": "office",
+    "mdi-desktop-classic": "monitor",
+    "mdi-desktop-mac": "mac",
+    "mdi-desktop-tower": "monitor",
+    "mdi-desktop-tower-monitor": "monitor",
+    "mdi-disc": "vinyl",
+    "mdi-disc-player": "vinyl",
+    "mdi-domain": "building",
+    "mdi-door": "hallway",
+    "mdi-door-closed": "hallway",
+    "mdi-door-open": "hallway",
+    "mdi-earbuds": "headphones",
+    "mdi-earbuds-outline": "headphones",
+    "mdi-flower": "garden",
+    "mdi-flower-outline": "garden",
+    "mdi-flower-tulip": "garden",
+    "mdi-forest": "outdoor",
+    "mdi-fridge": "kitchen",
+    "mdi-fridge-outline": "kitchen",
+    "mdi-garage": "car",
+    "mdi-garage-variant": "car",
+    "mdi-google-assistant": "google-nest",
+    "mdi-google-home": "google-nest",
+    "mdi-grass": "garden",
+    "mdi-grill": "outdoor",
+    "mdi-guitar-acoustic": "music",
+    "mdi-guitar-electric": "music",
+    "mdi-headphones": "headphones",
+    "mdi-headset": "headphones",
+    "mdi-home": "home",
+    "mdi-home-city": "building",
+    "mdi-home-modern": "home",
+    "mdi-home-outline": "home",
+    "mdi-home-variant": "home",
+    "mdi-hot-tub": "bathroom",
+    "mdi-karaoke": "mic",
+    "mdi-laptop": "laptop",
+    "mdi-laptop-mac": "mac",
+    "mdi-microphone": "mic",
+    "mdi-microphone-variant": "mic",
+    "mdi-monitor": "monitor",
+    "mdi-monitor-speaker": "speaker",
+    "mdi-music": "music",
+    "mdi-music-box": "music",
+    "mdi-music-circle": "music",
+    "mdi-music-clef-treble": "music",
+    "mdi-music-note": "music",
+    "mdi-nature": "outdoor",
+    "mdi-office-building": "building",
+    "mdi-office-building-outline": "building",
+    "mdi-palm-tree": "outdoor",
+    "mdi-patio-heater": "outdoor",
+    "mdi-piano": "music",
+    "mdi-pine-tree": "outdoor",
+    "mdi-podcast": "mic",
+    "mdi-pool": "outdoor",
+    "mdi-pot-steam": "kitchen",
+    "mdi-projector": "tv",
+    "mdi-projector-screen": "tv",
+    "mdi-radio": "radio",
+    "mdi-radio-tower": "radio",
+    "mdi-record": "vinyl",
+    "mdi-record-player": "vinyl",
+    "mdi-saxophone": "music",
+    "mdi-shower": "bathroom",
+    "mdi-shower-head": "bathroom",
+    "mdi-silverware": "kitchen",
+    "mdi-silverware-fork": "kitchen",
+    "mdi-silverware-fork-knife": "kitchen",
+    "mdi-silverware-variant": "kitchen",
+    "mdi-sofa": "living-room",
+    "mdi-sofa-outline": "living-room",
+    "mdi-sofa-single": "living-room",
+    "mdi-soundbar": "soundbar",
+    "mdi-speaker": "speaker",
+    "mdi-speaker-bluetooth": "bluetooth",
+    "mdi-speaker-multiple": "speakers",
+    "mdi-speaker-wireless": "speaker",
+    "mdi-sprout": "garden",
+    "mdi-stairs": "hallway",
+    "mdi-stove": "kitchen",
+    "mdi-surround-sound": "speakers",
+    "mdi-tablet": "tablet",
+    "mdi-television": "tv",
+    "mdi-television-box": "tv",
+    "mdi-television-classic": "tv",
+    "mdi-television-guide": "tv",
+    "mdi-theater": "tv",
+    "mdi-toilet": "toilet",
+    "mdi-tree": "outdoor",
+    "mdi-tree-outline": "outdoor",
+    "mdi-truck": "car",
+    "mdi-trumpet": "music",
+    "mdi-turntable": "vinyl",
+    "mdi-violin": "music",
+    "mdi-volume-high": "volume",
+    "mdi-volume-low": "volume",
+    "mdi-volume-medium": "volume",
+    "mdi-watering-can": "garden",
+    "mdi-weather-sunny": "sun",
+    "mdi-white-balance-sunny": "sun",
+    "megaphone": "volume",
+    "mic-vocal": "mic",
+    "microphone": "mic",
+    "microwave": "kitchen",
+    "monitor-speaker": "speaker",
+    "music-2": "music",
+    "music-3": "music",
+    "music-4": "music",
+    "piano": "music",
+    "podcast": "mic",
+    "projector": "tv",
+    "radio-receiver": "radio",
+    "radio-tower": "radio",
+    "refrigerator": "kitchen",
+    "screen-share": "cast",
+    "shower-head": "bathroom",
+    "sofa": "living-room",
+    "speaker-group": "speakers",
+    "speaker-loud": "volume",
+    "speaker-multiple": "speakers",
+    "sprout": "garden",
+    "television": "tv",
+    "tent-tree": "outdoor",
+    "toilet": "toilet",
+    "tree": "outdoor",
+    "tree-deciduous": "outdoor",
+    "tree-pine": "outdoor",
+    "trees": "outdoor",
+    "tv-2": "tv",
+    "tv-minimal": "tv",
+    "tv-minimal-play": "tv",
+    "utensils": "kitchen",
+    "utensils-crossed": "kitchen",
+    "volume-1": "volume",
+    "volume-2": "volume",
+}
 
 # Config keys each provider's setup flow owns: the keys it reads back with
 # get_setup_value / get_provider_setup_value (and rotates via _update_setup_data) from
@@ -54,8 +332,9 @@ LEGACY_BOSE_PRESET_KEY_PREFIX = "preset_"
 # "hue_username", the scrobblers under "_username", Open Subsonic its url under "baseURL").
 # Notes on the non-obvious entries:
 # - the filesystem providers' "content_type" is also surfaced by get_config_entries, but
-#   only as a read-only LABEL mirror (UI_ONLY, never persisted back to values), so moving
-#   it to setup_data is safe and required (it is read via get_provider_setup_value).
+#   only as a read-only mirror that carries the setup value as its default (so it is never
+#   persisted back to values), so moving it to setup_data is safe and required (it is read
+#   via get_provider_setup_value).
 # - hass "url"/"token"/"verify_ssl": on a Home Assistant add-on these come from fixed
 #   (hidden) config entries whose values equal what a stored copy would hold, so moving a
 #   stored copy is a harmless no-op there while restoring normal installs.
@@ -172,6 +451,31 @@ PROVIDER_SETUP_FLOW_KEYS: dict[str, tuple[str, ...]] = {
     "yousee": ("username", "password"),
     "ytmusic": ("username", "cookie", "po_token_server_url"),
     "zvuk_music": ("token",),
+}
+
+
+# Fallback defaults for setup-flow keys that were never stored in the first place.
+# A config value that matches its entry default is not persisted, so a key left at its
+# default had nothing in `values` for the migration below to move and now reads back as
+# None. These are the defaults those keys carried as config entries before the setup
+# flows landed. Only keys whose read site has no fallback of its own are listed; the
+# others already resolve their default at runtime. This runs on every startup, so only
+# keys their setup flow persists unconditionally belong here - a key a flow may
+# legitimately omit would be re-injected forever.
+# TODO: remove after 2.13 release
+PROVIDER_SETUP_FLOW_DEFAULTS: dict[str, dict[str, ConfigValueType]] = {
+    "alexa": {"url": "amazon.com", "api_url": "http://localhost:5000"},
+    "audiobookshelf": {"verify_ssl": True},
+    "filesystem_local": {"path": "/media"},
+    "filesystem_smb": {"subfolder": "", "smb_version": "3.0"},
+    "jellyfin": {"verify_ssl": True},
+    "lastfm_scrobble": {"_provider": "lastfm"},
+    "plex": {
+        "local_server_port": 32400,
+        "local_server_ssl": False,
+        "local_server_verify_cert": True,
+    },
+    "siriusxm": {"sxm_region": "US"},
 }
 
 
@@ -326,12 +630,42 @@ async def migrate(data: dict[str, Any]) -> bool:  # noqa: PLR0915
     if _migrate_bose_soundtouch_presets(data):
         changed = True
 
+    # Rewrite stored player icons from legacy values (mdi-* names and pre-1.0 picker
+    # names) to canonical ids of the shared icon set; unmappable mdi-* picks drop
+    # back to the player-type default.
+    # TODO: remove after 2.12 release
+    if _migrate_player_icons(data):
+        changed = True
+
+    # Drop the stored HTTP profile of Bluesound players; the setting is no longer offered
+    # because BluOS only plays back correctly on the forced content length profile.
+    # TODO: remove after 2.12 release
+    if _migrate_bluesound_http_profile(data):
+        changed = True
+
+    # Drop disabled protocol player configs that lost their parent player: the device they
+    # belong to can never register again while such a config lingers, and it is not shown
+    # in the UI so there is no way to enable it again.
+    # TODO: remove after 2.12 release
+    if _migrate_orphaned_disabled_protocol_configs(data):
+        changed = True
+
+    # Clear the stored name of players that were never renamed, so an updated default
+    # name is no longer shadowed by the auto-generated name stored at creation time.
+    # TODO: remove after 2.12 release
+    if _migrate_unrenamed_player_names(data):
+        changed = True
+
     return changed
 
 
 def migrate_provider_setup_data(data: dict[str, Any], encrypt: Callable[[str], str]) -> bool:
     """
     Move each provider's setup-flow-owned keys from `values` to `setup_data` in-place.
+
+    Also restores the keys listed in PROVIDER_SETUP_FLOW_DEFAULTS that are absent from
+    `setup_data`, which covers the installs whose values were already moved by an
+    earlier run of this step.
 
     Runs after encryption is initialized (unlike migrate()), so string values are
     encrypted at rest with the given callback - matching how the setup flows persist
@@ -348,34 +682,187 @@ def migrate_provider_setup_data(data: dict[str, Any], encrypt: Callable[[str], s
     for provider_cfg in all_provider_configs.values():
         if not isinstance(provider_cfg, dict):
             continue
-        owned_keys = PROVIDER_SETUP_FLOW_KEYS.get(provider_cfg.get("domain", ""))
+        domain = provider_cfg.get("domain", "")
+        owned_keys = PROVIDER_SETUP_FLOW_KEYS.get(domain)
         if not owned_keys:
             continue
         values = provider_cfg.get("values")
         if not isinstance(values, dict):
-            continue
+            # a config without stored values has nothing to move, but may still
+            # be missing a default
+            values = {}
         movable_keys = [key for key in owned_keys if key in values]
         setup_data = provider_cfg.get("setup_data")
-        needs_airplay_default = provider_cfg.get("domain") == "airplay_receiver" and (
-            not isinstance(setup_data, dict) or "airplay_name" not in setup_data
-        )
-        if not movable_keys and not needs_airplay_default:
-            continue
         if not isinstance(setup_data, dict):
             setup_data = {}
-            provider_cfg["setup_data"] = setup_data
+        # a key that is about to be moved carries the user's own value and is left alone
+        missing_defaults = {
+            key: value
+            for key, value in PROVIDER_SETUP_FLOW_DEFAULTS.get(domain, {}).items()
+            if key not in setup_data and key not in movable_keys
+        }
+        needs_airplay_default = domain == "airplay_receiver" and "airplay_name" not in setup_data
+        if not movable_keys and not missing_defaults and not needs_airplay_default:
+            continue
+        provider_cfg["setup_data"] = setup_data
         for key in movable_keys:
             # a value already collected into setup_data wins; only drop the stale copy
             if key not in setup_data:
                 value = values[key]
                 setup_data[key] = encrypt(value) if isinstance(value, str) else value
             del values[key]
+        for key, value in missing_defaults.items():
+            setup_data[key] = encrypt(value) if isinstance(value, str) else value
+        # re-checked after the move: airplay_name may have just arrived from values
         if needs_airplay_default and "airplay_name" not in setup_data:
             setup_data["airplay_name"] = encrypt("Music Assistant")
         changed = True
     if changed:
         LOGGER.info("Migrated provider setup values into setup_data")
     return changed
+
+
+# TODO: remove after 2.10 release
+def migrate_nfs_subfolder_into_export_path(
+    data: dict[str, Any],
+    encrypt: Callable[[str], str],
+    decrypt: Callable[[str], str],
+) -> bool:
+    """
+    Fold a stored NFS `subfolder` into its `export_path`, once.
+
+    The provider mounts the export as configured and scans the subfolder inside that mount, so
+    folding the two keys into one keeps an existing instance mounting what it already mounts.
+    Runs after encryption is initialized, like migrate_provider_setup_data, because both keys
+    live encrypted in `setup_data`.
+
+    Guarded by CONF_NFS_SUBFOLDER_MIGRATED so it cannot run twice: a subfolder stored
+    afterwards means "scan this path inside the mount" and must never be folded. Returns True
+    when the settings were modified, including the first run's marker.
+
+    :param data: The persistent settings data to migrate in-place.
+    :param encrypt: Callback that encrypts a string value at rest.
+    :param decrypt: Callback that decrypts a stored string value (a no-op for plain values).
+    """
+    if data.get(CONF_NFS_SUBFOLDER_MIGRATED):
+        return False
+    all_provider_configs = data.get(CONF_PROVIDERS, {})
+    if not isinstance(all_provider_configs, dict):
+        return False
+    changed = False
+    for instance_id, provider_cfg in all_provider_configs.items():
+        if not isinstance(provider_cfg, dict) or provider_cfg.get("domain") != "filesystem_nfs":
+            continue
+        setup_data = provider_cfg.get("setup_data")
+        if not isinstance(setup_data, dict):
+            continue
+        stored_subfolder = setup_data.get("subfolder")
+        stored_export_path = setup_data.get("export_path")
+        if not isinstance(stored_subfolder, str) or not isinstance(stored_export_path, str):
+            continue
+        try:
+            subfolder = decrypt(stored_subfolder).strip()
+            export_path = decrypt(stored_export_path)
+        except InvalidDataError:
+            # one unreadable instance must not fail config setup for the whole server; it
+            # still surfaces the problem at its own setup. Name it without its values.
+            LOGGER.warning(
+                "Could not read the stored NFS paths of %s; skipping its subfolder migration",
+                instance_id,
+            )
+            continue
+        if not subfolder or not export_path:
+            # an empty export path is broken either way and must not become a relative one
+            continue
+        # must come out as <export_path>/<subfolder> so the mount source is unchanged
+        setup_data["export_path"] = encrypt(str(PurePosixPath(export_path) / subfolder.lstrip("/")))
+        del setup_data["subfolder"]
+        changed = True
+    if changed:
+        LOGGER.info("Migrated NFS provider subfolder into the export path")
+    # claim the marker even when nothing was folded, so a subfolder stored later is safe
+    data[CONF_NFS_SUBFOLDER_MIGRATED] = True
+    return True
+
+
+# TODO: remove after 2.10 release
+def migrate_hass_engine_selection(data: dict[str, Any], encrypt: Callable[[str], str]) -> bool:
+    """
+    Hand the removed Home Assistant TTS/AI entity choice over to the providers consuming it.
+
+    The Home Assistant plugin exposes every TTS/AI entity as a selectable engine now and each
+    consuming provider picks one itself, so the single choice that used to live on the plugin
+    is copied to the installed consumers that have no choice of their own yet. Providers
+    installed later pick an engine themselves at load. Returns True if anything changed.
+
+    Runs after encryption is initialized (like migrate_provider_setup_data), since the ai_radio
+    selection belongs in its encrypted `setup_data`.
+
+    :param data: The persistent settings data to migrate in-place.
+    :param encrypt: Callback that encrypts a string value, used for the values that land in
+        `setup_data`.
+    """
+    all_provider_configs = data.get(CONF_PROVIDERS, {})
+    if not isinstance(all_provider_configs, dict):
+        return False
+    hass_configs = {
+        instance_id: provider_cfg
+        for instance_id, provider_cfg in all_provider_configs.items()
+        if isinstance(provider_cfg, dict) and provider_cfg.get("domain") == "hass"
+    }
+    if len(hass_configs) > 1:
+        # there is no correct winner between several choices, so let the user pick per provider
+        LOGGER.warning(
+            "Skipped migrating the Home Assistant TTS/AI entity selection: "
+            "%s Home Assistant configurations found, select the engines manually",
+            len(hass_configs),
+        )
+        return False
+    changed = False
+    for instance_id, hass_cfg in hass_configs.items():
+        values = hass_cfg.get("values")
+        if not isinstance(values, dict):
+            continue
+        if not any(key in values for key in (LEGACY_CONF_TTS_ENTITY, LEGACY_CONF_AI_TASK_ENTITY)):
+            continue
+        tts_entity = values.pop(LEGACY_CONF_TTS_ENTITY, None)
+        ai_task_entity = values.pop(LEGACY_CONF_AI_TASK_ENTITY, None)
+        changed = True
+        if isinstance(ai_task_entity, str) and ai_task_entity:
+            ai_engine = f"{instance_id}/{ai_task_entity}"
+            _set_engine_selection(
+                all_provider_configs, "music_quiz", "values", CONF_AI_ENGINE, ai_engine
+            )
+            _set_engine_selection(
+                all_provider_configs, "smart_playlist", "values", CONF_AI_ENGINE, ai_engine
+            )
+            _set_engine_selection(
+                all_provider_configs, "ai_radio", "setup_data", CONF_AI_ENGINE, encrypt(ai_engine)
+            )
+        if isinstance(tts_entity, str) and tts_entity:
+            _set_engine_selection(
+                all_provider_configs,
+                "ai_radio",
+                "setup_data",
+                CONF_TTS_ENGINE,
+                encrypt(f"{instance_id}/{tts_entity}"),
+            )
+        LOGGER.info("Migrated the Home Assistant TTS/AI entity selection to the plugin engines")
+    return changed
+
+
+def _set_engine_selection(
+    all_provider_configs: dict[str, Any], domain: str, section: str, key: str, value: str
+) -> None:
+    """Store an engine selection on each config of the given domain that has none of its own."""
+    for provider_cfg in all_provider_configs.values():
+        if not isinstance(provider_cfg, dict) or provider_cfg.get("domain") != domain:
+            continue
+        section_values = provider_cfg.get(section)
+        if not isinstance(section_values, dict):
+            section_values = {}
+            provider_cfg[section] = section_values
+        section_values.setdefault(key, value)
 
 
 def _migrate_player_queue_settings(data: dict[str, Any]) -> bool:
@@ -944,6 +1431,110 @@ def _migrate_output_limiter(data: dict[str, Any]) -> bool:
     return changed
 
 
+# the only HTTP profile BluOS devices play back correctly on
+FORCED_HTTP_PROFILE = "forced_content_length"
+
+
+def _migrate_bluesound_http_profile(data: dict[str, Any]) -> bool:
+    """
+    Drop a stored HTTP profile that Bluesound players can no longer select.
+
+    BluOS keeps looping the audio on any profile other than the forced content length one,
+    so the setting is no longer offered. A player left on another profile would stay broken
+    with no way back, so that pick is removed.
+    """
+    all_player_configs = data.get(CONF_PLAYERS, {})
+    if not isinstance(all_player_configs, dict):
+        return False
+    changed = False
+    for player_cfg in all_player_configs.values():
+        if not isinstance(player_cfg, dict):
+            continue
+        if not str(player_cfg.get("provider", "")).startswith("bluesound"):
+            continue
+        player_values = player_cfg.get("values")
+        if not isinstance(player_values, dict):
+            continue
+        if player_values.get(CONF_HTTP_PROFILE, FORCED_HTTP_PROFILE) != FORCED_HTTP_PROFILE:
+            del player_values[CONF_HTTP_PROFILE]
+            changed = True
+    if changed:
+        LOGGER.info("Restored the required HTTP profile on the Bluesound player configuration(s)")
+    return changed
+
+
+def _migrate_unrenamed_player_names(data: dict[str, Any]) -> bool:
+    """
+    Clear the stored name of player configs that hold the default name verbatim.
+
+    Player configs used to store the name a player was created with as both the custom
+    and the default name, which makes a never-renamed player indistinguishable from a
+    renamed one and lets the creation-time name shadow every later default name.
+    """
+    all_player_configs = data.get(CONF_PLAYERS, {})
+    if not isinstance(all_player_configs, dict):
+        return False
+    changed = False
+    for player_cfg in all_player_configs.values():
+        if not isinstance(player_cfg, dict):
+            continue
+        # a config without a default name would be left without any name at all
+        if not (default_name := player_cfg.get("default_name")):
+            continue
+        if player_cfg.get("name") != default_name:
+            continue
+        player_cfg["name"] = None
+        changed = True
+    return changed
+
+
+def _migrate_orphaned_disabled_protocol_configs(data: dict[str, Any]) -> bool:
+    """
+    Remove disabled protocol player configs that no longer belong to a player.
+
+    A protocol player is only ever presented as part of the player that owns it, so a
+    disabled config that outlived its owner keeps the device from registering again while
+    offering no way to enable it.
+    """
+    all_player_configs = data.get(CONF_PLAYERS, {})
+    if not isinstance(all_player_configs, dict):
+        return False
+    linked_ids: set[str] = set()
+    for player_cfg in all_player_configs.values():
+        if not isinstance(player_cfg, dict):
+            continue
+        player_values = player_cfg.get("values")
+        if not isinstance(player_values, dict):
+            continue
+        if isinstance(cached_ids := player_values.get(CONF_LINKED_PROTOCOL_IDS), list):
+            linked_ids.update(pid for pid in cached_ids if isinstance(pid, str))
+    orphaned: list[str] = []
+    for player_id, player_cfg in all_player_configs.items():
+        if not isinstance(player_cfg, dict):
+            continue
+        if player_cfg.get("player_type") != "protocol":
+            continue
+        if player_cfg.get("enabled", True):
+            continue
+        # a player owns a protocol player from either side of the link
+        if player_id in linked_ids:
+            continue
+        player_values = player_cfg.get("values")
+        parent_id = (
+            player_values.get(CONF_PROTOCOL_PARENT_ID) if isinstance(player_values, dict) else None
+        )
+        if parent_id in all_player_configs:
+            continue
+        orphaned.append(player_id)
+    dsp_configs = data.get(CONF_PLAYER_DSP)
+    for player_id in orphaned:
+        del all_player_configs[player_id]
+        if isinstance(dsp_configs, dict):
+            dsp_configs.pop(player_id, None)
+        LOGGER.warning("Removed orphaned player configuration %s", player_id)
+    return bool(orphaned)
+
+
 def _migrate_bose_soundtouch_presets(data: dict[str, Any]) -> bool:
     """
     Remove the per-player Bose SoundTouch preset mappings.
@@ -1044,4 +1635,34 @@ def _migrate_player_setup_data(data: dict[str, Any]) -> bool:
                 "Migrated credential/pairing values into setup_data for player %s", player_id
             )
             changed = True
+    return changed
+
+
+def _migrate_player_icons(data: dict[str, Any]) -> bool:
+    """Rewrite legacy stored player icon values to canonical shared-icon-set ids."""
+    all_player_configs = data.get(CONF_PLAYERS, {})
+    if not isinstance(all_player_configs, dict):
+        return False
+    changed = False
+    for player_id, player_cfg in all_player_configs.items():
+        if not isinstance(player_cfg, dict):
+            continue
+        values = player_cfg.get("values")
+        if not isinstance(values, dict):
+            continue
+        icon = values.get(CONF_ICON)
+        if not isinstance(icon, str) or icon in _CANONICAL_ICON_IDS:
+            continue
+        if (replacement := _LEGACY_ICON_MAP.get(icon)) is not None:
+            values[CONF_ICON] = replacement
+            LOGGER.info("Migrated icon %s to %s for player %s", icon, replacement, player_id)
+            changed = True
+        elif icon.startswith("mdi-"):
+            # no close equivalent in the shared icon set: drop the stored value
+            # so the player-type default applies
+            del values[CONF_ICON]
+            LOGGER.info("Dropped legacy icon %s for player %s", icon, player_id)
+            changed = True
+        # any other unknown value is left in place: clients render the fallback icon
+        # for unknown ids and the value may become a valid id in a future icon set
     return changed

@@ -9,7 +9,13 @@ DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
 
-DB_SCHEMA_VERSION: Final[int] = 56
+# 59, not 58: both branches independently allocated 56 (upstream to its playlist
+# sound-effect repair, this branch to listen_later), so upstream's 58 has to be
+# cleared for a fork database to migrate at all. It also has to move for stock
+# 2.10 databases -- at 58 the "prev_version not in (0, DB_SCHEMA_VERSION)" guard
+# in database.py skips migration entirely and every album query then fails on
+# "no such column: listen_later".
+DB_SCHEMA_VERSION: Final[int] = 59
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
@@ -42,6 +48,24 @@ RECOMMENDATIONS_ITEMS_TIMEOUT: Final[int] = 30
 # contractually fast (no live backend calls) so a short timeout suffices
 RECOMMENDATIONS_ROWS_TIMEOUT: Final[int] = 5
 
+# how long after a provider is loaded its library sync runs for the first time,
+# leaving the rest of the startup work room to settle first
+INITIAL_SYNC_DELAY: Final[int] = 10
+
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
 PROVIDER_MAPPING_CORRECTION_TASK_ID: Final[str] = "music_provider_mapping_correction"
 MUSIC_SYNC_COMPLETION_CHECK_TASK_ID: Final[str] = "music_sync_completion_check"
+TRACK_RECONCILIATION_TASK_ID: Final[str] = "music_track_reconciliation"
+
+# number of duplicate track candidate pairs examined per reconciliation run
+TRACK_RECONCILIATION_BATCH_SIZE: Final[int] = 100
+
+# where the duplicate track walk left off, stored so a restart resumes instead of starting
+# over: the pair last examined as [item_id, item_id], or an empty list once the walk has
+# reached the end of the library
+CONF_TRACK_RECONCILIATION_CURSOR: Final[str] = "track_reconciliation_cursor"
+# whether a sync has added content that the walk still owes another pass
+CONF_TRACK_RECONCILIATION_RESCAN_DUE: Final[str] = "track_reconciliation_rescan_due"
+# max difference in seconds between two track durations to still consider them the same
+# recording; matches the widest duration window compare_track is willing to accept
+TRACK_RECONCILIATION_MAX_DURATION_DELTA: Final[int] = 8

@@ -26,7 +26,7 @@ from music_assistant.constants import (
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.player_queues.base import _PlayerQueuesBase
-from music_assistant.controllers.streams.audio_buffer import AudioBuffer
+from music_assistant.controllers.streams.constants import STREAM_SLOT_WAIT_TIMEOUT
 
 if TYPE_CHECKING:
     from music_assistant_models.queue_item import QueueItem
@@ -73,16 +73,28 @@ class StreamFeederMixin(_PlayerQueuesBase):
                     next_item.name,
                     queue.display_name,
                 )
-                await AudioBuffer.get_buffer(
-                    self.mass,
-                    next_item.streamdetails,
+                await self.mass.streams.audio.get_audio_buffer(
+                    next_item,
                     reason="prepare_next",
-                    wait_ready=True,
+                    capacity_wait_timeout=STREAM_SLOT_WAIT_TIMEOUT,
+                    # speculative preparation gives up softly, so it must stay cheap:
+                    # leave the cross-provider search to the actual playback start
+                    allow_provider_match=False,
                 )
             except (AudioError, MediaNotFoundError) as err:
                 self.logger.debug("Failed to prepare next audio buffer: %s", err)
+            except asyncio.CancelledError:
+                # a replacement prepare aborted this one: release the half-filled source
+                # so its slot is not pinned until the inactivity sweep
+                if (sd := next_item.streamdetails) and (buf := sd.buffer) and buf.is_buffering:
+                    await asyncio.shield(buf.clear())
+                raise
 
-        self.mass.create_task(_do_prepare)
+        self.mass.create_task(
+            _do_prepare,
+            task_id=f"prepare_next_audio_buffer_{queue_id}",
+            abort_existing=True,
+        )
 
     def _enqueue_next_item(self, queue_id: str, next_item: QueueItem | None) -> None:
         """Enqueue the next item on the player."""
@@ -114,6 +126,18 @@ class StreamFeederMixin(_PlayerQueuesBase):
                 or queue_data.session_id != session_id
                 or queue.flow_mode
             ):
+                # nothing re-attempts this handover, so a skip here means the player runs out
+                # of audio when the current track ends - leave a trace of why it was skipped
+                self.logger.debug(
+                    "Not enqueuing next track %s on queue %s "
+                    "(state: %s, source: %s, same session: %s, flow mode: %s)",
+                    next_item.name,
+                    queue.display_name,
+                    player.state.playback_state if player else "player unavailable",
+                    player.state.active_source if player else None,
+                    queue_data.session_id == session_id,
+                    queue.flow_mode,
+                )
                 return
 
             current_item = queue.current_item

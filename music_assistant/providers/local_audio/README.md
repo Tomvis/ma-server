@@ -92,13 +92,25 @@ sounddevice.RawOutputStream (PortAudio, int16)
 ALSA hw: device / CoreAudio Device
 ```
 
+### Output Device Loss
+
+The writer task is the player's only audio path, and nothing restarts it inside a Sendspin stream, so a device that fails mid-playback would otherwise stay silent for the rest of the stream while the Sendspin group keeps the player on PLAYING.
+
+A failed write therefore closes the device and reopens it — libpulse has no reconnect, so the `pa_simple` connection is replaced rather than retried. There is no timeline state to rebuild: chunks carry absolute timestamps and the late-drop threshold discards whatever piled up during the reopen, so the device resyncs on its own. A reopened PA sink runs through idle->RUNNING again, which is when PulseAudio can put back a stale level, so the sink's volume is restored with it: the cached level where this player drives the sink's hardware volume, a re-pin to unity where its volume is applied in software instead.
+
+The writer's opens are bounded by `_DEVICE_OPEN_TIMEOUT_SECONDS`, because a wedged device fails by never answering rather than by raising, and waiting on it would hold the writer while chunks pile up behind a player still reporting playback. The open still runs to completion in its own thread, so a device that arrives after the wait gave up is closed rather than left behind to make every later open fail.
+
+The bridge gives up when it has no working device and cannot get one: the device fails again within `_DEVICE_REOPEN_GUARD_SECONDS` of a reopen, the reopen itself fails or times out, the device never opened at the start of the stream, or the writer died on something unclassified. It then leaves the Sendspin session (`quiesce_to_solo_stopped`) — a shared group plays on without this device, a solo one stops. The client stays registered, so the player survives to be grouped again.
+
+Giving up covers the remainder of that stream only. The reopen budget is per writer, so the next Sendspin stream starts the device over from scratch — a device that comes back on its own is picked up again on the next track without any user action.
+
 ### Volume Control
 
-The MA volume slider (0-100) is mapped to an amplitude scale factor via an exponential "audio taper" curve (`volume_pct_to_amplitude` in `constants.py`, based on the [dr-lex taper](https://www.dr-lex.be/info-stuff/volumecontrols.html)): a constant dB change per slider step from 10% to 100%, with a linear ramp to true silence below 10%. This avoids the classic "linear volume slider" problem where the bottom of the range is wildly more sensitive than the top and the top barely changes the loudness at all. The same taper is used for both the hardware and software volume paths below, so a given slider position sounds the same regardless of which path is active.
+The MA volume slider (0-100) is mapped to an amplitude scale factor via an exponential "audio taper" curve (`volume_pct_to_amplitude` in `music_assistant/helpers/pulse_capture.py`, based on the [dr-lex taper](https://www.dr-lex.be/info-stuff/volumecontrols.html)): a constant dB change per slider step from 10% to 100%, with a linear ramp to true silence below 10%. This avoids the classic "linear volume slider" problem where the bottom of the range is wildly more sensitive than the top and the top barely changes the loudness at all. The same taper is used for both the hardware and software volume paths below, so a given slider position sounds the same regardless of which path is active.
 
-The taper's dynamic range is configurable via `_TAPER_A` in `constants.py` — the default is **40dB** (`_TAPER_A = 0.01`), suited for receiver-driven and outdoor speaker setups (MA 70% ≈ -12dB). A 60dB range (`_TAPER_A = 0.001`) is more appropriate for headphones or desktop speakers. See `constants.py` for a reference table of common options.
+The taper's dynamic range is configurable via `_TAPER_A` in `music_assistant/helpers/pulse_capture.py` — the default is **40dB** (`_TAPER_A = 0.01`), suited for receiver-driven and outdoor speaker setups (MA 70% ≈ -12dB). A 60dB range (`_TAPER_A = 0.001`) is more appropriate for headphones or desktop speakers. See that module for a reference table of common options.
 
-**Linux PulseAudio/PipeWire backend**: Volume and mute are applied as native PulseAudio sink volume, via a shared `libpulse` connection (`PAVolumeController`). The taper's output amplitude is converted to a PA volume percentage via a cube root — PA's own volume percentage represents `amplitude**3` on its internal cubic curve, so the cube root is the inverse step needed to make PA apply the *taper's* amplitude rather than its own.
+**Linux PulseAudio/PipeWire backend**: Volume and mute are applied as native PulseAudio sink volume, via a shared `libpulse` connection (`PAVolumeController` from `music_assistant/helpers/pulse_capture.py`). The taper's output amplitude is converted to a PA volume percentage via a cube root — PA's own volume percentage represents `amplitude**3` on its internal cubic curve, so the cube root is the inverse step needed to make PA apply the *taper's* amplitude rather than its own.
 
 Each sink — including each `module-remap-sink` zone sink on multi-channel cards — has its own independent hardware volume that does not affect its master sink or sibling sinks. This means each zone of a 5.1/7.1 card (front, rear, side, center/LFE, and the full-channel "multichannel stereo" passthrough) gets its own independent volume control in MA.
 
@@ -128,9 +140,9 @@ The ALSA direct backend always uses 16-bit int PCM (PortAudio `int16` dtype) reg
 | `__init__.py` | Provider entry point, config entries (backend selector on Linux), and setup |
 | `provider.py` | `LocalAudioProvider` class |
 | `sendspin_bridge.py` | Bridge manager and per-device bridge (PA on Linux PulseAudio, sounddevice on Linux ALSA and macOS); also owns remap-sink topology lifecycle |
-| `pa_simple.py` | ctypes wrapper around `libpulse-simple`/`libpulse` for direct PCM output, PA sink/module hardware volume control, and module load/unload; PA sink enumeration via `pactl`; ALSA device enumeration via PortAudio; `suspend_resume_sink()` workaround in case a sound card stalls *(Linux only)* |
+| `pa_simple.py` | ctypes wrapper around `libpulse-simple` for direct PCM output (hardware volume/module control lives in `music_assistant/helpers/pulse_capture.py`); PA sink enumeration via `pactl`; ALSA device enumeration via PortAudio; `suspend_resume_sink()` workaround in case a sound card stalls *(Linux only)* |
 | `remap_topology.py` | Computes the per-zone and full-channel passthrough `module-remap-sink` topology for multi-channel cards *(Linux PulseAudio only)* |
-| `constants.py` | Shared constants (UUID namespace, buffer sizes, backend selector values) and the `volume_pct_to_amplitude` audio taper used by both the hardware and software volume paths; taper range is configurable via `_TAPER_A` (default 40dB, suited for receiver/outdoor setups) |
+| `constants.py` | Shared constants (UUID namespace, buffer sizes, backend selector values); the `volume_pct_to_amplitude` audio taper lives in `music_assistant/helpers/pulse_capture.py` (range configurable via `_TAPER_A`, default 40dB) |
 | `manifest.json` | Provider metadata and dependencies |
 | `strings.json` | Localized config entry labels/descriptions (audio backend selector and its options) |
 

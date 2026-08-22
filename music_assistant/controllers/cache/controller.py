@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.constants import (
@@ -67,18 +67,13 @@ class CacheController(CoreController):
             ),
         )
 
-    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
-        """Handle a one-shot action button press and re-render the config entries."""
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
+        """Handle a one-shot action button press and report its outcome."""
         if action == CONF_CLEAR_CACHE:
             await self.clear()
-            return (
-                *await self.get_config_entries(),
-                # distinct key so the result label doesn't collide with the action's label
-                ConfigEntry(
-                    key="clear_cache_result",
-                    type=ConfigEntryType.LABEL,
-                ),
-            )
+            return ConfigActionResult(translation_key=f"{CONF_CLEAR_CACHE}.result")
         return await super().handle_config_action(action)
 
     async def setup(self, config: CoreConfig) -> None:
@@ -378,7 +373,7 @@ class CacheController(CoreController):
         def _get_db_size() -> float:
             total = 0
             for path in db_files:
-                if os.path.exists(path):
+                if Path(path).exists():
                     total += Path(path).stat().st_size
             return total / (1024 * 1024)
 

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import MusicAssistantError
+from music_assistant_models.helpers import create_safe_string
 
 from music_assistant.constants import (
     DB_TABLE_ALBUMS,
@@ -39,7 +40,6 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.music.constants import DB_SCHEMA_VERSION
 from music_assistant.controllers.music.media.genres import GenreController
-from music_assistant.helpers.compare import create_safe_string
 from music_assistant.helpers.json import json_dumps, json_loads, serialize_to_json
 from music_assistant.helpers.lyrics import normalize_lrc_lyrics
 from music_assistant.helpers.tags import legacy_accolades
@@ -966,10 +966,53 @@ async def migrate_database(  # noqa: PLR0915
                 migrated_artwork_rows,
             )
 
+    if prev_version <= 56:
+        # drop the sound effect media type from the stored playlists: clients that do not
+        # know it yet refuse to parse a playlist that advertises it. Rewriting the rows
+        # here makes upgrading enough, instead of having to wait for the next library sync.
+        # enhanced: upstream gates this at <= 55, but this branch had already spent 56 on
+        # its own listen_later step, so an enhanced database reports 56 without ever having
+        # run this repair. The UPDATE is filtered, so replaying it costs nothing.
+        await database.execute(
+            f"UPDATE {DB_TABLE_PLAYLISTS} SET supported_mediatypes = json(("
+            "SELECT json_group_array(value) FROM json_each"
+            f"({DB_TABLE_PLAYLISTS}.supported_mediatypes) WHERE value != 'sound_effect'))"
+            " WHERE json_valid(supported_mediatypes)"
+            " AND supported_mediatypes LIKE '%sound_effect%'"
+        )
+
+    if prev_version <= 56:
+        # the stable branch numbers its schema versions independently of this one, so a
+        # stable database can report a version that leapfrogs steps it never ran: stable
+        # 41-43 never got the columns this branch adds at <= 41 and <= 42. Re-add them for
+        # every pre-57 database; the ALTERs are no-ops where the column already exists.
+        for table, column in (
+            (DB_TABLE_PLAYLISTS, "[translation_key] TEXT"),
+            (DB_TABLE_PLAYLISTS, "[translation_params] json"),
+            (DB_TABLE_PLAYLOG, "[playback_speed] REAL NOT NULL DEFAULT 1.0"),
+        ):
+            try:
+                await database.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+
+    if prev_version <= 57:
+        # add is_dynamic column to radio table
+        try:
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_RADIOS} ADD COLUMN is_dynamic BOOLEAN NOT NULL DEFAULT 0"
+            )
+        except Exception as err:
+            if "duplicate column" not in str(err):
+                raise
+
     # --- enhanced-branch migrations ---
 
-    if prev_version <= 55 and await _table_exists(database, DB_TABLE_ALBUMS):
+    if prev_version <= 58 and await _table_exists(database, DB_TABLE_ALBUMS):
         # add listen_later flag + timestamp to albums (Roon-style "save for later").
+        # Gated at <= 58, not <= 55: upstream spent 56/57 on its own steps, so a stock
+        # 2.10 database arrives stamped 58 and must still gain these columns here.
         for column_sql in (
             f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",
             f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later_added_at] INTEGER;",
@@ -1057,7 +1100,6 @@ async def migrate_database(  # noqa: PLR0915
             f"SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS} "
             "WHERE media_type = 'album' AND in_library = 1)"
         )
-
     # NOTE: this genre restore runs after the <= 50 step on purpose: it inserts genres
     # with the current code/schema, so the external_ids column must be gone first.
     if prev_version <= 47:
