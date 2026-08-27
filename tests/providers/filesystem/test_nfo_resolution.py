@@ -87,6 +87,13 @@ def _tags(
     )
 
 
+# This branch's _parse_album also reads AudioTags.critical_reception and
+# .album_dynamic_range. A bare MagicMock auto-vivifies both into Mock objects,
+# which _parse_album then stamps onto album.metadata, where serialization fails
+# on the missing __mashumaro_to_dict__. Pin them to the "not measured" value.
+_UNMEASURED_TAGS = {"critical_reception": None, "album_dynamic_range": None}
+
+
 # --- album.nfo resolution ----------------------------------------------------------------
 
 
@@ -1589,6 +1596,7 @@ async def test_parse_album_scans_folder_once_when_track_dir_equals_album_dir() -
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     await provider._parse_album(track_path="Artist/CAT-1234/t1.mp3", track_tags=tags)
 
@@ -1643,6 +1651,7 @@ async def test_parse_album_never_enriches_from_the_losing_candidate_folders_own_
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(track_path="Artist/CAT-1234/t1.mp3", track_tags=tags)
 
@@ -1694,6 +1703,7 @@ async def test_parse_album_artist_resolves_from_ancestor_nfo_while_album_stays_s
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(track_path="Artist/CAT-1234/t1.mp3", track_tags=tags)
 
@@ -1730,6 +1740,7 @@ async def test_parse_album_artist_resolves_from_ancestor_name_while_album_stays_
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(
         track_path="Music/The Artist/CAT-1234/t1.mp3", track_tags=tags
@@ -1770,6 +1781,7 @@ async def test_parse_album_exact_folder_match_skips_nfo_resolution() -> None:
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(track_path="Artist/My Album/t1.mp3", track_tags=tags)
 
@@ -1816,6 +1828,7 @@ async def test_parse_album_validated_nfo_outranks_a_relaxed_date_prefix_match() 
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(
         track_path="Artist/RealAlbumFolder/2025-03-14 My Album/t1.mp3", track_tags=tags
@@ -1859,6 +1872,7 @@ async def test_parse_album_malformed_nfo_falls_through_to_relaxed_date_prefix_ma
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(
         track_path="Artist/2025-03-14 My Album/t1.mp3", track_tags=tags
@@ -1902,6 +1916,7 @@ async def test_parse_album_relaxed_match_never_trusts_a_folder_the_nfo_tier_reje
         year=None,
         album_type=AlbumType.ALBUM,
         filename="track.mp3",
+        **_UNMEASURED_TAGS,
     )
     album = await provider._parse_album(
         track_path="Artist/2025-03-14 My Album/t1.mp3", track_tags=tags
