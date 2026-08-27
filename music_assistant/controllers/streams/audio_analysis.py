@@ -256,6 +256,8 @@ class AudioAnalysisController:
         # Monotonic time of the last analysis start, and the monitor that unloads idle models.
         self._last_analysis_activity: float = 0.0
         self._idle_unload_task: asyncio.Task[None] | None = None
+        # In-flight provider finalizes: their session is already gone, but the models are not.
+        self._finalize_tasks: set[asyncio.Task[None]] = set()
 
     def setup(self) -> None:
         """Register the nightly background scan task."""
@@ -1519,7 +1521,11 @@ class AudioAnalysisController:
             return
         for provider_id in provider_ids:
             if provider := self._resolve_aa_provider(provider_id):
-                self.mass.create_task(provider.finalize(session_key))
+                # finalize runs the whole-track inference, long after the session was popped
+                # above, so track it: it is what keeps the models in use from here on.
+                task = self.mass.create_task(provider.finalize(session_key))
+                self._finalize_tasks.add(task)
+                task.add_done_callback(self._finalize_tasks.discard)
 
     def _cancel_providers(self, session_key: str) -> None:
         """Cancel each provider in the session."""
@@ -1565,7 +1571,7 @@ class AudioAnalysisController:
         """Unload heavy models once no analysis has run for MODEL_IDLE_UNLOAD_SECONDS."""
         while True:
             await asyncio.sleep(MODEL_IDLE_CHECK_INTERVAL_SECONDS)
-            if self._active_sessions:
+            if self._active_sessions or self._finalize_tasks:
                 # Keep the timer fresh while analysis is running.
                 self._last_analysis_activity = time.monotonic()
                 continue
