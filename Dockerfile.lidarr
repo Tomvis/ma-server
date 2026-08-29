@@ -4,12 +4,12 @@
 # (aiosendspin, av, etc.) are kept; the music_assistant Python source is
 # replaced wholesale with the rating-branch checkout, so server-side features
 # like critical_reception filters and listen_later are present.
-# 2.10 line: now that this branch is merged to the 2.10.0 release, pin the base
+# 2.10 line: now that this branch is merged to the 2.10.1 release, pin the base
 # to that same tag rather than tracking `latest` or `nightly`, both of which
 # move: the overlay replaces the music_assistant source wholesale, so a base
 # that has drifted past the merged source ships a venv resolved for different
 # pins than the code layered over it.
-ARG UPSTREAM=ghcr.io/music-assistant/server:2.10.0
+ARG UPSTREAM=ghcr.io/music-assistant/server:2.10.1
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
