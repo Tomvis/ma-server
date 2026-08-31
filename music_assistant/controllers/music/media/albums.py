@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -43,6 +44,7 @@ from music_assistant.helpers.compare import (
     album_tracks_have_positions,
     compare_album_evidence,
     compare_artists,
+    compare_strings,
     loose_compare_strings,
     strip_album_retail_suffix,
 )
@@ -186,6 +188,69 @@ def _coerce_float_list(values: Iterable[Any] | None) -> list[float]:
         for v in (values or ())
         if not isinstance(v, bool) and (f := try_parse_float(v, None)) is not None
     ]
+
+
+def _track_position(track: Track) -> str:
+    """
+    Return the disc/track identity of a track, counting an unset disc as disc 1.
+
+    A provider that serves single-disc releases has no disc to report: Bandcamp
+    numbers every track disc 0, while the same album tagged locally is disc 1. Keyed
+    on the raw number the two never line up, so the positional half of the album-track
+    de-duplication below silently stops working and each track reads as one the
+    library lacks.
+    """
+    return f"{track.disc_number or 1}.{track.track_number}"
+
+
+_FEAT_SUFFIX = re.compile(
+    r"\s*[([]?\s*(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]*[)\]]?\s*$", re.IGNORECASE
+)
+_RELEASE_SUFFIX = re.compile(
+    r"\s*[([](?:bonus track|bonus|remaster(?:ed)?(?: \d{4})?|live|demo|instrumental"
+    r"|[a-z ]*cover|[a-z ]*version|edit|radio edit)[^)\]]*[)\]]\s*$",
+    re.IGNORECASE,
+)
+_LEADING_TRACK_NO = re.compile(r"^\s*\d{1,2}\s*[-_.]\s*")
+
+
+def _track_name_variants(name: str) -> set[str]:
+    """
+    Return the spellings a provider may use for a track the library already holds.
+
+    A streaming listing decorates a title in ways a local tag does not: a "(feat. X)"
+    credit the tagger folded into the artist, a "(Bonus Track)" / "(2015 Remaster)"
+    marker for the edition it sells, or -- on Bandcamp, which serves whatever the
+    artist typed -- the "01-Artist-Title" filename itself. Compared on the raw title
+    alone each of those reads as a track the library is missing.
+    """
+    variants = {name}
+    for pattern in (_FEAT_SUFFIX, _RELEASE_SUFFIX, _LEADING_TRACK_NO):
+        if stripped := pattern.sub("", name).strip():
+            variants.add(stripped)
+    # "01-Amestigon-Demiurg": a filename carrying its own artist field
+    parts = name.split("-")
+    if len(parts) >= 3 and parts[0].strip().isdigit() and (rest := "-".join(parts[2:]).strip()):
+        variants.add(rest)
+    return variants
+
+
+def _names_same_track(provider_name: str, library_names: Iterable[str]) -> bool:
+    """
+    Return True if a provider track title names a track the library already holds.
+
+    The exact lowercase compare this backs up matches only identical spellings, so a
+    typographic apostrophe, an ellipsis character, a diacritic or "ft." against
+    "feat." is enough to admit a second copy of a track that is already listed.
+    """
+    library_names = list(library_names)
+    return any(
+        compare_strings(variant, library_name, strict=True)
+        or loose_compare_strings(variant, library_name)
+        or compare_strings(variant, library_name, strict=False)
+        for variant in _track_name_variants(provider_name)
+        for library_name in library_names
+    )
 
 
 def _rating_bucket_clause(
@@ -989,19 +1054,33 @@ class AlbumsController(MediaControllerBase[Album]):
         # return all (unique) items from all providers
         # because we are returning the items from all providers combined,
         # we need to make sure that we don't return duplicates
-        unique_ids: set[str] = {f"{x.disc_number}.{x.track_number}" for x in db_items}
+        unique_ids: set[str] = {_track_position(x) for x in db_items}
         unique_ids.update({f"{x.name.lower()}.{x.version.lower()}" for x in db_items})
         for db_item in db_items:
             unique_ids.update(x.item_id for x in db_item.provider_mappings)
+        library_names = [x.name for x in db_items]
         for provider_mapping in library_album.provider_mappings:
             if (
                 allowed_providers is not None
                 and provider_mapping.provider_instance not in allowed_providers
             ):
                 continue
-            provider_tracks = await self._get_provider_album_tracks(
-                provider_mapping.item_id, provider_mapping.provider_instance
-            )
+            try:
+                provider_tracks = await self._get_provider_album_tracks(
+                    provider_mapping.item_id, provider_mapping.provider_instance
+                )
+            except MusicAssistantError as err:
+                # a mapping outlives what it points at: a subsonic server reissues its
+                # ids on a rescan, a streaming release is delisted. losing that one
+                # provider's listing is the whole cost -- raising here instead fails
+                # the album outright, including the tracks held in the library.
+                self.logger.debug(
+                    "album %s: skipping album tracks from %s: %s",
+                    library_album.name,
+                    provider_mapping.provider_instance,
+                    err,
+                )
+                continue
             for provider_track in provider_tracks:
                 # In some cases (looking at you YTM) the disc/track number is not obtained from
                 # library_tracks. Ensure to update the disc/track number when interacting with
@@ -1027,11 +1106,12 @@ class AlbumsController(MediaControllerBase[Album]):
                     )
                 if provider_track.item_id in unique_ids:
                     continue
-                unique_id = f"{provider_track.disc_number}.{provider_track.track_number}"
-                if unique_id in unique_ids:
+                if _track_position(provider_track) in unique_ids:
                     continue
                 unique_id = f"{provider_track.name.lower()}.{provider_track.version.lower()}"
                 if unique_id in unique_ids:
+                    continue
+                if _names_same_track(provider_track.name, library_names):
                     continue
                 unique_ids.add(unique_id)
                 provider_track.album = library_album
