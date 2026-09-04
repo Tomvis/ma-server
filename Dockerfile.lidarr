@@ -9,7 +9,7 @@
 # move: the overlay replaces the music_assistant source wholesale, so a base
 # that has drifted past the merged source ships a venv resolved for different
 # pins than the code layered over it.
-ARG UPSTREAM=ghcr.io/music-assistant/server:2.10.1
+ARG UPSTREAM=ghcr.io/music-assistant/server:2.10.2
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
