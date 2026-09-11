@@ -12,6 +12,7 @@ import subprocess
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -55,6 +56,15 @@ TAG_SPLITTER = ";"
 # must time itself out. Do not remove this as redundant. 30s is well above the
 # worst case for a healthy file and short enough to bound the damage.
 PARSE_TAGS_TIMEOUT_SECONDS = 30
+
+# Date tags in preference order, original before the reissue and full dates before bare years.
+# ffmpeg maps the common date fields onto "date" for us, but has no mapping for the two ID3 frames
+# holding the original release, so TDOR (ID3v2.4) and TORY (ID3v2.3) arrive under their raw names.
+_RELEASE_DATE_TAGS = ("originaldate", "tdor", "originalyear", "tory", "date")
+
+# The album carries the date of the release itself, so the reissue date comes first here and the
+# original release is only a fallback. This is the reverse of the track order above.
+_ALBUM_DATE_TAGS = ("date", "originaldate", "tdor", "originalyear", "tory")
 
 
 def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
@@ -718,13 +728,18 @@ class AudioTags:
 
     @property
     def year(self) -> int | None:
-        """Return album's year if present, parsed from date."""
-        if tag := self.tags.get("originalyear"):
-            return try_parse_int(tag.split("-")[0], None)
-        if tag := self.tags.get("originaldate"):
-            return try_parse_int(tag.split("-")[0], None)
-        if tag := self.tags.get("date"):
-            return try_parse_int(tag.split("-")[0], None)
+        """Return the year the album was released, if present."""
+        for tag_name in _ALBUM_DATE_TAGS:
+            if (tag := self.tags.get(tag_name)) and (parsed := _parse_release_date(tag)):
+                return parsed.year
+        return None
+
+    @property
+    def release_date(self) -> datetime | None:
+        """Return the date the track was originally released, if present."""
+        for tag_name in _RELEASE_DATE_TAGS:
+            if (tag := self.tags.get(tag_name)) and (parsed := _parse_release_date(tag)):
+                return parsed
         return None
 
     @property
@@ -998,6 +1013,10 @@ class AudioTags:
         if audio_stream is None:
             msg = "No audio stream found"
             raise InvalidDataError(msg)
+        if not audio_stream.get("channels"):
+            # ffprobe reports zero channels when it cannot decode the file
+            msg = "No audio channels found, file is probably corrupt"
+            raise InvalidDataError(msg)
         has_cover_image = any(
             x for x in raw["streams"] if x.get("codec_name", "") in ("mjpeg", "png")
         )
@@ -1018,7 +1037,7 @@ class AudioTags:
         return AudioTags(
             raw=raw,
             sample_rate=int(audio_stream.get("sample_rate", 44100)),
-            channels=audio_stream.get("channels", 2),
+            channels=int(audio_stream["channels"]),
             bits_per_sample=int(
                 audio_stream.get("bits_per_raw_sample", audio_stream.get("bits_per_sample")) or 16
             ),
@@ -1334,6 +1353,15 @@ def _parse_mp4_tags(tags: MP4Tags) -> dict[str, Any]:  # noqa: PLR0915
         result["replaygainalbumgain"] = _decode_mp4_freeform_single(
             tags["----:com.apple.iTunes:REPLAYGAIN_ALBUM_GAIN"]
         )
+
+    # the original release date has no atom of its own, so taggers store it as a freeform
+    # tag in whatever casing they favour, and ffprobe does not expose freeform atoms at all
+    for atom, values in tags.items():  # type: ignore[no-untyped-call]
+        if not atom.startswith("----:com.apple.iTunes:"):
+            continue
+        name = atom.removeprefix("----:com.apple.iTunes:").lower()
+        if name in ("originaldate", "originalyear"):
+            result[name] = _decode_mp4_freeform_single(values)
 
     return result
 
@@ -2150,3 +2178,19 @@ def _apply_artist_mbid_tag(tags: Any, artist_mbids: list[str]) -> bool:
     except Exception as err:
         LOGGER.warning("unexpected failure applying MusicBrainz Artist Id: %s", err)
         return False
+
+
+def _parse_release_date(value: str) -> datetime | None:
+    """Return a date tag as a datetime, or None if it does not hold a date."""
+    value = value.strip()
+    with suppress(ValueError):
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    # a date can be tagged to the month or to the year alone, which taggers write through as is
+    if len(value) >= 7:
+        with suppress(ValueError):
+            return datetime.strptime(value[:7], "%Y-%m").replace(tzinfo=UTC)
+    if len(value) >= 4 and (year := try_parse_int(value[:4], None)):
+        with suppress(ValueError):
+            return datetime(year, 1, 1, tzinfo=UTC)
+    return None
