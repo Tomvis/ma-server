@@ -555,242 +555,6 @@ class OpenSonicProvider(MusicProvider):
                 offset=offset,
             )
 
-    async def _enrich_album_with_critical_reception(
-        self, album: Album, prov_album_id: str, sonic_album: SonicAlbum | None = None
-    ) -> None:
-        """
-        Populate album CR + album-scope DR by ffprobing one track of the album.
-
-        :param sonic_album: Pre-fetched album record forwarded to the CR fetch so callers
-            that already paid for ``conn.get_album`` skip a redundant round-trip on cache miss.
-        """
-        try:
-            cr, album_dr = await self._get_album_critical_reception(prov_album_id, sonic_album)
-        except Exception as err:
-            self.logger.debug(
-                "critical_reception extraction failed for album %s: %s", prov_album_id, err
-            )
-            return
-        if cr is not None:
-            album.metadata.critical_reception = cr
-        if album_dr is not None:
-            album.metadata.dynamic_range = album_dr
-
-    async def _get_album_critical_reception(
-        self,
-        prov_album_id: str,
-        sonic_album: SonicAlbum | None = None,
-    ) -> tuple[CriticalReception | None, float | None]:
-        """
-        Fetch one track of an album, ffprobe it, return (CR, album_dr).
-
-        Cached per album_id for ``CRITICAL_RECEPTION_CACHE_TTL`` so bulk library sync
-        doesn't re-ffprobe every album on each run. Only outcomes of a cleanly completed
-        probe are cached (including the clean "no tags" negative); transient outcomes —
-        album fetch failure, every probe erroring, or the whole-album probe budget of
-        ``_CR_PROBE_ALBUM_BUDGET_SECONDS`` running out — return (possibly partial) results
-        without writing this cache, so a later sync re-probes. Note that only *this* cache
-        is skipped: ``get_album`` carries its own ``@use_cache``, so a transient result
-        reached through it is still served from that cache for its own, shorter TTL.
-
-        :param sonic_album: Pre-fetched album record; lets callers that already paid
-            for ``conn.get_album`` skip the round-trip on cache miss.
-        """
-        # Bind the cache key to the configured server URL so a config edit that
-        # repoints this provider at a different Subsonic server doesn't return
-        # stale CR/DR for an album_id that happens to collide.
-        cache_key = f"{self._cr_cache_namespace()}:{prov_album_id}"
-        cached = await self.mass.cache.get(
-            key=cache_key,
-            provider=self.instance_id,
-            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-            default=None,
-        )
-        if cached is not None:
-            # A stored entry is itself proof that a probe ran cleanly; legacy
-            # {"ok": False} entries decode to (None, None), the same cached
-            # clean negative they always meant.
-            return (
-                CriticalReception.from_dict(cr_data) if (cr_data := cached.get("cr")) else None,
-                float(dr_data) if (dr_data := cached.get("dr")) is not None else None,
-            )
-        if sonic_album is None:
-            try:
-                sonic_album = await self.conn.get_album(prov_album_id)
-            except ParameterError, DataNotFoundError:
-                sonic_album = None
-        if sonic_album is None or not sonic_album.song:
-            # Don't cache "no songs" or "fetch failed" — those states can change
-            # (user uploads tracks, server comes back) and a month-long negative
-            # cache would block a follow-up sync from re-probing.
-            return None, None
-        # Try a handful of tracks and OR-merge their signals. A bonus / hidden
-        # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
-        # later track carries DR but no CR — break out only once both have been
-        # observed (or we run out of attempts or time) so neither signal is lost.
-        # Cost note: these probes run SEQUENTIALLY and each one can burn the full
-        # PARSE_TAGS_TIMEOUT_SECONDS inside ffprobe on top of its stream fetch, so the
-        # loop as a whole — not each attempt — is bounded by _CR_PROBE_ALBUM_BUDGET_SECONDS,
-        # independent of _CR_PROBE_SONG_ATTEMPTS. Scope is deliberately just this loop: the
-        # cache round-trips and the conn.get_album fetch above sit outside it, so the budget
-        # bounds the probing, not this method end-to-end. Nothing here can stop an ffprobe
-        # already running in an executor thread; the budget bounds the caller's wait, not
-        # the work, and a probe abandoned by the timeout runs on until PARSE_TAGS_TIMEOUT_SECONDS
-        # kills it. Its temp file is still cleaned up: the `finally` in the probe helper is
-        # entered by the CancelledError and gets to run its own awaits, because
-        # asyncio.timeout cancels exactly once at the deadline — though those are two more
-        # default-executor hops, so a saturated pool can stretch the unwind past the budget.
-        cr: CriticalReception | None = None
-        album_dr: float | None = None
-        # Distinguish "probe ran cleanly and found nothing" from "every probe attempt
-        # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
-        # a transient failure returns bare None and is skipped below.
-        probed_clean = False
-        started_at = asyncio.get_running_loop().time()
-        try:
-            async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
-                for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
-                    probe = await self._extract_critical_reception_from_song(sonic_song.id)
-                    if probe is None:
-                        continue
-                    probed_clean = True
-                    probe_cr, probe_dr = probe
-                    if cr is None and probe_cr is not None:
-                        cr = probe_cr
-                    if album_dr is None and probe_dr is not None:
-                        album_dr = probe_dr
-                    if cr is not None and album_dr is not None:
-                        break
-        except TimeoutError:
-            # Either the budget ran out, or a probe raised a TimeoutError of its own —
-            # aiohttp's ServerTimeoutError subclasses it, and conn.stream errors are not
-            # covered by the probe helper's `except Exception`. Both abort the loop, so
-            # distinguish them by elapsed time rather than logging a budget we may not
-            # have spent. Transient either way: hand back whatever earlier probes already
-            # produced (possibly (None, None)) but do NOT write the CR cache, or a
-            # partial/empty result gets pinned for CRITICAL_RECEPTION_CACHE_TTL. The next
-            # sync re-probes and can complete the picture.
-            elapsed = asyncio.get_running_loop().time() - started_at
-            if elapsed >= _CR_PROBE_ALBUM_BUDGET_SECONDS:
-                self.logger.debug(
-                    "critical_reception probe budget of %ss exhausted for album %s",
-                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
-                    prov_album_id,
-                )
-            else:
-                self.logger.debug(
-                    "critical_reception probe for album %s timed out after %.1fs "
-                    "(inside the %ss budget — likely a stalled stream read)",
-                    prov_album_id,
-                    elapsed,
-                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
-                )
-            return cr, album_dr
-        if not probed_clean:
-            # Every probe attempt errored transiently (stream/ffprobe failure) rather
-            # than cleanly finding no tags. Don't pin a month-long negative cache — mirror
-            # the "fetch failed" path above so the next sync re-probes once it recovers.
-            return None, None
-        await self.mass.cache.set(
-            key=cache_key,
-            data={"cr": cr.to_dict() if cr is not None else None, "dr": album_dr},
-            provider=self.instance_id,
-            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-            expiration=CRITICAL_RECEPTION_CACHE_TTL,
-        )
-        return cr, album_dr
-
-    def _cr_cache_namespace(self) -> str:
-        """
-        Stable, URL-derived prefix for the CR cache key.
-
-        Without this prefix the cache key is just ``prov_album_id`` — a config
-        edit that swings this provider over to a different Subsonic server
-        keeps the same MA provider instance_id but the album IDs no longer
-        refer to the same albums, so the cache returns stale CR/DR for the
-        new server. Hashing the URL bumps the namespace on any URL change.
-        """
-        url = str(self.config.get_value(CONF_BASE_URL) or "")
-        if not url:
-            return "default"
-        # md5 is fine here — this is a cache namespace, not a security boundary.
-        return hashlib.md5(url.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
-
-    async def _extract_critical_reception_from_song(
-        self, song_id: str
-    ) -> tuple[CriticalReception | None, float | None] | None:
-        """
-        Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
-
-        Album-scope DR is the upstream tag writer's ALBUM_DYNAMIC_RANGE — same value
-        on every track, so reading any one of them gives us the album-level number.
-        """
-        # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
-        # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
-        # for some containers (M4A 'moov' atom can sit before mdat but ffprobe still
-        # wants the file size to validate offsets); a temp file sidesteps all of it.
-        try:
-            resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
-        except ParameterError, DataNotFoundError:
-            return None
-        # mkstemp is synchronous (single syscall; not worth the executor hop) and
-        # creates the temp file before any await, so the outer try/finally that
-        # owns the cleanup is entered without a cancellation hole. We close the fd
-        # right away — the prefix is buffered in memory and persisted in one write
-        # below. The aiohttp ClientResponse must be released even if mkstemp raises
-        # (OSError on tmpdir EACCES / ENFILE / disk full), so wrap the whole flow
-        # in `async with resp:` so a mkstemp failure still triggers __aexit__.
-        tmp_path: str | None = None
-        try:
-            async with resp:
-                tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
-                os.close(tmp_fd)
-                # Accumulate the prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
-                # resident), then persist it in a single executor hop below.
-                buf = bytearray()
-                probe_bytes: bytes | None = None
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    if not chunk:
-                        break
-                    remaining = CRITICAL_RECEPTION_PROBE_BYTES - len(buf)
-                    if remaining <= 0:
-                        break
-                    buf += chunk[:remaining] if len(chunk) > remaining else chunk
-                    # FLAC keeps its tags in a VORBIS_COMMENT block that the tag
-                    # writer places before the (often multi-MB) embedded cover art.
-                    # Trim to a minimal metadata-only FLAC as soon as that block is
-                    # complete: otherwise a large PICTURE block pushes the metadata
-                    # past the byte cap and ffprobe rejects the truncated file,
-                    # dropping tags that actually sit near the start.
-                    if (flac := _flac_tag_prefix(buf)) is not None:
-                        probe_bytes = flac
-                        break
-                    if len(buf) >= CRITICAL_RECEPTION_PROBE_BYTES:
-                        break
-            if probe_bytes is None:
-                probe_bytes = bytes(buf)
-            if not probe_bytes:
-                return None
-            await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
-            # No outer asyncio.wait_for here: async_parse_tags runs parse_tags via
-            # asyncio.to_thread, so cancelling the await would abandon — not stop —
-            # the executor thread. The work is bounded from the inside instead:
-            # the ffprobe subprocess is capped by PARSE_TAGS_TIMEOUT_SECONDS (a hung
-            # ffprobe is killed there and surfaces here as an exception), and the
-            # parse_tags_mutagen pass that follows — which always runs, since
-            # tmp_path is a local existing file — is untimed but is a pure in-memory
-            # parse of a prefix of at most CRITICAL_RECEPTION_PROBE_BYTES. The caller's
-            # wait is bounded separately, per album rather than per probe, by
-            # _CR_PROBE_ALBUM_BUDGET_SECONDS.
-            try:
-                tags = await async_parse_tags(tmp_path)
-            except Exception:
-                return None
-            return tags.critical_reception, tags.album_dynamic_range
-        finally:
-            if tmp_path is not None:
-                await remove_file(tmp_path)
-
     async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
         """Provide a generator for library playlists."""
         results = await self.conn.get_playlists()
@@ -1438,3 +1202,239 @@ class OpenSonicProvider(MusicProvider):
         for sonic_album in albums:
             recent.items.append(parse_album(self.logger, self.instance_id, sonic_album))
         return recent
+
+    async def _enrich_album_with_critical_reception(
+        self, album: Album, prov_album_id: str, sonic_album: SonicAlbum | None = None
+    ) -> None:
+        """
+        Populate album CR + album-scope DR by ffprobing one track of the album.
+
+        :param sonic_album: Pre-fetched album record forwarded to the CR fetch so callers
+            that already paid for ``conn.get_album`` skip a redundant round-trip on cache miss.
+        """
+        try:
+            cr, album_dr = await self._get_album_critical_reception(prov_album_id, sonic_album)
+        except Exception as err:
+            self.logger.debug(
+                "critical_reception extraction failed for album %s: %s", prov_album_id, err
+            )
+            return
+        if cr is not None:
+            album.metadata.critical_reception = cr
+        if album_dr is not None:
+            album.metadata.dynamic_range = album_dr
+
+    async def _get_album_critical_reception(
+        self,
+        prov_album_id: str,
+        sonic_album: SonicAlbum | None = None,
+    ) -> tuple[CriticalReception | None, float | None]:
+        """
+        Fetch one track of an album, ffprobe it, return (CR, album_dr).
+
+        Cached per album_id for ``CRITICAL_RECEPTION_CACHE_TTL`` so bulk library sync
+        doesn't re-ffprobe every album on each run. Only outcomes of a cleanly completed
+        probe are cached (including the clean "no tags" negative); transient outcomes —
+        album fetch failure, every probe erroring, or the whole-album probe budget of
+        ``_CR_PROBE_ALBUM_BUDGET_SECONDS`` running out — return (possibly partial) results
+        without writing this cache, so a later sync re-probes. Note that only *this* cache
+        is skipped: ``get_album`` carries its own ``@use_cache``, so a transient result
+        reached through it is still served from that cache for its own, shorter TTL.
+
+        :param sonic_album: Pre-fetched album record; lets callers that already paid
+            for ``conn.get_album`` skip the round-trip on cache miss.
+        """
+        # Bind the cache key to the configured server URL so a config edit that
+        # repoints this provider at a different Subsonic server doesn't return
+        # stale CR/DR for an album_id that happens to collide.
+        cache_key = f"{self._cr_cache_namespace()}:{prov_album_id}"
+        cached = await self.mass.cache.get(
+            key=cache_key,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+            default=None,
+        )
+        if cached is not None:
+            # A stored entry is itself proof that a probe ran cleanly; legacy
+            # {"ok": False} entries decode to (None, None), the same cached
+            # clean negative they always meant.
+            return (
+                CriticalReception.from_dict(cr_data) if (cr_data := cached.get("cr")) else None,
+                float(dr_data) if (dr_data := cached.get("dr")) is not None else None,
+            )
+        if sonic_album is None:
+            try:
+                sonic_album = await self.conn.get_album(prov_album_id)
+            except ParameterError, DataNotFoundError:
+                sonic_album = None
+        if sonic_album is None or not sonic_album.song:
+            # Don't cache "no songs" or "fetch failed" — those states can change
+            # (user uploads tracks, server comes back) and a month-long negative
+            # cache would block a follow-up sync from re-probing.
+            return None, None
+        # Try a handful of tracks and OR-merge their signals. A bonus / hidden
+        # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
+        # later track carries DR but no CR — break out only once both have been
+        # observed (or we run out of attempts or time) so neither signal is lost.
+        # Cost note: these probes run SEQUENTIALLY and each one can burn the full
+        # PARSE_TAGS_TIMEOUT_SECONDS inside ffprobe on top of its stream fetch, so the
+        # loop as a whole — not each attempt — is bounded by _CR_PROBE_ALBUM_BUDGET_SECONDS,
+        # independent of _CR_PROBE_SONG_ATTEMPTS. Scope is deliberately just this loop: the
+        # cache round-trips and the conn.get_album fetch above sit outside it, so the budget
+        # bounds the probing, not this method end-to-end. Nothing here can stop an ffprobe
+        # already running in an executor thread; the budget bounds the caller's wait, not
+        # the work, and a probe abandoned by the timeout runs on until PARSE_TAGS_TIMEOUT_SECONDS
+        # kills it. Its temp file is still cleaned up: the `finally` in the probe helper is
+        # entered by the CancelledError and gets to run its own awaits, because
+        # asyncio.timeout cancels exactly once at the deadline — though those are two more
+        # default-executor hops, so a saturated pool can stretch the unwind past the budget.
+        cr: CriticalReception | None = None
+        album_dr: float | None = None
+        # Distinguish "probe ran cleanly and found nothing" from "every probe attempt
+        # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
+        # a transient failure returns bare None and is skipped below.
+        probed_clean = False
+        started_at = asyncio.get_running_loop().time()
+        try:
+            async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
+                for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
+                    probe = await self._extract_critical_reception_from_song(sonic_song.id)
+                    if probe is None:
+                        continue
+                    probed_clean = True
+                    probe_cr, probe_dr = probe
+                    if cr is None and probe_cr is not None:
+                        cr = probe_cr
+                    if album_dr is None and probe_dr is not None:
+                        album_dr = probe_dr
+                    if cr is not None and album_dr is not None:
+                        break
+        except TimeoutError:
+            # Either the budget ran out, or a probe raised a TimeoutError of its own —
+            # aiohttp's ServerTimeoutError subclasses it, and conn.stream errors are not
+            # covered by the probe helper's `except Exception`. Both abort the loop, so
+            # distinguish them by elapsed time rather than logging a budget we may not
+            # have spent. Transient either way: hand back whatever earlier probes already
+            # produced (possibly (None, None)) but do NOT write the CR cache, or a
+            # partial/empty result gets pinned for CRITICAL_RECEPTION_CACHE_TTL. The next
+            # sync re-probes and can complete the picture.
+            elapsed = asyncio.get_running_loop().time() - started_at
+            if elapsed >= _CR_PROBE_ALBUM_BUDGET_SECONDS:
+                self.logger.debug(
+                    "critical_reception probe budget of %ss exhausted for album %s",
+                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
+                    prov_album_id,
+                )
+            else:
+                self.logger.debug(
+                    "critical_reception probe for album %s timed out after %.1fs "
+                    "(inside the %ss budget — likely a stalled stream read)",
+                    prov_album_id,
+                    elapsed,
+                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
+                )
+            return cr, album_dr
+        if not probed_clean:
+            # Every probe attempt errored transiently (stream/ffprobe failure) rather
+            # than cleanly finding no tags. Don't pin a month-long negative cache — mirror
+            # the "fetch failed" path above so the next sync re-probes once it recovers.
+            return None, None
+        await self.mass.cache.set(
+            key=cache_key,
+            data={"cr": cr.to_dict() if cr is not None else None, "dr": album_dr},
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+            expiration=CRITICAL_RECEPTION_CACHE_TTL,
+        )
+        return cr, album_dr
+
+    def _cr_cache_namespace(self) -> str:
+        """
+        Stable, URL-derived prefix for the CR cache key.
+
+        Without this prefix the cache key is just ``prov_album_id`` — a config
+        edit that swings this provider over to a different Subsonic server
+        keeps the same MA provider instance_id but the album IDs no longer
+        refer to the same albums, so the cache returns stale CR/DR for the
+        new server. Hashing the URL bumps the namespace on any URL change.
+        """
+        url = str(self.config.get_value(CONF_BASE_URL) or "")
+        if not url:
+            return "default"
+        # md5 is fine here — this is a cache namespace, not a security boundary.
+        return hashlib.md5(url.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+    async def _extract_critical_reception_from_song(
+        self, song_id: str
+    ) -> tuple[CriticalReception | None, float | None] | None:
+        """
+        Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
+
+        Album-scope DR is the upstream tag writer's ALBUM_DYNAMIC_RANGE — same value
+        on every track, so reading any one of them gives us the album-level number.
+        """
+        # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
+        # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
+        # for some containers (M4A 'moov' atom can sit before mdat but ffprobe still
+        # wants the file size to validate offsets); a temp file sidesteps all of it.
+        try:
+            resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
+        except ParameterError, DataNotFoundError:
+            return None
+        # mkstemp is synchronous (single syscall; not worth the executor hop) and
+        # creates the temp file before any await, so the outer try/finally that
+        # owns the cleanup is entered without a cancellation hole. We close the fd
+        # right away — the prefix is buffered in memory and persisted in one write
+        # below. The aiohttp ClientResponse must be released even if mkstemp raises
+        # (OSError on tmpdir EACCES / ENFILE / disk full), so wrap the whole flow
+        # in `async with resp:` so a mkstemp failure still triggers __aexit__.
+        tmp_path: str | None = None
+        try:
+            async with resp:
+                tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
+                os.close(tmp_fd)
+                # Accumulate the prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
+                # resident), then persist it in a single executor hop below.
+                buf = bytearray()
+                probe_bytes: bytes | None = None
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    if not chunk:
+                        break
+                    remaining = CRITICAL_RECEPTION_PROBE_BYTES - len(buf)
+                    if remaining <= 0:
+                        break
+                    buf += chunk[:remaining] if len(chunk) > remaining else chunk
+                    # FLAC keeps its tags in a VORBIS_COMMENT block that the tag
+                    # writer places before the (often multi-MB) embedded cover art.
+                    # Trim to a minimal metadata-only FLAC as soon as that block is
+                    # complete: otherwise a large PICTURE block pushes the metadata
+                    # past the byte cap and ffprobe rejects the truncated file,
+                    # dropping tags that actually sit near the start.
+                    if (flac := _flac_tag_prefix(buf)) is not None:
+                        probe_bytes = flac
+                        break
+                    if len(buf) >= CRITICAL_RECEPTION_PROBE_BYTES:
+                        break
+            if probe_bytes is None:
+                probe_bytes = bytes(buf)
+            if not probe_bytes:
+                return None
+            await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
+            # No outer asyncio.wait_for here: async_parse_tags runs parse_tags via
+            # asyncio.to_thread, so cancelling the await would abandon — not stop —
+            # the executor thread. The work is bounded from the inside instead:
+            # the ffprobe subprocess is capped by PARSE_TAGS_TIMEOUT_SECONDS (a hung
+            # ffprobe is killed there and surfaces here as an exception), and the
+            # parse_tags_mutagen pass that follows — which always runs, since
+            # tmp_path is a local existing file — is untimed but is a pure in-memory
+            # parse of a prefix of at most CRITICAL_RECEPTION_PROBE_BYTES. The caller's
+            # wait is bounded separately, per album rather than per probe, by
+            # _CR_PROBE_ALBUM_BUDGET_SECONDS.
+            try:
+                tags = await async_parse_tags(tmp_path)
+            except Exception:
+                return None
+            return tags.critical_reception, tags.album_dynamic_range
+        finally:
+            if tmp_path is not None:
+                await remove_file(tmp_path)
