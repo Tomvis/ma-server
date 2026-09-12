@@ -42,9 +42,6 @@ docs/superpowers
 devenv.local.nix
 devenv.local.yaml
 
-# VS Code
-.vscode/launch.json
-
 # Rating-branch overlay artifacts. The *_overlay/ dirs are populated by
 # scripts/staging for Dockerfile.lidarr's overlay-based image build; they
 # mirror installed venv packages and are recreated locally as needed.
