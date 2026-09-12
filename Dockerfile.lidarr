@@ -11,7 +11,7 @@
 # 2.11 line: `enhanced` merged origin/dev at 84c812a60, which is
 # 2.11.0.dev2026091103 + 5 commits; none of those five touch requirements_all.txt
 # or pyproject.toml, so this base's venv matches the layered code.
-ARG UPSTREAM=ghcr.io/music-assistant/server:2.11.0.dev2026091103
+ARG UPSTREAM=ghcr.io/music-assistant/server:2.11.0.dev2026091203
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
