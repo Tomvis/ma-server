@@ -272,7 +272,10 @@ async def test_finalize_raises_when_the_decoder_failed() -> None:
     session_data, streamdetails = _make_session_data()
     session_data.chunks_received = MIN_DURATION_SECONDS + 1
     session_data.eof_sent = True
-    cast("MagicMock", session_data.ffmpeg).wait = AsyncMock(side_effect=RuntimeError("ffmpeg died"))
+    # the fork waits through wait_with_timeout() (hang guard), not bare wait()
+    cast("MagicMock", session_data.ffmpeg).wait_with_timeout = AsyncMock(
+        side_effect=RuntimeError("ffmpeg died")
+    )
     provider._data["sess"] = session_data
     provider._sessions["sess"] = AnalysisSessionData(
         streamdetails=streamdetails,
@@ -285,6 +288,31 @@ async def test_finalize_raises_when_the_decoder_failed() -> None:
 
     assert excinfo.value.retry_at is not None
     assert excinfo.value.retry_at >= before + DECODE_FAILURE_RETRY_DELAY
+
+
+@pytest.mark.asyncio
+async def test_finalize_drops_the_session_when_ffmpeg_hangs() -> None:
+    """
+    An ffmpeg that never exits after EOF is dropped, not recorded as a track failure.
+
+    A hang is a symptom of this box, not of the audio, so the track stays pending for a
+    later run instead of being written to the failures overview. The decoder must still
+    be closed on the way out.
+    """
+    provider = _make_provider()
+    session_data, streamdetails = _make_session_data()
+    session_data.chunks_received = MIN_DURATION_SECONDS + 1
+    session_data.eof_sent = True
+    ffmpeg = cast("MagicMock", session_data.ffmpeg)
+    ffmpeg.wait_with_timeout = AsyncMock(side_effect=TimeoutError)
+    provider._data["sess"] = session_data
+    provider._sessions["sess"] = AnalysisSessionData(
+        streamdetails=streamdetails,
+        audio_format=MagicMock(),
+    )
+
+    assert await provider._finalize("sess") is None
+    ffmpeg.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
