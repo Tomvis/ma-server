@@ -87,6 +87,9 @@ class ListenLaterProvider(PluginProvider):
         self._unregister_handles.append(
             self.mass.subscribe(self._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED)
         )
+        self._unregister_handles.append(
+            self.mass.subscribe(self._on_media_item_deleted, EventType.MEDIA_ITEM_DELETED)
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
@@ -135,4 +138,22 @@ class ListenLaterProvider(PluginProvider):
             self._saved_uris.add(item.uri)
         else:
             self._saved_uris.discard(item.uri)
+        self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
+
+    async def _on_media_item_deleted(self, event: MassEvent) -> None:
+        """
+        Drop a deleted album from the shelf snapshot and refresh the row.
+
+        Deletion never flips listen_later, so it does not reach the updated handler.
+        Without this the uri lingers in the snapshot, and a future album reusing it
+        would be mistaken for an item already on the shelf -- impossible today, since
+        albums.item_id is AUTOINCREMENT and ids are never reused, but the snapshot
+        would still slowly accumulate entries for records that no longer exist.
+        """
+        item = event.data
+        if not isinstance(item, Album) or not item.uri:
+            return
+        if item.uri not in self._saved_uris:
+            return
+        self._saved_uris.discard(item.uri)
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})

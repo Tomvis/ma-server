@@ -139,7 +139,7 @@ async def test_unload_releases_the_subscription(
     """unload() releases every handle it registered."""
     provider, _signal, unregister, _mass = plugin
     await provider.unload()
-    unregister.assert_called_once()
+    assert unregister.call_count == 2
     assert provider._unregister_handles == []
 
 
@@ -154,9 +154,7 @@ async def test_subscribes_to_media_item_updated(
     stays green.
     """
     provider, _signal, _unregister, mass = plugin
-    mass.subscribe.assert_called_once_with(
-        provider._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED
-    )
+    mass.subscribe.assert_any_call(provider._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED)
 
 
 async def test_seed_query_requests_the_full_shelf(
@@ -197,4 +195,48 @@ async def test_unloading_before_subscribe_skips_the_subscription() -> None:
     await provider.loaded_in_mass()
 
     mass.subscribe.assert_not_called()
+    assert provider._unregister_handles == []
+
+
+async def test_deleting_a_saved_album_drops_it_and_refreshes(
+    plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """A deleted album leaves the shelf snapshot and refreshes the row."""
+    provider, signal, _unregister, _mass = plugin
+    deleted = _album("library://album/1", listen_later=True)
+    event = MassEvent(event=EventType.MEDIA_ITEM_DELETED, object_id=deleted.uri, data=deleted)
+
+    await provider._on_media_item_deleted(event)
+
+    assert "library://album/1" not in provider._saved_uris
+    signal.assert_called_once_with({"event": EVENT_RECOMMENDATIONS_UPDATED})
+
+
+async def test_deleting_an_unsaved_album_signals_nothing(
+    plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """Deleting an album that was never on the shelf is not a shelf change."""
+    provider, signal, _unregister, _mass = plugin
+    gone = _album("library://album/99", listen_later=False)
+    event = MassEvent(event=EventType.MEDIA_ITEM_DELETED, object_id=gone.uri, data=gone)
+
+    await provider._on_media_item_deleted(event)
+
+    signal.assert_not_called()
+
+
+async def test_both_subscriptions_are_registered_and_released(
+    plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """Updated and deleted are both watched, and both handles are released."""
+    provider, _signal, unregister, mass = plugin
+    # assert the event types, not just the count: subscribing the deleted handler to
+    # the wrong EventType would leave this green while the feature silently died
+    mass.subscribe.assert_any_call(provider._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED)
+    mass.subscribe.assert_any_call(provider._on_media_item_deleted, EventType.MEDIA_ITEM_DELETED)
+    assert len(provider._unregister_handles) == 2
+
+    await provider.unload()
+
+    assert unregister.call_count == 2
     assert provider._unregister_handles == []
