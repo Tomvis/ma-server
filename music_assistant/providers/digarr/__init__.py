@@ -101,9 +101,9 @@ class DigarrProvider(PluginProvider):
                 key=CONF_MA_USER,
                 type=ConfigEntryType.STRING,
                 required=True,
-                # An empty list would render as a picker with nothing to pick; None
-                # falls back to free text so the field stays usable either way.
-                options=users or None,
+                # An empty list is the framework's own "no options" value: it's what makes
+                # this render as free text instead of an unusable empty picker.
+                options=users,
                 default_value=self.config.get_value(CONF_MA_USER),
             ),
             ConfigEntry(
