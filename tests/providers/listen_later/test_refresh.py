@@ -112,7 +112,13 @@ async def test_unrelated_unsaved_album_signals_nothing(
 async def test_non_album_items_are_ignored(
     plugin: tuple[ListenLaterProvider, MagicMock, MagicMock],
 ) -> None:
-    """Only albums carry the shelf flag; other media types are skipped."""
+    """
+    Only albums carry the shelf flag; other media types are skipped.
+
+    listen_later=True on a URI outside the seeded set would, without the isinstance
+    guard, look like a genuine 0->1 transition and fire a signal -- so this only stays
+    silent because the type check skips it, not because it happens to be a no-op.
+    """
     provider, signal, _unregister = plugin
     track = Track(
         item_id="5",
@@ -120,6 +126,7 @@ async def test_non_album_items_are_ignored(
         name="So What",
         provider_mappings=set(),
         uri="library://track/5",
+        listen_later=True,
     )
     await provider._on_media_item_updated(_event(track))
     signal.assert_not_called()
