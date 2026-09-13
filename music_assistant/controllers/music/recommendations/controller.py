@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import MediaType, ProviderFeature
-from music_assistant_models.media_items import Album, UniqueList
+from music_assistant_models.media_items import Album, ItemMapping, UniqueList
 
 from music_assistant.constants import MASS_LOGGER_NAME
 from music_assistant.controllers.music.constants import (
@@ -22,7 +22,6 @@ from music_assistant.providers.recommendations import LibraryRecommendationsProv
 if TYPE_CHECKING:
     from music_assistant_models.media_items import (
         BrowseFolder,
-        ItemMapping,
         MediaItemType,
         RecommendationFolder,
     )
@@ -124,27 +123,41 @@ class RecommendationsController:
         self, items: UniqueList[MediaItemType | ItemMapping | BrowseFolder]
     ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
         """
-        Copy library critical-reception and dynamic-range onto provider album items.
+        Give album row items the critical-reception and dynamic-range the library holds.
 
-        Rows served straight from a streaming or subsonic provider hand back items that
-        were never matched to their library counterpart, so the album badges the clients
-        render have nothing to read -- even when the very same album sits in the library
-        carrying the data. Graft only those two metadata values across, leaving item_id,
-        provider and uri untouched so navigation, playback and de-duplication behave
-        exactly as before.
+        Two shapes arrive without badge data and need different treatment:
+
+        - A provider album (subsonic, tidal) that was never matched to its library
+          counterpart. Graft the two metadata values across and leave item_id, provider
+          and uri alone, so navigation, playback and de-duplication are unaffected.
+        - A minimized library row -- ``recently_played`` and friends return ItemMapping,
+          which has no metadata field at all, so there is nowhere to graft. Swap in the
+          full library album instead. It wears the identical ``library://album/<id>``
+          uri, so this is the same item, only complete.
 
         Never raises and never drops items: on timeout or lookup failure the row is
         returned as it arrived.
         """
-        targets = [
-            item
-            for item in items
-            if item.media_type == MediaType.ALBUM
-            and item.provider != "library"
-            and getattr(item, "metadata", None) is not None
-            and item.metadata.critical_reception is None
-            and item.metadata.dynamic_range is None
-        ]
+        upgrades: list[int] = []
+        grafts: list[int] = []
+        for index, item in enumerate(items):
+            if item.media_type != MediaType.ALBUM:
+                continue
+            if isinstance(item, ItemMapping):
+                # only library mappings may be swapped: replacing a provider mapping
+                # would rewrite its uri and move the card to a different album page
+                if item.provider == "library":
+                    upgrades.append(index)
+                continue
+            if item.provider == "library":
+                continue
+            if (
+                item.metadata.critical_reception is not None
+                or item.metadata.dynamic_range is not None
+            ):
+                continue
+            grafts.append(index)
+        targets = upgrades + grafts
         if not targets:
             return items
         try:
@@ -152,23 +165,30 @@ class RecommendationsController:
                 matches = await asyncio.gather(
                     *(
                         self.mass.music.albums.get_library_item_by_prov_id(
-                            item.item_id, item.provider
+                            items[index].item_id, items[index].provider
                         )
-                        for item in targets
+                        for index in targets
                     ),
                     return_exceptions=True,
                 )
         except TimeoutError:
             self.logger.debug("Timeout enriching album badges; serving the row unenriched")
             return items
-        for item, match in zip(targets, matches, strict=True):
+        enriched = list(items)
+        for index, match in zip(targets, matches, strict=True):
             if not isinstance(match, Album) or match.metadata is None:
+                continue
+            if index in upgrades:
+                enriched[index] = match
+                continue
+            item = enriched[index]
+            if isinstance(item, ItemMapping):
                 continue
             if match.metadata.critical_reception is not None:
                 item.metadata.critical_reception = match.metadata.critical_reception
             if match.metadata.dynamic_range is not None:
                 item.metadata.dynamic_range = match.metadata.dynamic_range
-        return items
+        return UniqueList(enriched)
 
     async def _provider_rows(
         self, provider: MusicProvider | MetadataProvider | PluginProvider

@@ -138,3 +138,39 @@ async def test_a_failing_lookup_never_drops_the_row(
 
     assert len(out) == 1
     assert out[0].metadata.dynamic_range is None
+
+
+async def test_library_item_mapping_albums_are_upgraded_to_full_albums(
+    controller: RecommendationsController,
+) -> None:
+    """recently_played returns minimized library rows; swap in the full album."""
+    mapping = ItemMapping(
+        item_id="358", provider="library", name="Album 358", media_type=MediaType.ALBUM
+    )
+    library = _album("358", "library", cr=CriticalReception(amg_dr=12.0), dr=12.0)
+    controller.mass.music.albums.get_library_item_by_prov_id = AsyncMock(  # type: ignore[method-assign]
+        return_value=library
+    )
+
+    out = await controller._attach_library_album_badges(UniqueList([mapping]))
+
+    assert isinstance(out[0], Album)
+    assert out[0].metadata.dynamic_range == 12.0
+    # the swap is only safe because the uri is identical -- same item, just complete
+    assert out[0].uri == mapping.uri
+
+
+async def test_provider_item_mapping_albums_are_left_alone(
+    controller: RecommendationsController,
+) -> None:
+    """Swapping a provider mapping would rewrite its uri and move the card's target."""
+    mapping = ItemMapping(
+        item_id="abc", provider="tidal--x", name="Album abc", media_type=MediaType.ALBUM
+    )
+    lookup = AsyncMock()
+    controller.mass.music.albums.get_library_item_by_prov_id = lookup  # type: ignore[method-assign]
+
+    out = await controller._attach_library_album_badges(UniqueList([mapping]))
+
+    lookup.assert_not_awaited()
+    assert out[0] is mapping
