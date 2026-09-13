@@ -1,0 +1,12 @@
+{
+  "manifest": {
+    "description": "Surfaces your Listen Later shelf as a row on the Discover page."
+  },
+  "media": {
+    "recommendations": {
+      "listen_later": {
+        "name": "Listen Later"
+      }
+    }
+  }
+}

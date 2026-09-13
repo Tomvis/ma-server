@@ -1626,6 +1626,8 @@
   "provider.lidarr.config_entries.url.description": "e.g. http://192.168.1.10:8000 or https://music-rater.example.com",
   "provider.lidarr.config_entries.url.label": "music-rater URL",
   "provider.lidarr.config_entries.verify_ssl.label": "Verify SSL",
+  "provider.listen_later.manifest.description": "Surfaces your Listen Later shelf as a row on the Discover page.",
+  "provider.listen_later.media.recommendations.listen_later.name": "Listen Later",
   "provider.listenbrainz_scrobble.config_entries._user_token.label": "User Token",
   "provider.listenbrainz_scrobble.config_entries.api_base_url.description": "URL for listenbrainz endpoint. Leave blank to default to the public listenbrainz API.",
   "provider.listenbrainz_scrobble.config_entries.api_base_url.label": "Base URL",

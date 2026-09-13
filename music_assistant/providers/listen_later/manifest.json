@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "domain": "listen_later",
+  "stage": "stable",
+  "name": "Listen Later",
+  "description": "Surfaces your Listen Later shelf as a row on the Discover page.",
+  "codeowners": ["@Tomvis"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false,
+  "builtin": true,
+  "allow_disable": false
+}
