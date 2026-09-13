@@ -50,11 +50,13 @@ async def test_row_identity_is_stable_and_instance_scoped(
     """The row carries the stable item_id and the instance_id as its provider."""
     provider, _ = plugin
     row = (await provider.get_recommendations())[0]
-    # User row preferences (order, hidden) are keyed on item_id, and the items API
-    # resolves the provider from the `provider` field -- both must not drift.
+    # User row preferences (order, hidden) are keyed on the row's derived uri, and
+    # the items API resolves the provider from the `provider` field -- both must
+    # not drift.
     assert row.item_id == "listen_later"
     assert row.provider == "listen_later"
     assert row.translation_key == "listen_later"
+    assert row.uri == "listen_later://folder/listen_later"
 
 
 async def test_get_recommendation_items_delegates_to_the_albums_controller(
@@ -84,14 +86,7 @@ async def test_provider_loads_with_the_recommendations_feature(
     mass: MusicAssistant,
 ) -> None:
     """The provider loads into a running server and declares RECOMMENDATIONS."""
-    # The builtin provider may already be auto-loaded by the mass fixture.
-    # If so, fetch it; otherwise create it.
-    try:
-        await mass.config._create_provider_instance("listen_later", {})
-    except ValueError as e:
-        if "does not support multiple instances" not in str(e):
-            raise
     provider = mass.get_provider("listen_later", provider_type=ListenLaterProvider)
-    assert provider is not None
+    assert provider is not None, "listen_later should be auto-loaded as a builtin"
     await provider.initialized.wait()
     assert ProviderFeature.RECOMMENDATIONS in provider.supported_features

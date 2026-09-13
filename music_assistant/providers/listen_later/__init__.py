@@ -18,7 +18,7 @@ from music_assistant_models.media_items import Album, RecommendationFolder, Uniq
 from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
-    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.event import MassEvent
     from music_assistant_models.media_items import (
         BrowseFolder,
@@ -35,7 +35,11 @@ SUPPORTED_FEATURES: set[ProviderFeature] = {
 }
 
 # The row's stable identity. Per-user row preferences (order, hidden) are keyed on
-# it, so it must not change across restarts or releases.
+# the row's derived uri -- "listen_later://folder/listen_later", built from the
+# provider domain and this item_id -- not on item_id alone. None of ROW_ID, the
+# provider domain, or `multi_instance: false` in manifest.json (which is what pins
+# instance_id == domain) may change without resetting every user's saved row order
+# and hidden state.
 ROW_ID = "listen_later"
 
 # How many albums the row carries. A Discover row is a glance, not a listing --
@@ -57,10 +61,6 @@ async def setup(
 class ListenLaterProvider(PluginProvider):
     """Builtin provider surfacing the Listen Later shelf on Discover."""
 
-    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Return the (options) config entries for this provider instance."""
-        return ()
-
     async def handle_async_init(self) -> None:
         """Initialise the shelf snapshot and the subscription handle list."""
         self._saved_uris: set[str] = set()
@@ -68,13 +68,22 @@ class ListenLaterProvider(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """Snapshot the shelf, then watch for changes to it."""
-        # Seeding matters: without it the first update seen for each saved album
-        # would look like a transition and signal a refresh, so a library sync
-        # would storm the Discover page.
+        # Seeding matters: a library sync itself stays silent (run_sync suppresses
+        # MEDIA_ITEM_UPDATED), but without a seed the first ordinary metadata update
+        # of each already-saved album would read as a false 0->1 transition and fire
+        # a spurious refresh.
         saved = await self.mass.music.albums.library_items(
             listen_later=True, order_by="listen_later_added_at_desc", limit=0
         )
         self._saved_uris = {album.uri for album in saved if album.uri}
+        # loaded_in_mass runs in a detached task that unload_provider() does not
+        # await, so an unload can complete while the seed query above is still in
+        # flight. Bail out rather than register a live subscription onto a provider
+        # that is already gone -- mass.subscribe holds a strong reference to the
+        # bound method, which would otherwise pin this dead instance and keep it
+        # emitting alongside its replacement.
+        if self.unloading:
+            return
         self._unregister_handles.append(
             self.mass.subscribe(self._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED)
         )
