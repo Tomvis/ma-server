@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Stage the *_overlay/ directories that Dockerfile.lidarr COPYs into the image.
+# Stage the *_overlay/ directories that Dockerfile.lidarr COPY directives into the image.
 #
 # The overlay dirs are gitignored, regenerable mirrors of things that live
 # elsewhere: this repo's package tree, the sibling models/ and frontend/
@@ -16,7 +16,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-Stage the *_overlay/ dirs that Dockerfile.lidarr COPYs into the image.
+Stage the *_overlay/ dirs that Dockerfile.lidarr COPY directives into the image.
 
   scripts/staging                stage everything (rebuilds the frontend if stale)
   scripts/staging --check        verify only; writes nothing, non-zero if stale
@@ -222,7 +222,7 @@ fi
 
 # --- aiosendspin -------------------------------------------------------------
 # The enhanced providers need the local trackfields build, and its version is
-# baked into the .dist-info directory name Dockerfile.lidarr COPYs to. If the
+# baked into the .dist-info directory name Dockerfile.lidarr COPY directives to. If the
 # two ever disagree the image gets a dist-info whose name lies about its
 # contents, and MA's provider loader tears the package out for failing its pin.
 #
@@ -246,7 +246,7 @@ AIOSENDSPIN_VERSION="${AIOSENDSPIN_VERSION%.dist-info}"
 copy_targets="$(sed 's/#.*//' "$DOCKERFILE" |
 	grep -oE 'aiosendspin-[^/ ]+\.dist-info' | grep -Fv '*' | sort -u || true)"
 if [ "$copy_targets" != "aiosendspin-${AIOSENDSPIN_VERSION}.dist-info" ]; then
-	fail "installed aiosendspin is ${AIOSENDSPIN_VERSION}, but $DOCKERFILE COPYs to:
+	fail "installed aiosendspin is ${AIOSENDSPIN_VERSION}, but $DOCKERFILE COPY directives to:
        ${copy_targets:-<no dist-info target found>}
        Update the COPY target in the Dockerfile, or reinstall the matching wheel."
 fi

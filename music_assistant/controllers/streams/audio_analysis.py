@@ -1066,7 +1066,7 @@ class AudioAnalysisController:
             return provider
         return None
 
-    async def _run_background_scan(self) -> None:
+    async def _run_background_scan(self) -> None:  # noqa: PLR0915  # one linear scan pipeline; splitting it hurts the upstream merge
         """Run the scan as decode-once-fan-out streaming over candidate tracks."""
         providers = self.providers
         if not providers:

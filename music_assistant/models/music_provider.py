@@ -1039,7 +1039,7 @@ class MusicProvider(Provider):
         else:
             state.incomplete_media_types.add(media_type)
 
-    async def _run_library_sync(self, media_type: MediaType) -> None:
+    async def _run_library_sync(self, media_type: MediaType) -> None:  # noqa: PLR0915  # reference implementation kept in one readable piece
         """Sync the given media type into the library and process its deletions."""
         # this reference implementation may be overridden
         # with a provider specific approach if needed

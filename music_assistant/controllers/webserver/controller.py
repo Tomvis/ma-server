@@ -834,10 +834,9 @@ class WebserverController(CoreController):
             # limit now that 2.9.9's auth/role checks and this branch's
             # MusicAssistantError arm both live here; log output is unchanged
             self.logger.exception(
-                "Error executing command %s: %s: %s",
+                "Error executing command %s: %s",
                 command_msg.command,
                 type(e).__name__,
-                e,
             )
             # deliberately opaque: the exception type/message only goes to the log.
             # code 999 is the same "unknown error" fallback the websocket path uses

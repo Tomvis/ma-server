@@ -302,7 +302,7 @@ def get_pypi_metadata(package_name: str) -> dict[str, Any] | None:
     url = f"https://pypi.org/pypi/{package_name}/json"
 
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
+        with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310  # hardcoded https://pypi.org literal; no user-supplied scheme
             return json.loads(response.read())
     except urllib.error.HTTPError as err:
         if err.code == 404:

@@ -81,7 +81,20 @@ Use the `mass` fixture (full instance with temp storage) for integration tests, 
 - `python -m music_assistant --log-level debug` - Run server locally (localhost:8095)
 - Requires ffmpeg v7.1+ and Python 3.14+ (see `.python-version` for the pinned runtime)
 
-Always run `pre-commit run --all-files` after a code change to ensure the new code adheres to the project standards.
+Always run the hooks after a code change to ensure the new code adheres to the project standards.
+
+**Scope them to what you changed.** `pre-commit run --all-files` cannot pass on this tree: the
+`mypy` hook sets `pass_filenames: false`, so it type-checks all ~2000 source files and reports
+~315 pre-existing errors across 120 files — 101 of which are byte-identical to upstream and are
+therefore upstream's debt, not something to fix here. Run this instead, and treat it as the gate:
+
+```bash
+SKIP=mypy pre-commit run --files <the files you changed>
+mypy 2>&1 | grep <your path>     # must report nothing for your own files
+```
+
+`git commit --no-verify` is consequently expected on this branch. Ruff, codespell and every
+other hook DO pass tree-wide, so a failure from any of them is genuinely yours.
 
 ## Provider Development
 
