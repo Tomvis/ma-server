@@ -8,11 +8,12 @@ from itertools import zip_longest
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.auth import Scope
-from music_assistant_models.enums import ProviderFeature
-from music_assistant_models.media_items import UniqueList
+from music_assistant_models.enums import MediaType, ProviderFeature
+from music_assistant_models.media_items import Album, UniqueList
 
 from music_assistant.constants import MASS_LOGGER_NAME
 from music_assistant.controllers.music.constants import (
+    RECOMMENDATIONS_ENRICH_TIMEOUT,
     RECOMMENDATIONS_ITEMS_TIMEOUT,
     RECOMMENDATIONS_ROWS_TIMEOUT,
 )
@@ -92,12 +93,16 @@ class RecommendationsController:
                 return UniqueList()
             async with asyncio.timeout(RECOMMENDATIONS_ITEMS_TIMEOUT):
                 if isinstance(prov, LibraryRecommendationsProvider):
-                    return await prov.get_recommendation_items(item_id, providers=providers)
-                # external provider rows don't support provider filtering: their SPI
-                # signature is unchanged, so `providers` is silently ignored here
-                return await cast(
-                    "MusicProvider | MetadataProvider | PluginProvider", prov
-                ).get_recommendation_items(item_id)
+                    items = await prov.get_recommendation_items(item_id, providers=providers)
+                else:
+                    # external provider rows don't support provider filtering: their SPI
+                    # signature is unchanged, so `providers` is silently ignored here
+                    items = await cast(
+                        "MusicProvider | MetadataProvider | PluginProvider", prov
+                    ).get_recommendation_items(item_id)
+            # deliberately outside the items timeout: enrichment is a nicety, and must
+            # never be able to cost us items we have already fetched
+            return await self._attach_library_album_badges(items)
         except TimeoutError:
             self.logger.warning(
                 "Timeout while fetching recommendation items for %s/%s; skipping",
@@ -114,6 +119,56 @@ class RecommendationsController:
                 exc_info=err if self.logger.isEnabledFor(logging.DEBUG) else None,
             )
             return UniqueList()
+
+    async def _attach_library_album_badges(
+        self, items: UniqueList[MediaItemType | ItemMapping | BrowseFolder]
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Copy library critical-reception and dynamic-range onto provider album items.
+
+        Rows served straight from a streaming or subsonic provider hand back items that
+        were never matched to their library counterpart, so the album badges the clients
+        render have nothing to read -- even when the very same album sits in the library
+        carrying the data. Graft only those two metadata values across, leaving item_id,
+        provider and uri untouched so navigation, playback and de-duplication behave
+        exactly as before.
+
+        Never raises and never drops items: on timeout or lookup failure the row is
+        returned as it arrived.
+        """
+        targets = [
+            item
+            for item in items
+            if item.media_type == MediaType.ALBUM
+            and item.provider != "library"
+            and getattr(item, "metadata", None) is not None
+            and item.metadata.critical_reception is None
+            and item.metadata.dynamic_range is None
+        ]
+        if not targets:
+            return items
+        try:
+            async with asyncio.timeout(RECOMMENDATIONS_ENRICH_TIMEOUT):
+                matches = await asyncio.gather(
+                    *(
+                        self.mass.music.albums.get_library_item_by_prov_id(
+                            item.item_id, item.provider
+                        )
+                        for item in targets
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            self.logger.debug("Timeout enriching album badges; serving the row unenriched")
+            return items
+        for item, match in zip(targets, matches, strict=True):
+            if not isinstance(match, Album) or match.metadata is None:
+                continue
+            if match.metadata.critical_reception is not None:
+                item.metadata.critical_reception = match.metadata.critical_reception
+            if match.metadata.dynamic_range is not None:
+                item.metadata.dynamic_range = match.metadata.dynamic_range
+        return items
 
     async def _provider_rows(
         self, provider: MusicProvider | MetadataProvider | PluginProvider

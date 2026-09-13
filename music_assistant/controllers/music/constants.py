@@ -49,6 +49,10 @@ RECOMMENDATIONS_ITEMS_TIMEOUT: Final[int] = 30
 # contractually fast (no live backend calls) so a short timeout suffices
 RECOMMENDATIONS_ROWS_TIMEOUT: Final[int] = 5
 
+# Budget for grafting library album metadata onto provider row items. Deliberately
+# short and non-fatal: when it expires the row is still served, just without badges.
+RECOMMENDATIONS_ENRICH_TIMEOUT: Final[int] = 5
+
 # how long after a provider is loaded its library sync runs for the first time,
 # leaving the rest of the startup work room to settle first
 INITIAL_SYNC_DELAY: Final[int] = 10
