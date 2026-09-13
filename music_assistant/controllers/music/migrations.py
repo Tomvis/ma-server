@@ -1007,12 +1007,35 @@ async def migrate_database(  # noqa: PLR0915
             if "duplicate column" not in str(err):
                 raise
 
+    if prev_version <= 58:
+        # the access record (owner + sharing) of a Music Assistant playlist; NULL for every
+        # existing row, which keeps them household playlists
+        try:
+            await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN [access] json")
+        except Exception as err:
+            if "duplicate column" not in str(err):
+                raise
+
     # --- enhanced-branch migrations ---
 
-    if prev_version <= 58 and await _table_exists(database, DB_TABLE_ALBUMS):
+    if prev_version <= 59 and await _table_exists(database, DB_TABLE_PLAYLISTS):
+        # Backfill upstream's playlist `access` column for a fork database.
+        # Upstream allocated schema 59 to that column and gated its step at
+        # "prev_version <= 58", but this branch had already spent 59 on listen_later --
+        # so a fork database arrives stamped 59, *without* the column, and upstream's
+        # step never fires for it. Every playlist read touches db_row["access"], so
+        # missing it breaks the playlists page outright. Idempotent: a database that
+        # already took upstream's <= 58 step just raises "duplicate column" here.
+        try:
+            await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN [access] json")
+        except Exception as err:
+            if "duplicate column" not in str(err):
+                raise
+
+    if prev_version <= 59 and await _table_exists(database, DB_TABLE_ALBUMS):
         # add listen_later flag + timestamp to albums (Roon-style "save for later").
-        # Gated at <= 58, not <= 55: upstream spent 56/57 on its own steps, so a stock
-        # 2.10 database arrives stamped 58 and must still gain these columns here.
+        # Gated at <= 59, not <= 55: upstream spent 56/57/59 on its own steps, so a stock
+        # database arrives stamped as high as 59 and must still gain these columns here.
         for column_sql in (
             f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later] BOOLEAN NOT NULL DEFAULT 0;",
             f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [listen_later_added_at] INTEGER;",

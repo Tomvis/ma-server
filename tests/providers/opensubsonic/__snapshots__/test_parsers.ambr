@@ -2105,6 +2105,7 @@
 # ---
 # name: test_parse_playlist[gonic-sample.playlist]
   dict({
+    'access': None,
     'date_added': None,
     'external_ids': list([
     ]),

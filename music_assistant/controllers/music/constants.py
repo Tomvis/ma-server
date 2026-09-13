@@ -9,13 +9,14 @@ DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
 
-# 59, not 58: both branches independently allocated 56 (upstream to its playlist
-# sound-effect repair, this branch to listen_later), so upstream's 58 has to be
-# cleared for a fork database to migrate at all. It also has to move for stock
-# 2.10 databases -- at 58 the "prev_version not in (0, DB_SCHEMA_VERSION)" guard
-# in database.py skips migration entirely and every album query then fails on
-# "no such column: listen_later".
-DB_SCHEMA_VERSION: Final[int] = 59
+# 60, not 59: upstream took 59 for the playlist `access` column (owner + sharing),
+# and this branch had already spent 59 on listen_later. A fork database is therefore
+# stamped 59 while *lacking* upstream's column, and upstream's own step is gated at
+# "prev_version <= 58" so it would never fire for it. Worse, the
+# "prev_version not in (0, DB_SCHEMA_VERSION)" guard in database.py would skip
+# migration entirely at 59, and every playlist read then fails on the missing
+# "access" column. The <= 59 step in migrations.py backfills it.
+DB_SCHEMA_VERSION: Final[int] = 60
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60

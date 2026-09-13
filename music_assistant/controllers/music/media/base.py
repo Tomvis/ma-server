@@ -97,6 +97,7 @@ JSON_KEYS = (
     "supported_mediatypes",
     "translation_params",
     "audiobook_artists",
+    "access",
 )
 
 # The columns that make up a relation row, so a merge can copy it onto the target
@@ -351,6 +352,13 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 await provider.on_item_updated(library_item)
         return library_item
 
+    def check_removal_allowed(self, item: ItemCls) -> None:  # noqa: B027
+        """
+        Raise when the calling user may not remove the given item from the library.
+
+        :param item: The library item about to be removed.
+        """
+
     async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
         """Delete library record from the database."""
         db_id = int(item_id)  # ensure integer
@@ -452,6 +460,10 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             played_only=played_only,
             in_library_only=True,
         )
+        # upstream 2.11 narrows per-user listings (playlist owner/sharing) through
+        # listing_filter; the count has to honour it or the total disagrees with the
+        # rows actually returned by library_items.
+        query_parts.extend(self.listing_filter(query_params))
         return await self._execute_count(query_parts, query_params)
 
     if TYPE_CHECKING:
@@ -551,6 +563,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         reachable_via = self._resolve_reachable_via(reachable_via)
         if reachable_via is not None and not reachable_via:
             return []
+        listing_params: dict[str, Any] = {}
         items = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
@@ -558,6 +571,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             offset=offset,
             order_by=order_by,
             provider_filter=self._provider_filter_considering_reachability(provider, reachable_via),
+            extra_query_parts=self.listing_filter(listing_params) or None,
+            extra_query_params=listing_params,
             genre_ids=genre,
             played_only=played_only,
             in_library_only=True,
@@ -583,6 +598,17 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 reachable_via=reachable_via,
             )
         return items
+
+    def listing_filter(self, query_params: dict[str, Any]) -> list[str]:
+        """
+        Return the SQL conditions that narrow listings of this type for the calling user.
+
+        For callers that build their own listing query with `get_library_items_by_query`.
+
+        :param query_params: Query params dict; the conditions' bound params are added to it.
+        """
+        clause = self._listing_filter_clause(query_params)
+        return [clause] if clause else []
 
     async def iter_library_items(
         self,
@@ -1908,6 +1934,17 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         self, item_id: str | int, update: ItemCls, overwrite: bool = False
     ) -> None:
         """Update existing library record in the database."""
+
+    def _listing_filter_clause(self, query_params: dict[str, Any]) -> str | None:
+        """
+        Return an extra SQL condition that narrows library listings for the calling user.
+
+        Applied to the listings and counts served to a user, not to the lookups the
+        library sync and other internal callers rely on.
+
+        :param query_params: Query params dict; the condition's bound params are added to it.
+        """
+        return None
 
     def _search_filter_clause(self, search: str, query_params: dict[str, Any]) -> str:
         """Return the SQL WHERE clause fragment used for search filtering."""

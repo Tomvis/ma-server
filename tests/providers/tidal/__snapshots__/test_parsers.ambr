@@ -246,6 +246,7 @@
 # ---
 # name: test_parse_playlist[mix]
   dict({
+    'access': None,
     'date_added': None,
     'external_ids': list([
     ]),
@@ -333,6 +334,7 @@
 # ---
 # name: test_parse_playlist[playlist]
   dict({
+    'access': None,
     'date_added': '2024-06-10T12:00:00+00:00',
     'external_ids': list([
     ]),

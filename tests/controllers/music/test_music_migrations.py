@@ -644,9 +644,7 @@ async def test_migration_strips_sound_effect_from_enhanced_lineage_playlists(
 
     mass = MagicMock()
     mass.cache.clear = AsyncMock()
-    await migrate_database(
-        mass, database, MagicMock(), prev_version=56, create_tables=AsyncMock()
-    )
+    await migrate_database(mass, database, MagicMock(), prev_version=56, create_tables=AsyncMock())
 
     rows = await database.get_rows_from_query(
         "SELECT supported_mediatypes FROM playlists WHERE item_id = 1"
@@ -708,3 +706,71 @@ async def test_migration_keeps_listen_later_data(database: DatabaseConnection) -
     # no in_library provider mapping, so the mutual-exclusivity cleanup must not fire
     assert rows[0]["listen_later"] == 1
     assert rows[0]["listen_later_added_at"] == 1700000000
+
+
+async def test_migration_adds_access_column_to_playlists(database: DatabaseConnection) -> None:
+    """A pre-59 database gets the playlists.access column; running it twice is harmless."""
+    assert "access" not in await _table_columns(database, "playlists")
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    for _ in range(2):
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=58,
+            create_tables=AsyncMock(),
+        )
+
+    assert "access" in await _table_columns(database, "playlists")
+
+
+async def test_migration_adds_access_column_to_a_fork_database_stamped_59(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 59 by this branch still gains upstream's playlists.access column.
+
+    Upstream allocated schema 59 to that column and gated its step at
+    "prev_version <= 58"; this branch had already spent 59 on listen_later, so a fork
+    database sits at 59 without the column and upstream's step never fires for it.
+    Every playlist read touches db_row["access"], so the catch-up step is what keeps
+    the playlists page working across this upgrade.
+    """
+    assert "access" not in await _table_columns(database, "playlists")
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    for _ in range(2):
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=59,
+            create_tables=AsyncMock(),
+        )
+
+    assert "access" in await _table_columns(database, "playlists")
+
+
+async def test_migration_adds_listen_later_columns_to_a_stock_database_stamped_59(
+    database: DatabaseConnection,
+) -> None:
+    """A stock upstream database stamped 59 still gains this branch's listen_later columns."""
+    columns = await _table_columns(database, "albums")
+    assert "listen_later" not in columns
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    await migrate_database(
+        mass,
+        database,
+        MagicMock(),
+        prev_version=59,
+        create_tables=AsyncMock(),
+    )
+
+    columns = await _table_columns(database, "albums")
+    assert "listen_later" in columns
+    assert "listen_later_added_at" in columns
