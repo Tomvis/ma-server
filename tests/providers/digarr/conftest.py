@@ -1,11 +1,18 @@
-"""A dependency-free fake aiohttp session for the digarr client tests."""
+"""Shared fixtures and fakes for the digarr provider tests."""
 
 from __future__ import annotations
 
 import json as jsonlib
+from collections.abc import Generator
+from contextlib import AbstractContextManager
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
+from music_assistant_models.enums import ProviderType
+
+from music_assistant.providers.digarr import SUPPORTED_FEATURES, DigarrProvider
+from music_assistant.providers.digarr.constants import CONF_API_KEY, CONF_MA_USER, CONF_URL
 
 
 class FakeResponse:
@@ -69,3 +76,36 @@ class FakeSession:
 def session() -> FakeSession:
     """Return a fresh fake session per test."""
     return FakeSession()
+
+
+def as_user(username: str | None) -> AbstractContextManager[MagicMock]:
+    """Patch the current-user lookup the provider consults."""
+    user = None if username is None else MagicMock(username=username)
+    return patch("music_assistant.providers.digarr.get_current_user", return_value=user)
+
+
+@pytest.fixture
+def provider() -> Generator[DigarrProvider]:
+    """
+    Construct the provider bound to MA user 'tom', viewed by 'tom' unless overridden.
+
+    Wraps the whole test in ``as_user("tom")`` so every action/recommendation test
+    gets a bound viewer by default without repeating the boilerplate; a test that
+    cares about a *different* viewer nests its own ``as_user(...)`` inside the test
+    body, which shadows this default for the duration of its own ``with`` block.
+    """
+    mass = MagicMock()
+    mass.http_session = MagicMock()
+    manifest = MagicMock()
+    manifest.type = ProviderType.PLUGIN
+    manifest.domain = "digarr"
+    config = MagicMock()
+    config.name = "digarr - Tom"
+    config.instance_id = "digarr--abcd1234"
+    values = {CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: "tom"}
+    config.get_value = MagicMock(side_effect=lambda key, default=None: values.get(key, default))
+    prov = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
+    prov._items = []
+    prov._rec_ids = {}
+    with as_user("tom"):
+        yield prov

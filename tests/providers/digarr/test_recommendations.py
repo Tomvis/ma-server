@@ -2,22 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-from music_assistant_models.enums import ProviderType
 from music_assistant_models.media_items import Artist
 
-from music_assistant.providers.digarr import SUPPORTED_FEATURES, DigarrProvider
+from music_assistant.providers.digarr import DigarrProvider
 from music_assistant.providers.digarr.client import DigarrError, DigarrRecommendation
-from music_assistant.providers.digarr.constants import (
-    CONF_API_KEY,
-    CONF_MA_USER,
-    CONF_URL,
-    EVENT_RECOMMENDATIONS_UPDATED,
-    ROW_ID,
-)
+from music_assistant.providers.digarr.constants import EVENT_RECOMMENDATIONS_UPDATED, ROW_ID
+
+from .conftest import as_user
 
 MBID = "c14b4180-dc87-481e-b17a-64e4150f90f6"
 
@@ -38,31 +31,6 @@ def make_rec(rec_id: int = 1, name: str = "Opeth", score: float = 1.0) -> Digarr
         release_group_mbid=None,
         release_group_title=None,
     )
-
-
-@pytest.fixture
-def provider() -> DigarrProvider:
-    """Construct the provider bound to MA user 'tom'."""
-    mass = MagicMock()
-    mass.http_session = MagicMock()
-    manifest = MagicMock()
-    manifest.type = ProviderType.PLUGIN
-    manifest.domain = "digarr"
-    config = MagicMock()
-    config.name = "digarr - Tom"
-    config.instance_id = "digarr--abcd1234"
-    values = {CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: "tom"}
-    config.get_value = MagicMock(side_effect=lambda key, default=None: values.get(key, default))
-    prov = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
-    prov._items = []
-    prov._rec_ids = {}
-    return prov
-
-
-def as_user(username: str | None) -> AbstractContextManager[MagicMock]:
-    """Patch the current-user lookup the provider consults."""
-    user = None if username is None else MagicMock(username=username)
-    return patch("music_assistant.providers.digarr.get_current_user", return_value=user)
 
 
 async def test_row_is_shown_to_the_bound_user(provider: DigarrProvider) -> None:
