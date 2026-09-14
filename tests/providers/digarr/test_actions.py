@@ -5,7 +5,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.auth import Scope
+from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 from music_assistant_models.media_items import Artist
 
 from music_assistant.providers.digarr.client import DigarrError
@@ -150,7 +151,7 @@ async def test_a_non_bound_user_is_refused(provider) -> None:
     provider._client.set_status = AsyncMock(return_value={"status": "approved"})
     provider._refresh = AsyncMock()
 
-    with as_user("lera"), pytest.raises(InvalidDataError):
+    with as_user("lera"), pytest.raises(InsufficientPermissions):
         await provider.approve(artist.uri)
     provider._client.set_status.assert_not_awaited()
 
@@ -168,5 +169,10 @@ async def test_commands_are_registered_unconditionally(provider) -> None:
 
     await provider.loaded_in_mass()
 
-    registered = {call.args[0] for call in provider.mass.register_api_command.call_args_list}
+    calls = provider.mass.register_api_command.call_args_list
+    registered = {call.args[0] for call in calls}
     assert registered == {"digarr/approve", "digarr/reject", "digarr/block", "digarr/undo"}
+    # A silently-dropped required_scope would expose these write commands to any
+    # authenticated user, and nothing else here would notice.
+    assert all(call.kwargs.get("required_scope") == Scope.LIBRARY_MANAGE for call in calls)
+    assert len(provider._unregister_handles) == 4

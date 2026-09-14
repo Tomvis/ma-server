@@ -103,6 +103,12 @@ async def test_refresh_populates_items_and_the_id_map(provider: DigarrProvider) 
 
     assert provider._items == [resolved]
     assert provider._rec_ids[resolved.uri] == 42
+    # make_rec's artist_id (101) is deliberately distinct from its rec_id (42): a
+    # copy-paste of the wrong field here would make block() POST a recommendation
+    # id to the artist-block endpoint instead of an artist id, and every existing
+    # assertion elsewhere would still pass.
+    assert provider._artist_ids[resolved.uri] == 101
+    assert provider._mbid_artist_ids[MBID] == 101
 
 
 async def test_refresh_drops_unresolvable_recommendations(provider: DigarrProvider) -> None:
@@ -160,6 +166,15 @@ async def test_recommendation_id_falls_back_to_musicbrainz(provider: DigarrProvi
     provider._mbid_rec_ids = {MBID: 42}
     with patch("music_assistant.providers.digarr.mbid_of", MagicMock(return_value=MBID)):
         assert provider.recommendation_id_for(artist.uri, artist) == 42
+
+
+async def test_artist_id_falls_back_to_musicbrainz(provider: DigarrProvider) -> None:
+    """block()'s artist-id lookup gets the same rotated-uri fallback as the rec id."""
+    artist = Artist(item_id="ytm-new", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._artist_ids = {}
+    provider._mbid_artist_ids = {MBID: 101}
+    with patch("music_assistant.providers.digarr.mbid_of", MagicMock(return_value=MBID)):
+        assert provider._artist_id_for(artist.uri, artist) == 101
 
 
 async def test_recommendation_id_is_none_when_nothing_matches(

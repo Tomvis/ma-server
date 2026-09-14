@@ -20,7 +20,7 @@ from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType, ExternalID, ProviderFeature
-from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 from music_assistant_models.media_items import RecommendationFolder, UniqueList
 
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
@@ -384,10 +384,16 @@ class DigarrProvider(PluginProvider):
         """
         Reject the recommendation behind ``item`` and permanently block its artist.
 
-        Two calls: ``set_status(..., "rejected")`` first, then digarr's
-        artist-block endpoint, which keys on digarr's own internal artist id --
-        not the recommendation id used everywhere else, and not the MusicBrainz
-        id either. Never passes ``remove_lidarr_artist``: blocking only stops
+        Two calls: digarr's artist-block endpoint first, then
+        ``set_status(..., "rejected")``. Blocking first means a failure there
+        leaves the recommendation untouched -- still pending, still in the row
+        -- so the user can retry from the same card. Rejecting first would
+        succeed, then the next refresh drops the now-rejected recommendation
+        from ``_rec_ids`` (``get_pending`` only returns ``status=pending``),
+        leaving a failed block unretriable from Music Assistant. The block
+        endpoint keys on digarr's own internal artist id -- not the
+        recommendation id used everywhere else, and not the MusicBrainz id
+        either. Never passes ``remove_lidarr_artist``: blocking only stops
         future recommendations, it does not reverse an approve.
 
         :param item: The resolved item's MA uri, as sent by the frontend action.
@@ -396,8 +402,8 @@ class DigarrProvider(PluginProvider):
         artist_id = self._artist_id_for(item, resolved)
         if artist_id is None:
             raise InvalidDataError(f"{item} is not a tracked digarr recommendation")
-        result = await self._client.set_status(rec_id, "rejected")
         await self._client.block_artist(artist_id)
+        result = await self._client.set_status(rec_id, "rejected")
         await self._refresh()
         return self._build_result(resolved, "rejected", result)
 
@@ -507,14 +513,18 @@ class DigarrProvider(PluginProvider):
         own API key, i.e. as its bound digarr user -- so a viewer who is not that
         user must be refused here, exactly like the read path in
         get_recommendation_items, or one Music Assistant user could trigger a real
-        Lidarr download in another user's name. Never falls back to a name match
-        on an unmapped uri either: approving the wrong artist is a real download,
-        not a cosmetic mistake.
+        Lidarr download in another user's name. Raises ``InsufficientPermissions``
+        for that case ("not yours") and ``InvalidDataError`` for an unmapped uri
+        ("unknown id") -- the same split used at providers/fastmcp_server/connect/
+        _revoke.py:89-94 -- so the two are distinguishable in logs and the
+        frontend can show a 403 rather than a validation error. Never falls back
+        to a name match on an unmapped uri either: approving the wrong artist is
+        a real download, not a cosmetic mistake.
 
         :param uri: The resolved item's MA uri, as sent by the frontend action.
         """
         if not self._viewer_is_bound_user():
-            raise InvalidDataError(
+            raise InsufficientPermissions(
                 "Not authorized to act on this digarr instance's recommendations"
             )
         item = await self.mass.music.get_item_by_uri(uri)
@@ -523,23 +533,28 @@ class DigarrProvider(PluginProvider):
             raise InvalidDataError(f"{uri} is not a tracked digarr recommendation")
         return item, rec_id
 
-    async def _act(self, uri: str, status: str, **client_kwargs: Any) -> dict[str, Any]:
+    async def _act(
+        self, uri: str, status: str, *, remove_lidarr_artist: bool = False
+    ) -> dict[str, Any]:
         """
         Apply a status change to the recommendation ``uri`` maps to, then refresh the row.
 
-        The shared implementation behind approve/reject/undo. ``client_kwargs`` is
-        forwarded verbatim to ``DigarrClient.set_status`` -- in practice only
-        ``undo`` uses it, to pass ``remove_lidarr_artist=True``, so approve and
-        reject never send that flag at all rather than sending it as False. A
-        ``DigarrError`` raised by the client is left to propagate so the caller's
+        The shared implementation behind approve/reject/undo. ``remove_lidarr_artist``
+        is an explicit, typed parameter -- rather than a forwarded ``**kwargs`` blob
+        -- specifically because it is the project's single highest-risk argument
+        (see ``undo``): a misspelling must be caught by mypy, not only by an
+        AsyncMock assertion. Only ``undo`` passes ``True``; approve and reject send
+        no such keyword to ``set_status`` at all, rather than sending it as False.
+        A ``DigarrError`` raised by the client is left to propagate so the caller's
         toast shows the real reason.
 
         :param uri: The resolved item's MA uri, as sent by the frontend action.
         :param status: The new digarr status: "approved", "rejected", or "pending".
-        :param client_kwargs: Extra keyword arguments forwarded to ``set_status``.
+        :param remove_lidarr_artist: Forwarded to ``set_status`` only when True.
         """
         item, rec_id = await self._resolve_recommendation(uri)
-        result = await self._client.set_status(rec_id, status, **client_kwargs)
+        kwargs: dict[str, bool] = {"remove_lidarr_artist": True} if remove_lidarr_artist else {}
+        result = await self._client.set_status(rec_id, status, **kwargs)
         await self._refresh()
         return self._build_result(item, status, result)
 
