@@ -187,4 +187,39 @@ async def test_commands_are_registered_unconditionally(provider) -> None:
     # A silently-dropped required_scope would expose these write commands to any
     # authenticated user, and nothing else here would notice.
     assert all(call.kwargs.get("required_scope") == Scope.LIBRARY_MANAGE for call in calls)
+
+
+async def test_warns_when_ma_user_matches_no_known_account(provider) -> None:
+    """
+    A stale or mistyped ma_user must be flagged, not silently reproduce the invisible row.
+
+    ma_user is free text whenever the picker's user lookup is unavailable, so nothing
+    else catches a typo -- _viewer_is_bound_user() would just never match anyone, and
+    the Discover row would go invisible with no error explaining why.
+    """
+    provider._client.whoami = AsyncMock(return_value=("tom", False))
+    provider.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[MagicMock(username="lera"), MagicMock(username="guest")]
+    )
+    provider.mass.register_api_command = MagicMock(return_value=lambda: None)
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    warnings = [call.args[0] % call.args[1:] for call in provider.logger.warning.call_args_list]
+    assert any("does not match any known Music Assistant user" in message for message in warnings)
+
+
+async def test_does_not_warn_when_ma_user_matches_a_known_account(provider) -> None:
+    """No spurious warning when ma_user is exactly a real, currently known account."""
+    provider._client.whoami = AsyncMock(return_value=("tom", False))
+    provider.mass.webserver.auth.list_users = AsyncMock(
+        return_value=[MagicMock(username="tom"), MagicMock(username="lera")]
+    )
+    provider.mass.register_api_command = MagicMock(return_value=lambda: None)
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    provider.logger.warning.assert_not_called()
     assert len(provider._unregister_handles) == 4
