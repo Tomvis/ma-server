@@ -12,6 +12,7 @@ same objects `_update_provider_config` operates on -- against `mass_minimal`.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
@@ -135,6 +136,53 @@ async def test_client_never_reads_a_secure_string_through_options_values(
     assert provider._client._api_key == "real-key"
 
 
+async def test_api_key_never_appears_in_a_serialized_config_entry(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    CONF_API_KEY's serialized entry must never carry the decrypted key.
+
+    Config.__post_serialize__ masks a SECURE_STRING's `value` to
+    SECURE_STRING_SUBSTITUTE before an entry ever reaches an API response, but does
+    NOT mask `default_value` -- so giving this entry any default_value derived from
+    the decrypted setup value (as an earlier version of get_config_entries did) would
+    serve the plaintext key to any caller with CONFIG_PROVIDERS_READ, i.e. any
+    household member, not just the instance's owner. The entry must also stay
+    loadable without one: a required entry with neither a value nor a default fails
+    Config.validate() and would stop the instance loading.
+    """
+    provider = await _load_provider(
+        mass_minimal,
+        setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "super-secret-key"},
+    )
+
+    provider.config.validate()  # must not raise
+
+    entries = {entry.key: entry for entry in await provider.get_config_entries()}
+    assert entries[CONF_API_KEY].default_value is None
+    assert entries[CONF_API_KEY].required is False
+
+    payload = json.dumps(provider.config.to_dict())
+    assert "super-secret-key" not in payload
+
+
+async def test_api_key_never_appears_after_an_explicit_options_edit(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """The same guarantee holds once api_key has also been explicitly saved to `values`."""
+    provider = await _load_provider(
+        mass_minimal,
+        setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "old-secret-key"},
+        values={CONF_API_KEY: mass_minimal.config.encrypt_string("new-secret-key")},
+    )
+
+    provider.config.validate()  # must not raise
+
+    payload = json.dumps(provider.config.to_dict())
+    assert "old-secret-key" not in payload
+    assert "new-secret-key" not in payload
+
+
 async def test_api_key_rotation_reaches_the_client_after_a_reload(
     mass_minimal: MusicAssistant,
 ) -> None:
@@ -159,19 +207,22 @@ async def test_unrelated_save_does_not_corrupt_the_key_with_the_substitute_place
     mass_minimal: MusicAssistant,
 ) -> None:
     """
-    Saving an unrelated field must not treat the frontend's secret placeholder as a rotation.
+    A caller resubmitting the secret placeholder must not have it treated as a rotation.
 
-    An untouched SECURE_STRING is redisplayed -- and round-trips back on save -- as
-    SECURE_STRING_SUBSTITUTE, which never equals the stored ciphertext, so
-    Config.update() always flags it "changed" even though nothing was typed. Without a
-    guard, saving row_size alone would silently clobber the real key with that literal
-    placeholder text.
+    The shipped frontend skips resubmitting an untouched SECURE_STRING entirely
+    (EditConfig.vue/SetupFlowDialog.vue), so a normal options-page save never
+    exercises this path. A non-frontend caller is not guaranteed to: the MCP config
+    tool, for one, masks the current value to SECURE_STRING_SUBSTITUTE before
+    deciding what to forward, and could echo it straight back. That placeholder
+    never equals the stored ciphertext, so Config.update() would flag it "changed"
+    regardless -- this guard is defence against such a caller clobbering the real
+    key with the literal placeholder text, not against the frontend.
     """
     provider = await _load_provider(
         mass_minimal, setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "OLDKEY"}
     )
-    # the frontend never has the real secret to resubmit; an untouched SECURE_STRING
-    # round-trips back as the placeholder alongside the field actually being changed
+    # a non-frontend caller resubmits the masked placeholder alongside the field it
+    # actually means to change
     posted = {CONF_API_KEY: SECURE_STRING_SUBSTITUTE, CONF_ROW_SIZE: 5}
     changed_keys = await _resave(mass_minimal, provider, posted)
     # confirms the spurious-change premise the guard exists for

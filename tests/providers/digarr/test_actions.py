@@ -187,6 +187,7 @@ async def test_commands_are_registered_unconditionally(provider) -> None:
     # A silently-dropped required_scope would expose these write commands to any
     # authenticated user, and nothing else here would notice.
     assert all(call.kwargs.get("required_scope") == Scope.LIBRARY_MANAGE for call in calls)
+    assert len(provider._unregister_handles) == 4
 
 
 async def test_warns_when_ma_user_matches_no_known_account(provider) -> None:
@@ -222,4 +223,3 @@ async def test_does_not_warn_when_ma_user_matches_a_known_account(provider) -> N
     await provider.loaded_in_mass()
 
     provider.logger.warning.assert_not_called()
-    assert len(provider._unregister_handles) == 4

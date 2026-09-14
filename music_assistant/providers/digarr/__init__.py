@@ -209,16 +209,28 @@ class DigarrProvider(PluginProvider):
         against exactly these entries after construction, so a key missing from this
         tuple reads back as None for the rest of the instance's life.
 
-        Each ``default_value=`` below is deliberately ``_setup_data_only`` -- never
-        ``get_setup_value`` (falls back to this same field's own *current* value once
-        it's absent from ``setup_data``, which existing CONF_MA_USER instances always
-        are) and never anything else that mirrors the field's current effective value
-        (e.g. ``_config_or_setup_value``): ``Config.to_raw`` persists an entry only
-        when ``value != default_value``, so a default that tracks the live value
-        converges to equal it after one reload, and the *next* save of *any* field
-        silently drops this one from storage. ``Config.parse`` already overlays a
-        stored value as ``entry.value``, which is what the options page actually
-        renders -- default_value only needs to cover the genuinely-unset case.
+        CONF_URL and CONF_MA_USER's ``default_value=`` below is deliberately
+        ``_setup_data_only`` -- never ``get_setup_value`` (falls back to this same
+        field's own *current* value once it's absent from ``setup_data``, which
+        existing CONF_MA_USER instances always are) and never anything else that
+        mirrors the field's current effective value (e.g. ``_config_or_setup_value``):
+        ``Config.to_raw`` persists an entry only when ``value != default_value``, so a
+        default that tracks the live value converges to equal it after one reload,
+        and the *next* save of *any* field silently drops this one from storage.
+        ``Config.parse`` already overlays a stored value as ``entry.value``, which is
+        what the options page actually renders -- default_value only needs to cover
+        the genuinely-unset case.
+
+        CONF_API_KEY gets no ``default_value`` at all, for a different reason:
+        ``Config.__post_serialize__`` masks a SECURE_STRING's ``value`` to
+        ``SECURE_STRING_SUBSTITUTE`` before it ever reaches an API response, but does
+        NOT mask ``default_value`` -- so setting it to the decrypted setup value (as
+        an earlier version of this method did) would serve the plaintext key to
+        anyone with ``CONFIG_PROVIDERS_READ`` (any household member, not just an
+        admin), defeating the whole point of a per-user key. Required is also
+        ``False`` here for the same reason CONF_MA_USER is: ``Config.validate()``
+        rejects a required entry with neither a value nor a default, which would
+        stop the instance loading with no default to fall back to.
         """
         users = await ma_usernames(self.mass, self.logger)
         return (
@@ -231,8 +243,10 @@ class DigarrProvider(PluginProvider):
             ConfigEntry(
                 key=CONF_API_KEY,
                 type=ConfigEntryType.SECURE_STRING,
-                required=True,
-                default_value=self._setup_data_only(CONF_API_KEY),
+                # Never required and never given a default_value -- see this
+                # method's own docstring for why a default here would leak the
+                # plaintext key to any household member, not just the owner.
+                required=False,
             ),
             ConfigEntry(
                 key=CONF_MA_USER,
@@ -469,12 +483,16 @@ class DigarrProvider(PluginProvider):
         the single, always-correctly-decrypting source of truth for this key; the
         reload the base implementation schedules below then already sees it there.
 
-        ``changed_keys`` includes CONF_API_KEY whenever the options form is saved at
-        all, not only when the field itself was edited: the frontend never receives
-        the real secret back, only ``SECURE_STRING_SUBSTITUTE`` in its place, and
-        resubmits that placeholder for an untouched field -- which never equals the
-        previously stored ciphertext, so it always registers as "changed" even though
-        nothing was typed. That placeholder is therefore never treated as a rotation.
+        ``changed_keys`` can include CONF_API_KEY even when nothing was actually
+        typed. The shipped frontend does skip resubmitting an untouched SECURE_STRING
+        (EditConfig.vue / SetupFlowDialog.vue), so a normal options-page save that
+        only touches another field never flags this one. But a non-frontend caller
+        need not: the MCP config tool, for one, masks the current value to
+        ``SECURE_STRING_SUBSTITUTE`` before deciding what to forward, and could echo
+        that placeholder straight back as a "new" value. It never equals the
+        previously stored ciphertext, so ``Config.update`` would register it as
+        changed regardless of intent -- the check below is defence against that
+        placeholder ever being treated as a real rotation, not against the frontend.
 
         :param config: The freshly saved config, with the new values already applied
             in memory (not yet encrypted -- only ``to_raw()`` does that).
