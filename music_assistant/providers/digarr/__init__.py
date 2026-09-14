@@ -107,6 +107,13 @@ def _build_command_dispatcher(
             "Not authorized to act on this digarr instance's recommendations"
         )
 
+    # generate_commands_json parses this for the published API docs (controllers/
+    # webserver/api_docs.py:1127); without it every one of the four commands would
+    # publish an empty description and lose its documented `item` param. Set directly
+    # rather than via functools.wraps: wraps also sets __wrapped__, which makes
+    # inspect.signature (helpers/api.py:120) unwrap to action's own (self, item)
+    # signature and inject a bogus required `self` argument into the API contract.
+    dispatch.__doc__ = action.__doc__
     return dispatch
 
 
@@ -304,7 +311,19 @@ class DigarrProvider(PluginProvider):
         on first use. Mirrors providers/lidarr/provider.py:168-191 (a
         single-instance provider; the once-only guard here is what that
         pattern is missing for a multi-instance one).
+
+        This runs in a detached task that ``unload_provider`` does not await
+        (mass.py:1460-1470), so this instance can be unloaded before this task
+        ever runs at all. Without the guard below, a dead instance would still
+        find the registry empty (a live unload leaves nothing behind for an
+        instance that had not registered yet), register all four commands, and
+        hold the only handles -- unregisterable forever, since
+        ``unload_provider`` cannot call an already-unloaded instance's
+        ``unload`` a second time. Mirrors providers/listen_later/
+        __init__.py:79-85.
         """
+        if self.unloading:
+            return
         for command, action in (
             ("digarr/approve", DigarrProvider.approve),
             ("digarr/reject", DigarrProvider.reject),
@@ -360,10 +379,17 @@ class DigarrProvider(PluginProvider):
             other_instances = [
                 other
                 for other in self.mass.get_provider_instances(DOMAIN, return_unavailable=True)
-                if isinstance(other, DigarrProvider) and other.instance_id != self.instance_id
+                if isinstance(other, DigarrProvider)
+                and other.instance_id != self.instance_id
+                # A candidate mid-unload itself (e.g. mass.stop() unloading every
+                # provider concurrently) may already be past the point where it
+                # would ever look for a hand-off, or may be popped before it gets
+                # the chance to act on one -- excluding it here is what stops the
+                # handles from being orphaned on a dead instance in that race.
+                and not other.unloading
             ]
             if other_instances:
-                other_instances[0]._unregister_handles = owned_handles
+                other_instances[0]._adopt_command_handles(owned_handles)
             else:
                 for unregister in owned_handles:
                     unregister()
@@ -567,6 +593,20 @@ class DigarrProvider(PluginProvider):
             )
 
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
+
+    def _adopt_command_handles(self, handles: list[Callable[[], None]]) -> None:
+        """
+        Take over ownership of the shared digarr commands' unregister handles.
+
+        Called on a remaining instance by the one that registered the shared
+        commands when that instance unloads, so responsibility for handing
+        them off again (or finally unregistering them) transfers along with
+        the handles themselves, rather than the caller reaching into this
+        instance's state directly.
+
+        :param handles: The unregister callables the departing instance held.
+        """
+        self._unregister_handles = handles
 
     def _viewer_is_bound_user(self) -> bool:
         """

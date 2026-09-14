@@ -110,24 +110,68 @@ async def test_approve_as_lera_acts_through_leras_instance_only() -> None:
 
 
 async def test_a_viewer_bound_to_neither_instance_is_refused() -> None:
-    """A third Music Assistant user, bound to no digarr instance, must be refused."""
+    """
+    A third user, bound to no digarr instance, must be refused by the dispatcher itself.
+
+    Refused before ever reaching an instance's own action. Stubs
+    ``_resolve_recommendation`` (rather than relying on ``set_status``
+    never being awaited) because that method's *own* bound-user gate raises
+    the identical ``InsufficientPermissions`` message: a dispatcher that
+    ignored the calling user entirely and simply fell back to some instance
+    (e.g. instances[0]) would still make this test pass on that gate alone.
+    Asserting neither instance's ``_resolve_recommendation`` was even called
+    proves the dispatcher's own lookup is what refused the request.
+    """
+    mass, tom, lera = make_pair()
+    await load_provider(mass, tom)
+    await load_provider(mass, lera)
+
+    tom._resolve_recommendation = AsyncMock()
+    lera._resolve_recommendation = AsyncMock()
+
+    handler = mass.command_handlers["digarr/approve"]
+    with as_user("stranger"), pytest.raises(InsufficientPermissions):
+        await handler("digarr--tom://artist/whatever")
+
+    tom._resolve_recommendation.assert_not_awaited()
+    lera._resolve_recommendation.assert_not_awaited()
+
+
+async def test_undo_as_lera_dispatches_through_the_registry_too() -> None:
+    """
+    The digarr/undo command, not just digarr/approve, must dispatch by calling user.
+
+    Every other dispatch test here goes through digarr/approve; without this,
+    all four registered commands could be wired to the same action (e.g. every
+    one of them silently calling approve) and nothing here would notice. undo
+    is also the highest-risk action -- the only one that passes
+    remove_lidarr_artist=True -- so this re-pins that flag through the shared
+    registry, not just through a direct provider.undo() call.
+    """
     mass, tom, lera = make_pair()
     await load_provider(mass, tom)
     await load_provider(mass, lera)
 
     artist = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
     mass.music.get_item_by_uri = AsyncMock(return_value=artist)
-    tom._rec_ids = {artist.uri: 42}
     lera._rec_ids = {artist.uri: 99}
+    lera._client.set_status = AsyncMock(
+        return_value={
+            "status": "pending",
+            "lidarrArtistRemoved": True,
+            "lidarrRemovalSkippedReason": None,
+        }
+    )
+    lera._refresh = AsyncMock()
     tom._client.set_status = AsyncMock()
-    lera._client.set_status = AsyncMock()
 
-    handler = mass.command_handlers["digarr/approve"]
-    with as_user("stranger"), pytest.raises(InsufficientPermissions):
-        await handler(artist.uri)
+    handler = mass.command_handlers["digarr/undo"]
+    with as_user("lera"):
+        result = await handler(artist.uri)
 
+    lera._client.set_status.assert_awaited_once_with(99, "pending", remove_lidarr_artist=True)
     tom._client.set_status.assert_not_awaited()
-    lera._client.set_status.assert_not_awaited()
+    assert result["lidarr_artist_removed"] is True
 
 
 async def test_unloading_the_registering_instance_hands_off_to_the_remaining_one() -> None:
@@ -174,3 +218,68 @@ async def test_unloading_the_last_instance_actually_unregisters() -> None:
     await unload_provider(mass, lera)
 
     assert mass.command_handlers == {}
+
+
+async def test_loaded_in_mass_no_ops_once_the_instance_is_already_unloading() -> None:
+    """
+    A detached loaded_in_mass task must not register commands for a dead instance.
+
+    ``loaded_in_mass`` runs in a task ``unload_provider`` does not await
+    (mass.py:1460-1470), so an instance can be marked unloading -- or even
+    fully unloaded -- before this task gets its turn to run. Registering
+    anyway would hand the only unregister handles to an instance nothing will
+    ever call ``unload()`` on again, leaking the commands permanently.
+    """
+    mass, tom, _lera = make_pair()
+    tom.unloading = True
+
+    await tom.loaded_in_mass()
+
+    assert mass.command_handlers == {}
+    assert mass.register_api_command.call_count == 0
+    assert tom._unregister_handles == []
+
+
+async def test_registered_handler_keeps_the_actions_docstring() -> None:
+    """
+    The registered handler must publish the same docstring as the action it wraps.
+
+    ``generate_commands_json`` parses a command handler's docstring for its
+    published API description and ``:param:`` types (controllers/webserver/
+    api_docs.py:1127); a dispatcher with no docstring of its own would
+    silently publish an empty description and drop the documented ``item``
+    param for every one of the four commands.
+    """
+    mass, tom, _lera = make_pair()
+    await load_provider(mass, tom)
+
+    for command, action in (
+        ("digarr/approve", DigarrProvider.approve),
+        ("digarr/reject", DigarrProvider.reject),
+        ("digarr/block", DigarrProvider.block),
+        ("digarr/undo", DigarrProvider.undo),
+    ):
+        assert mass.command_handlers[command].__doc__ == action.__doc__
+
+
+async def test_hand_off_skips_a_candidate_that_is_itself_unloading() -> None:
+    """
+    A concurrently-unloading instance must never be handed the commands.
+
+    ``mass.stop()`` unloads every provider concurrently. Without excluding a
+    candidate that is itself mid-unload, tom (the owner) could hand off to
+    lera while her own unload is already underway and about to pop her from
+    the registry, orphaning the handles on an instance nothing will call
+    ``unload()`` on again.
+    """
+    mass, tom, lera = make_pair()
+    await load_provider(mass, tom)
+    await load_provider(mass, lera)
+    lera.unloading = True
+
+    await unload_provider(mass, tom)
+
+    # No other (non-unloading) instance existed to hand off to, so tom -- the
+    # owner -- actually unregisters rather than orphaning the handles on lera.
+    assert mass.command_handlers == {}
+    assert lera._unregister_handles == []

@@ -201,14 +201,16 @@ async def unload_provider(mass: MagicMock, prov: DigarrProvider, is_removed: boo
     """
     Simulate the real unload sequence for a loaded instance.
 
-    Mirrors ``MusicAssistant.unload_provider`` (mass.py:1094-1132): the
-    instance is only removed from the loaded-providers registry *after*
-    ``provider.unload()`` returns, so a hand-off inside ``unload()`` still
-    sees itself as loaded while deciding who takes over.
+    Mirrors ``MusicAssistant.unload_provider`` (mass.py:1094-1132): ``unloading``
+    is set *before* ``provider.unload()`` is awaited, and the instance is only
+    removed from the loaded-providers registry *after* it returns -- so a
+    hand-off inside ``unload()`` still sees itself (and any concurrently
+    unloading sibling) as loaded while deciding who takes over.
 
     :param mass: The shared mass double the instance was built with.
     :param prov: The loaded instance to unload.
     :param is_removed: Forwarded to ``prov.unload()``.
     """
+    prov.unloading = True
     await prov.unload(is_removed)
     mass._loaded.pop(prov.instance_id, None)
