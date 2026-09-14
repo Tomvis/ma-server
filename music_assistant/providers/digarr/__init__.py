@@ -13,7 +13,7 @@ user because plugin rows bypass the core provider filter.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.auth import Scope
@@ -36,6 +36,7 @@ from music_assistant.providers.digarr.constants import (
     CONF_ROW_SIZE,
     CONF_URL,
     DEFAULT_URL,
+    DOMAIN,
     EVENT_RECOMMENDATIONS_UPDATED,
     REFRESH_TASK_ID,
     RESOLUTION_BUFFER,
@@ -73,6 +74,40 @@ def mbid_of(item: Artist | ItemMapping) -> str | None:
     """
     mbid: str | None = item.get_external_id(ExternalID.MB_ARTIST)
     return mbid
+
+
+def _build_command_dispatcher(
+    mass: MusicAssistant,
+    action: Callable[[DigarrProvider, str], Coroutine[Any, Any, dict[str, Any]]],
+) -> Callable[[str], Coroutine[Any, Any, dict[str, Any]]]:
+    """
+    Build the handler registered for one shared digarr context-menu command.
+
+    Each of the four commands is registered exactly once, globally, by
+    whichever digarr instance happens to load first -- ``mass``'s command
+    registry has no concept of "one per provider instance". But each instance
+    acts with its own bound Music Assistant user's digarr API key, so the
+    registered handler cannot be permanently bound to that first instance
+    either. Instead it re-resolves, on every call, which currently loaded
+    digarr instance the calling user is actually bound to, and delegates to
+    that one. An unbound viewer gets the same refusal ``_resolve_recommendation``
+    raises for a single-instance setup, so behaviour for them is unchanged.
+
+    :param mass: The MusicAssistant instance to search for a loaded digarr
+        instance bound to the calling user.
+    :param action: The unbound DigarrProvider method (approve/reject/block/undo)
+        to invoke on the resolved instance.
+    """
+
+    async def dispatch(item: str) -> dict[str, Any]:
+        for instance in mass.get_provider_instances(DOMAIN, return_unavailable=True):
+            if isinstance(instance, DigarrProvider) and instance._viewer_is_bound_user():
+                return await action(instance, item)
+        raise InsufficientPermissions(
+            "Not authorized to act on this digarr instance's recommendations"
+        )
+
+    return dispatch
 
 
 async def setup(
@@ -247,23 +282,42 @@ class DigarrProvider(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """
-        Register the context-menu actions and probe digarr for connectivity.
+        Register the context-menu actions (once) and probe digarr for connectivity.
 
-        Registered unconditionally -- even if the probe below fails -- so the menu
-        entries still appear when digarr is unreachable at load time. Registering
-        conditionally would leave the provider marked available but with the actions
-        silently missing, which is far harder to diagnose than an error raised on
-        first use. Mirrors providers/lidarr/provider.py:168-191.
+        digarr is multi-instance -- one instance per digarr user -- but
+        ``mass.register_api_command`` raises if a command name is already
+        registered, and the four command names here are shared by every
+        instance. So registration itself happens only once: the first
+        instance to load wins the guard below and keeps the unregister
+        handles (making it responsible for handing them off or unregistering
+        them in ``unload``); every later instance finds the commands already
+        present and registers nothing. Either way, the handler installed
+        resolves the calling user's own instance at call time (see
+        ``_build_command_dispatcher``) rather than being bound to whichever
+        instance happened to register it.
+
+        Registered unconditionally with respect to digarr's own reachability --
+        even if the probe below fails -- so the menu entries still appear when
+        digarr is unreachable at load time. Registering conditionally on that
+        would leave the provider marked available but with the actions
+        silently missing, which is far harder to diagnose than an error raised
+        on first use. Mirrors providers/lidarr/provider.py:168-191 (a
+        single-instance provider; the once-only guard here is what that
+        pattern is missing for a multi-instance one).
         """
-        for command, handler in (
-            ("digarr/approve", self.approve),
-            ("digarr/reject", self.reject),
-            ("digarr/block", self.block),
-            ("digarr/undo", self.undo),
+        for command, action in (
+            ("digarr/approve", DigarrProvider.approve),
+            ("digarr/reject", DigarrProvider.reject),
+            ("digarr/block", DigarrProvider.block),
+            ("digarr/undo", DigarrProvider.undo),
         ):
+            if command in self.mass.command_handlers:
+                continue
             self._unregister_handles.append(
                 self.mass.register_api_command(
-                    command, handler, required_scope=Scope.LIBRARY_MANAGE
+                    command,
+                    _build_command_dispatcher(self.mass, action),
+                    required_scope=Scope.LIBRARY_MANAGE,
                 )
             )
         try:
@@ -279,7 +333,17 @@ class DigarrProvider(PluginProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """
-        Tear down the scheduled refresh and any other registered handles.
+        Tear down the scheduled refresh and, if this instance owns them, the shared commands.
+
+        Only the instance that actually registered the four context-menu
+        commands in ``loaded_in_mass`` holds any unregister handles (see the
+        registration guard there), so an instance that found them already
+        registered does nothing here -- it never owned them. For the owner,
+        unregistering unconditionally would be wrong: the commands are global,
+        so that would remove them for every *other* still-loaded digarr
+        instance too, not just this one. So the owner instead hands its
+        handles to a remaining instance, if any, and only unregisters for real
+        once it is the last digarr instance standing.
 
         :param is_removed: Whether the provider instance itself is being removed,
             as opposed to a reload; passed through so the task's persisted state
@@ -289,9 +353,20 @@ class DigarrProvider(PluginProvider):
             f"{REFRESH_TASK_ID}_{self.instance_id}",
             clear_persisted_state=is_removed,
         )
-        for unregister in self._unregister_handles:
-            unregister()
-        self._unregister_handles.clear()
+        # Reassigned (not .clear()'d) below: a hand-off gives this exact list object
+        # to another instance, and clearing it in place would empty that one too.
+        owned_handles, self._unregister_handles = self._unregister_handles, []
+        if owned_handles:
+            other_instances = [
+                other
+                for other in self.mass.get_provider_instances(DOMAIN, return_unavailable=True)
+                if isinstance(other, DigarrProvider) and other.instance_id != self.instance_id
+            ]
+            if other_instances:
+                other_instances[0]._unregister_handles = owned_handles
+            else:
+                for unregister in owned_handles:
+                    unregister()
         await super().unload(is_removed)
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
