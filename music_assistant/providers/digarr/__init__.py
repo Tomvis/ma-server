@@ -199,6 +199,14 @@ class DigarrProvider(PluginProvider):
         # Initialized here (not in handle_async_init) so loaded_in_mass can append to it
         # even if it is ever invoked before handle_async_init has run.
         self._unregister_handles: list[Callable[[], None]] = []
+        # Populated by get_config_entries() and reused by loaded_in_mass() so a single
+        # load only calls ma_usernames() (and thus list_users()) once instead of twice:
+        # rehydrate always resolves get_config_entries() before loaded_in_mass ever runs,
+        # so by the time the latter needs the list it is already fresh. None (rather than
+        # an empty list) distinguishes "never fetched yet" from "fetched, no users" so a
+        # loaded_in_mass() call that somehow runs first still falls back to fetching its
+        # own copy instead of treating an unpopulated cache as a real empty result.
+        self._known_ma_usernames: list[ConfigValueOption] | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """
@@ -233,6 +241,15 @@ class DigarrProvider(PluginProvider):
         stop the instance loading with no default to fall back to.
         """
         users = await ma_usernames(self.mass, self.logger)
+        if self._known_ma_usernames is None:
+            # Cached for loaded_in_mass() to reuse -- see _known_ma_usernames's
+            # docstring in __init__. Guarded on "still None": this method also runs
+            # on every options-page open, not just at load, so an already-populated
+            # cache must not be overwritten by a later, possibly lower-scope caller
+            # (ma_usernames returns [] on a missing users.read scope) -- only the
+            # first call (always the load-time one, since rehydrate resolves this
+            # before loaded_in_mass ever runs) gets to seed it.
+            self._known_ma_usernames = users
         return (
             ConfigEntry(
                 key=CONF_URL,
@@ -348,7 +365,7 @@ class DigarrProvider(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """
-        Register the context-menu actions (once), probe digarr, and validate ma_user.
+        Register the context-menu actions (once), probe digarr, and validate ma_user/api_key.
 
         digarr is multi-instance -- one instance per digarr user -- but
         ``mass.register_api_command`` raises if a command name is already
@@ -409,7 +426,13 @@ class DigarrProvider(PluginProvider):
                 err,
             )
 
-        if self._ma_user and (known_users := await ma_usernames(self.mass, self.logger)):
+        # Reuse get_config_entries()'s lookup (already fresh: rehydrate always resolves
+        # it before this method ever runs) instead of hitting list_users() a second
+        # time for the same load -- see _known_ma_usernames's docstring in __init__.
+        known_users = self._known_ma_usernames
+        if known_users is None:
+            known_users = await ma_usernames(self.mass, self.logger)
+        if self._ma_user and known_users:
             usernames = {cast("str", user.value) for user in known_users}
             if self._ma_user not in usernames:
                 # A stale or mistyped ma_user (the free-text fallback has no picker to
@@ -423,6 +446,24 @@ class DigarrProvider(PluginProvider):
                     self._ma_user,
                     ", ".join(sorted(usernames)),
                 )
+
+        # A pre-fix instance can still have a (now-stale) api_key sitting in `values`
+        # from before update_config() started mirroring rotations into setup_data --
+        # see update_config's own docstring for why setup_data, not values, is always
+        # the source the client is built from. That old values-side key is silently
+        # ignored today with no indication anything is wrong: the options page only
+        # ever shows the masked substitute, so there is no way to tell it apart from
+        # the (correct) active one by looking at the UI. Warn instead of ever
+        # switching to it automatically -- an old, unvetted values-side key must never
+        # become active just because it happens to be present at load time.
+        values_api_key = self.config.get_value(CONF_API_KEY)
+        if values_api_key and values_api_key != self._client._api_key:
+            self.logger.warning(
+                "digarr: api_key holds a value from before setup_data started tracking "
+                "rotations, and it is being ignored -- the active key is the one "
+                "already in use. Re-enter the api_key on this instance's options page "
+                "to make it the active one.",
+            )
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -493,6 +534,30 @@ class DigarrProvider(PluginProvider):
         previously stored ciphertext, so ``Config.update`` would register it as
         changed regardless of intent -- the check below is defence against that
         placeholder ever being treated as a real rotation, not against the frontend.
+
+        Known gap, left unfixed here: this hook is never called at all when the
+        instance is unavailable at save time. ``_update_provider_config``
+        (controllers/config/providers.py: the branch condition at line 695, this
+        hook's call at line 697) only calls ``provider.update_config`` on its "loaded
+        and available" branch; the "enabled but not available" branch (lines 706-708)
+        instead calls ``mass.load_provider_config(config)`` directly, which tears this
+        instance down and reconstructs a brand new one from ``config`` without ever
+        calling this method. A rotation submitted while unavailable therefore lands in
+        the freshly-updated ``config.values`` but is never mirrored into setup_data, so
+        the reconstructed instance's ``__init__`` builds its client from the *old*
+        setup_data key and the rotation is silently lost.
+
+        Not fixed within this provider -- not because a reconciliation is impossible,
+        but because it would have to apply a single policy to two cases the fresh
+        instance's ``__init__`` cannot tell apart: "a rotation the controller just
+        skipped mirroring" (should become active) and "a stale pre-fix values/api_key"
+        (must stay ignored and only warned about, per ``loaded_in_mass``). Both look
+        identical in storage -- a value present in ``config.values`` that differs from
+        setup_data -- and only the controller, at the moment of the actual save, still
+        has ``changed_keys`` and can tell which one this is. A correct fix therefore
+        belongs in ``_update_provider_config``: call (or equivalently invoke) this hook
+        on its unavailable branch too, before it reconstructs the instance, so the
+        rotation is mirrored with the same certainty it has on the available branch.
 
         :param config: The freshly saved config, with the new values already applied
             in memory (not yet encrypted -- only ``to_raw()`` does that).

@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ProviderType
 from music_assistant_models.provider import ProviderManifest
 
+import music_assistant.providers.digarr as digarr_module
 from music_assistant.constants import CONF_PROVIDERS, DEFAULT_PROVIDER_CONFIG_ENTRIES
 from music_assistant.providers.digarr import SUPPORTED_FEATURES, DigarrProvider
 from music_assistant.providers.digarr.constants import (
@@ -58,7 +59,7 @@ async def _load_provider(
     :param values: The provider's stored raw config `values`, already in their at-rest
         form (i.e. pass real ciphertext for a SECURE_STRING key).
     """
-    mass._http_session = MagicMock()  # type: ignore[attr-defined]  # avoid a real ClientSession
+    mass._http_session = MagicMock()  # avoid a real ClientSession
     encrypted_setup_data = {
         key: mass.config.encrypt_string(value) if isinstance(value, str) else value
         for key, value in setup_data.items()
@@ -111,7 +112,7 @@ async def _resave(
     changed_keys = new_config.update(posted)
     mass.config.set(f"{CONF_PROVIDERS}/{INSTANCE_ID}", new_config.to_raw())
     await provider.update_config(new_config, changed_keys)
-    return changed_keys
+    return changed_keys  # type: ignore[no-any-return]
 
 
 async def test_client_never_reads_a_secure_string_through_options_values(
@@ -327,3 +328,97 @@ async def test_config_entry_defaults_never_shadow_the_setup_value_display(
 
     assert entry.default_value == "http://stale-no-port"
     assert entry.value == "http://fixed-with-port:4533"
+
+
+async def test_loaded_in_mass_does_not_refetch_ma_usernames(mass_minimal: MusicAssistant) -> None:
+    """
+    loaded_in_mass()'s ma_user check must reuse get_config_entries()'s user lookup.
+
+    Both used to call ma_usernames() (and thus list_users()) independently for the
+    same load -- get_config_entries() (already run once by rehydrate during
+    `_load_provider` above) must have cached its result for loaded_in_mass() to reuse
+    instead of fetching its own copy.
+    """
+    provider = await _load_provider(
+        mass_minimal,
+        setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: "tom"},
+    )
+    with patch.object(
+        digarr_module,
+        "ma_usernames",
+        new=AsyncMock(side_effect=AssertionError("ma_usernames was re-fetched")),
+    ):
+        await provider.loaded_in_mass()
+
+
+async def test_warns_exactly_once_when_a_pre_fix_values_api_key_is_being_ignored(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    A pre-fix rotation left in `values` must be flagged, not silently dropped.
+
+    Before today's fix, an api_key rotation on the options page landed in `values`
+    only; the client is now built exclusively from setup_data, so an instance left in
+    that state silently keeps using the old key with nothing telling the user their
+    rotation never took effect -- the options page only ever shows the masked
+    substitute, so there is no way to spot this from the UI either.
+
+    Asserts the exact call count (not just "some warning matched"): there is no
+    de-dup mechanism behind this warning -- it is naturally single-fire because
+    loaded_in_mass() itself only runs once per load and the check has no loop -- and
+    an assertion that only checks a match among the calls would not catch a second,
+    accidental warning appearing alongside it.
+    """
+    provider = await _load_provider(
+        mass_minimal,
+        setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "OLDKEY"},
+        values={CONF_API_KEY: mass_minimal.config.encrypt_string("NEVER-APPLIED")},
+    )
+    assert provider._client._api_key == "OLDKEY"
+    provider._client.whoami = AsyncMock(  # type: ignore[method-assign]
+        return_value=("test-user", False)
+    )
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    assert provider.logger.warning.call_count == 1
+    message = provider.logger.warning.call_args.args[0] % provider.logger.warning.call_args.args[1:]
+    assert "re-enter the api_key" in message.lower()
+
+
+async def test_does_not_warn_when_values_api_key_matches_the_active_one(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """No spurious warning once `values` and setup_data legitimately hold the same key."""
+    provider = await _load_provider(
+        mass_minimal,
+        setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "SAMEKEY"},
+        values={CONF_API_KEY: mass_minimal.config.encrypt_string("SAMEKEY")},
+    )
+    assert provider._client._api_key == "SAMEKEY"
+    provider._client.whoami = AsyncMock(  # type: ignore[method-assign]
+        return_value=("test-user", False)
+    )
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    provider.logger.warning.assert_not_called()
+
+
+async def test_does_not_warn_when_values_has_no_api_key_at_all(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """The ordinary case (api_key only ever in setup_data) must never warn."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://digarr:3000", CONF_API_KEY: "k"}
+    )
+    provider._client.whoami = AsyncMock(  # type: ignore[method-assign]
+        return_value=("test-user", False)
+    )
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    provider.logger.warning.assert_not_called()
