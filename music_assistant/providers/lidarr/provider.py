@@ -97,8 +97,19 @@ class LidarrProvider(PluginProvider):
         self._unregister_handles = []
         self._test_ok = False
         self._test_error: str | None = None
+        # CONF_URL is collected by the setup flow into setup_data, not values -- a
+        # freshly-created instance's config.values is {} (see controllers/config/
+        # flows.py's _finish_provider_setup) -- but it is also a declared, editable
+        # options entry, so an explicit options-page edit (which lands in `values`)
+        # must be able to permanently override the setup-collected value.
+        # _config_or_setup_value is what gives that edit priority; see its docstring
+        # for how it tells "never edited" apart from "edited to this same value".
+        # Reading plain config.get_value(CONF_URL) here (as an earlier version did)
+        # missed setup_data entirely, so any instance added after the setup flow
+        # started collecting the url there built a client from url=None and crashed
+        # immediately on MusicRaterClient's `url.rstrip("/")`.
         self._client = MusicRaterClient(
-            url=cast("str", config.get_value(CONF_URL)),
+            url=cast("str", self._config_or_setup_value(CONF_URL)),
             session=mass.http_session,
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
@@ -268,8 +279,11 @@ class LidarrProvider(PluginProvider):
         urlparse(url).netloc keeps the `user:pass@` userinfo in front of the host, so
         deriving host:port from it would leak embedded credentials. This rebuilds from
         hostname/port only, so callers can safely log or toast the result.
+
+        Reads through ``_config_or_setup_value`` (not plain ``config.get_value``) for
+        the same reason ``__init__`` does -- see that call site's comment.
         """
-        parsed = urlparse(str(self.config.get_value(CONF_URL) or ""))
+        parsed = urlparse(str(self._config_or_setup_value(CONF_URL) or ""))
         if not parsed.hostname:
             return None
         if parsed.port is not None:
@@ -284,7 +298,7 @@ class LidarrProvider(PluginProvider):
         never leak credentials embedded in the configured URL.
         """
         host = self._host_port()
-        url = str(self.config.get_value(CONF_URL) or "")
+        url = str(self._config_or_setup_value(CONF_URL) or "")
         if host is None:
             return url
         scheme = urlparse(url).scheme or "http"
@@ -417,6 +431,56 @@ class LidarrProvider(PluginProvider):
         upstream service.
         """
         return self._host_port() or self.name
+
+    def _config_or_setup_value(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
+        """
+        Resolve a setup-collected, options-editable key, preferring an explicit options edit.
+
+        ``get_setup_value`` gives the value collected once at setup time unconditional
+        priority, so an edit made later on the options page -- which lands in
+        ``config.values``, not ``setup_data`` -- would otherwise be silently ignored
+        forever. This reverses that: an explicit options value wins, and only when the
+        key has never actually been saved through the options page does the
+        setup-collected value apply.
+
+        CONF_URL here is a plain STRING, not a SECURE_STRING (digarr's CONF_API_KEY is
+        the one that needs a dedicated read path for that reason) -- ``config.get_value``
+        never needs to decrypt a STRING entry, so no ciphertext hazard applies to this
+        method at all. It exists purely for the "never edited" vs "edited to this same
+        value" distinction below.
+
+        Telling "never edited" apart from "edited to a value that happens to match a
+        default" differs before and after ``rehydrate_provider_config`` runs (right
+        after construction, before validation and async init -- so most call sites,
+        other than ``__init__`` itself, run after it):
+
+        * Before it (in ``__init__``): a key the options page has never saved is not
+          present in ``self.config.values`` at all yet (the pre-rehydrate config is
+          seeded only with whatever is genuinely in stored ``values``), so
+          ``config.get_value`` reads back falsy/None for it -- never a baked-in
+          default -- so the setup value can never be shadowed there.
+        * After it: every declared key IS present, with ``entry.value`` already
+          resolved to either the explicit stored value or ``entry.default_value``.
+          This still can't shadow the setup value -- but only because
+          ``get_config_entries()``'s own ``default_value=`` for CONF_URL is pinned to
+          ``_setup_data_only(CONF_URL)`` and NOTHING that varies with the live value
+          (see that method's own docstring for why even ``get_setup_value`` is unsafe
+          there). Computing that default from this method (or from anything else that
+          mirrors the current value) would make ``entry.value`` converge to equal
+          ``entry.default_value`` after one reload -- and since ``Config.to_raw``
+          persists an entry only when they differ, the *next* save of any field at
+          all would then silently erase this one from storage. Never do that.
+
+        Mirrors providers/digarr/__init__.py's identical helper (there needed for
+        CONF_URL and CONF_MA_USER; here only for CONF_URL).
+
+        :param key: The config/setup key to resolve (CONF_URL).
+        :param default: Value to fall back to when neither an options edit nor a
+            setup value is present.
+        """
+        if value := self.config.get_value(key):
+            return value
+        return self.get_setup_value(key, default)
 
     def _setup_data_only(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
         """

@@ -157,3 +157,34 @@ async def test_config_entry_default_never_shadows_the_stored_value_display(
 
     assert entry.default_value is None
     assert entry.value == "http://music-rater"
+
+
+async def test_fresh_instance_reads_url_from_setup_data(mass_minimal: MusicAssistant) -> None:
+    """
+    A newly-added instance's url (collected by the setup flow into setup_data) must work.
+
+    setup_flow.py collects CONF_URL into setup_data, not `values` -- a freshly created
+    instance's `values` is {} (controllers/config/flows.py's _finish_provider_setup).
+    Reading url only through plain config.get_value (as an earlier version of
+    __init__ did) misses setup_data entirely, so any instance added since the setup
+    flow started collecting it there would build MusicRaterClient(url=None, ...) and
+    crash immediately on `url.rstrip("/")` -- worse than the erasure bug this whole
+    file otherwise guards against, since it means the provider can never be added at
+    all rather than merely losing its url later.
+    """
+    provider = await _load_provider(
+        mass_minimal, values={}, setup_data={CONF_URL: "http://music-rater"}
+    )
+
+    assert provider._client._base == "http://music-rater"
+
+
+async def test_explicit_options_edit_overrides_a_setup_value(mass_minimal: MusicAssistant) -> None:
+    """An options-page url edit must win over whatever the setup flow originally collected."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://fixed-with-port:4533"},
+        setup_data={CONF_URL: "http://stale-no-port"},
+    )
+
+    assert provider._client._base == "http://fixed-with-port:4533"
