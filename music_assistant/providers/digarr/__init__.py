@@ -13,12 +13,14 @@ user because plugin rows bypass the core provider filter.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
+from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ConfigEntryType, ExternalID, ProviderFeature
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 from music_assistant_models.media_items import RecommendationFolder, UniqueList
@@ -74,6 +76,28 @@ def mbid_of(item: Artist | ItemMapping) -> str | None:
     """
     mbid: str | None = item.get_external_id(ExternalID.MB_ARTIST)
     return mbid
+
+
+async def ma_usernames(mass: MusicAssistant, logger: logging.Logger) -> list[ConfigValueOption]:
+    """
+    List MA usernames so the bound user is a picker, not free text.
+
+    Module level (like ``mbid_of``) so both this provider's own ``get_config_entries``
+    and the setup flow -- which has no loaded instance to call a method on -- share the
+    exact same lookup and empty-result fallback.
+
+    :param mass: The MusicAssistant instance to query for its user list.
+    :param logger: Logger to report a failed lookup to.
+    """
+    # controllers/webserver/auth.py:832. Note it requires the users.read
+    # scope, so wrap it: a config page (or the setup flow) opened without that
+    # scope must fall back to free text rather than failing to render at all.
+    try:
+        users = await mass.webserver.auth.list_users()
+    except Exception as err:
+        logger.warning("Could not list Music Assistant users: %s", err)
+        return []
+    return [ConfigValueOption(user.username, user.username) for user in users]
 
 
 def _build_command_dispatcher(
@@ -138,18 +162,27 @@ class DigarrProvider(PluginProvider):
         super().__init__(mass, manifest, config, supported_features)
         self._test_ok = False
         self._test_error: str | None = None
-        # CONF_URL/CONF_API_KEY are collected by the setup flow into setup_data, not
-        # values -- a freshly-created instance's config.values is {} (see
-        # controllers/config/flows.py's _finish_provider_setup), so config.get_value
-        # would silently resolve to DEFAULT_URL / "" on first load. get_setup_value
-        # reads setup_data first and falls back to the active config value, so it
-        # covers both first load and every load after the options page is re-saved.
+        # CONF_URL/CONF_API_KEY/CONF_MA_USER are all collected by the setup flow into
+        # setup_data, not values -- a freshly-created instance's config.values is {}
+        # (see controllers/config/flows.py's _finish_provider_setup) -- but all three
+        # are also declared as editable options entries, so an explicit edit on the
+        # options page must be able to permanently override the setup-collected value.
+        # _config_or_setup_value is what gives that edit priority for CONF_URL/
+        # CONF_MA_USER; see its docstring for how it tells "never edited" apart from
+        # "edited to this same value". CONF_API_KEY is deliberately NOT read through
+        # it: it is a SECURE_STRING, and self.config.get_value only decrypts a value
+        # read through an entry whose *type* is SECURE_STRING -- the passthrough
+        # entry construction-time reads go through (seed_stored_config_values) is a
+        # plain STRING, so an options-page rotation would hand this client raw
+        # ciphertext instead of the key. update_config() below keeps setup_data (which
+        # get_setup_value always decrypts, regardless of entry type) in sync with any
+        # such rotation instead.
         self._client = DigarrClient(
-            url=cast("str", self.get_setup_value(CONF_URL, DEFAULT_URL)),
+            url=cast("str", self._config_or_setup_value(CONF_URL, DEFAULT_URL)),
             api_key=cast("str", self.get_setup_value(CONF_API_KEY, "")),
             session=mass.http_session,
         )
-        self._ma_user = cast("str", config.get_value(CONF_MA_USER, ""))
+        self._ma_user = cast("str", self._config_or_setup_value(CONF_MA_USER, ""))
         self._row_size = int(cast("int", config.get_value(CONF_ROW_SIZE, ROW_ITEM_TARGET)))
         self._min_score = float(cast("float", config.get_value(CONF_MIN_SCORE, 0.0)))
         # The Discover row's current generation. Populated by _refresh; kept here (rather
@@ -171,29 +204,55 @@ class DigarrProvider(PluginProvider):
         """
         Return the options entries shown for this (loaded) instance.
 
-        CONF_URL and CONF_API_KEY are collected by the setup flow but must be
-        declared here as well: the framework re-parses the stored config against
-        exactly these entries after construction, so a key missing from this tuple
-        reads back as None for the rest of the instance's life.
+        CONF_URL, CONF_API_KEY and CONF_MA_USER are all collected by the setup flow
+        but must be declared here as well: the framework re-parses the stored config
+        against exactly these entries after construction, so a key missing from this
+        tuple reads back as None for the rest of the instance's life.
+
+        CONF_URL and CONF_MA_USER's ``default_value=`` below is deliberately
+        ``_setup_data_only`` -- never ``get_setup_value`` (falls back to this same
+        field's own *current* value once it's absent from ``setup_data``, which
+        existing CONF_MA_USER instances always are) and never anything else that
+        mirrors the field's current effective value (e.g. ``_config_or_setup_value``):
+        ``Config.to_raw`` persists an entry only when ``value != default_value``, so a
+        default that tracks the live value converges to equal it after one reload,
+        and the *next* save of *any* field silently drops this one from storage.
+        ``Config.parse`` already overlays a stored value as ``entry.value``, which is
+        what the options page actually renders -- default_value only needs to cover
+        the genuinely-unset case.
+
+        CONF_API_KEY gets no ``default_value`` at all, for a different reason:
+        ``Config.__post_serialize__`` masks a SECURE_STRING's ``value`` to
+        ``SECURE_STRING_SUBSTITUTE`` before it ever reaches an API response, but does
+        NOT mask ``default_value`` -- so setting it to the decrypted setup value (as
+        an earlier version of this method did) would serve the plaintext key to
+        anyone with ``CONFIG_PROVIDERS_READ`` (any household member, not just an
+        admin), defeating the whole point of a per-user key. Required is also
+        ``False`` here for the same reason CONF_MA_USER is: ``Config.validate()``
+        rejects a required entry with neither a value nor a default, which would
+        stop the instance loading with no default to fall back to.
         """
-        users = await self._ma_usernames()
+        users = await ma_usernames(self.mass, self.logger)
         return (
             ConfigEntry(
                 key=CONF_URL,
                 type=ConfigEntryType.STRING,
                 required=True,
-                default_value=self.get_setup_value(CONF_URL, DEFAULT_URL),
+                default_value=self._setup_data_only(CONF_URL, DEFAULT_URL),
             ),
             ConfigEntry(
                 key=CONF_API_KEY,
                 type=ConfigEntryType.SECURE_STRING,
-                required=True,
-                default_value=self.get_setup_value(CONF_API_KEY),
+                # Never required and never given a default_value -- see this
+                # method's own docstring for why a default here would leak the
+                # plaintext key to any household member, not just the owner.
+                required=False,
             ),
             ConfigEntry(
                 key=CONF_MA_USER,
                 type=ConfigEntryType.STRING,
-                # Left optional: on first load no user has been picked yet, and a
+                # Left optional: an existing instance predating this being collected at
+                # setup, or one whose lookup failed, has no user picked yet, and a
                 # required entry with an unresolvable default (None) fails
                 # Config.validate() and rolls the whole instance back before it ever
                 # gets to load. The Discover row just doesn't render until one is set.
@@ -201,7 +260,7 @@ class DigarrProvider(PluginProvider):
                 # An empty list is the framework's own "no options" value: it's what makes
                 # this render as free text instead of an unusable empty picker.
                 options=users,
-                default_value=self.config.get_value(CONF_MA_USER),
+                default_value=self._setup_data_only(CONF_MA_USER),
             ),
             ConfigEntry(
                 key=CONF_ROW_SIZE,
@@ -289,7 +348,7 @@ class DigarrProvider(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """
-        Register the context-menu actions (once) and probe digarr for connectivity.
+        Register the context-menu actions (once), probe digarr, and validate ma_user.
 
         digarr is multi-instance -- one instance per digarr user -- but
         ``mass.register_api_command`` raises if a command name is already
@@ -346,9 +405,24 @@ class DigarrProvider(PluginProvider):
             self.logger.warning(
                 "digarr at %s unreachable on load: %s. The context-menu actions will "
                 "surface this error on first use.",
-                self.get_setup_value(CONF_URL, DEFAULT_URL),
+                self._config_or_setup_value(CONF_URL, DEFAULT_URL),
                 err,
             )
+
+        if self._ma_user and (known_users := await ma_usernames(self.mass, self.logger)):
+            usernames = {cast("str", user.value) for user in known_users}
+            if self._ma_user not in usernames:
+                # A stale or mistyped ma_user (the free-text fallback has no picker to
+                # catch it) means _viewer_is_bound_user() can never match anyone, so
+                # the Discover row would go invisible with no error explaining why --
+                # the exact symptom this warning is here to head off.
+                self.logger.warning(
+                    "digarr: ma_user %r does not match any known Music Assistant user "
+                    "(%s) -- the Discover row will be invisible to every viewer until "
+                    "this is corrected.",
+                    self._ma_user,
+                    ", ".join(sorted(usernames)),
+                )
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -394,6 +468,41 @@ class DigarrProvider(PluginProvider):
                 for unregister in owned_handles:
                     unregister()
         await super().unload(is_removed)
+
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """
+        Mirror a genuine api_key edit into setup_data before the reload the base class schedules.
+
+        CONF_API_KEY is never read back through the options-entry pipeline (see
+        ``_config_or_setup_value``'s docstring) because the two decrypt differently:
+        setup_data is a single blob ``get_setup_value`` always decrypts, while a
+        SECURE_STRING ``ConfigEntry`` only decrypts when read through an entry
+        actually typed SECURE_STRING -- not true of the plain-STRING passthrough
+        entry construction-time reads go through. Writing a real edit into setup_data
+        instead keeps ``get_setup_value`` -- what the client is always built from --
+        the single, always-correctly-decrypting source of truth for this key; the
+        reload the base implementation schedules below then already sees it there.
+
+        ``changed_keys`` can include CONF_API_KEY even when nothing was actually
+        typed. The shipped frontend does skip resubmitting an untouched SECURE_STRING
+        (EditConfig.vue / SetupFlowDialog.vue), so a normal options-page save that
+        only touches another field never flags this one. But a non-frontend caller
+        need not: the MCP config tool, for one, masks the current value to
+        ``SECURE_STRING_SUBSTITUTE`` before deciding what to forward, and could echo
+        that placeholder straight back as a "new" value. It never equals the
+        previously stored ciphertext, so ``Config.update`` would register it as
+        changed regardless of intent -- the check below is defence against that
+        placeholder ever being treated as a real rotation, not against the frontend.
+
+        :param config: The freshly saved config, with the new values already applied
+            in memory (not yet encrypted -- only ``to_raw()`` does that).
+        :param changed_keys: The dotted keys ("values/<key>") this save changed.
+        """
+        if f"values/{CONF_API_KEY}" in changed_keys:
+            new_key = config.values[CONF_API_KEY].value
+            if isinstance(new_key, str) and new_key and new_key != SECURE_STRING_SUBSTITUTE:
+                self._update_setup_data(CONF_API_KEY, new_key)
+        await super().update_config(config, changed_keys)
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """
@@ -522,17 +631,75 @@ class DigarrProvider(PluginProvider):
         """
         return await self._act(item, "pending", remove_lidarr_artist=True)
 
-    async def _ma_usernames(self) -> list[ConfigValueOption]:
-        """List MA usernames so the bound user is a picker, not free text."""
-        # controllers/webserver/auth.py:832. Note it requires the users.read
-        # scope, so wrap it: a config page opened without that scope must fall
-        # back to free text rather than failing to render at all.
-        try:
-            users = await self.mass.webserver.auth.list_users()
-        except Exception as err:
-            self.logger.warning("Could not list Music Assistant users: %s", err)
-            return []
-        return [ConfigValueOption(user.username, user.username) for user in users]
+    def _config_or_setup_value(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
+        """
+        Resolve a setup-collected, options-editable key, preferring an explicit options edit.
+
+        ``get_setup_value`` gives the value collected once at setup time unconditional
+        priority, so an edit made later on the options page -- which lands in
+        ``config.values``, not ``setup_data`` -- would otherwise be silently ignored
+        forever (this shipped as a real bug for CONF_URL). This reverses that: an
+        explicit options value wins, and only when the key has never actually been
+        saved through the options page does the setup-collected value apply.
+
+        Only for a plain STRING entry (CONF_URL, CONF_MA_USER) -- NEVER a
+        SECURE_STRING (CONF_API_KEY). ``Config.get_value`` decrypts only when the
+        *entry it reads through* is typed SECURE_STRING; the passthrough entry
+        construction-time reads go through (``seed_stored_config_values``, before
+        ``rehydrate_provider_config`` applies this provider's real declared types) is
+        a plain STRING regardless of the field, so reading a rotated key through this
+        method there would hand back raw ciphertext. See ``update_config`` for how
+        CONF_API_KEY is kept current instead.
+
+        Telling "never edited" apart from "edited to a value that happens to match a
+        default" differs before and after ``rehydrate_provider_config`` runs (right
+        after construction, before validation and async init -- so most call sites,
+        other than ``__init__`` itself, run after it):
+
+        * Before it (in ``__init__``): a key the options page has never saved is not
+          present in ``self.config.values`` at all yet (the pre-rehydrate config is
+          seeded only with whatever is genuinely in stored ``values``), so
+          ``config.get_value`` reads back falsy/None for it -- never a baked-in
+          default -- so the setup value can never be shadowed there.
+        * After it: every declared key IS present, with ``entry.value`` already
+          resolved to either the explicit stored value or ``entry.default_value``.
+          This still can't shadow the setup value -- but only because
+          ``get_config_entries()``'s own ``default_value=`` for these keys is pinned
+          to ``_setup_data_only(key)`` and NOTHING that varies with the live value
+          (see that method's own docstring for why even ``get_setup_value`` is unsafe
+          there). Computing that default from this method (or from anything else that
+          mirrors the current value) would make ``entry.value`` converge to equal
+          ``entry.default_value`` after one reload -- and since ``Config.to_raw``
+          persists an entry only when they differ, the *next* save of any field at
+          all would then silently erase this one from storage. Never do that.
+
+        :param key: The config/setup key to resolve (CONF_URL or CONF_MA_USER).
+        :param default: Value to fall back to when neither an options edit nor a
+            setup value is present.
+        """
+        if value := self.config.get_value(key):
+            return value
+        return self.get_setup_value(key, default)
+
+    def _setup_data_only(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
+        """
+        Return ``key``'s setup_data value, WITHOUT ever falling back to its live config value.
+
+        The only safe source for ``get_config_entries()``'s ``default_value=`` (see
+        ``_config_or_setup_value``'s docstring): unlike ``self.get_setup_value``,
+        which falls back to ``self.get_config_value`` -- i.e. this same field's own
+        current value -- when the key is absent from ``setup_data``, this falls back
+        only to the static ``default`` given here. That distinction is not academic:
+        CONF_MA_USER predates being collected at setup (both production instances
+        have it in ``values`` alone, nothing in ``setup_data``), so
+        ``get_setup_value(CONF_MA_USER)`` there resolves right back to the live
+        ``values`` entry -- reproducing the exact self-erasing default the options
+        page must never have.
+
+        :param key: The setup data key to look up.
+        :param default: Value to return when the key is not present in setup_data.
+        """
+        return self.mass.config.get_provider_setup_value(self.instance_id, key, default)
 
     async def _refresh(self) -> None:
         """
@@ -546,6 +713,13 @@ class DigarrProvider(PluginProvider):
         serving the previous generation instead of blanking the row. A
         ``DigarrError`` is logged and swallowed for the same reason: this runs
         from a background schedule with no caller to raise to.
+
+        Always logs one INFO summary line -- even when every candidate resolved and
+        nothing is otherwise worth reporting -- so "did the row populate?" is
+        answerable from the logs alone. That summary also separates a candidate that
+        resolved to nothing on any provider from one that resolved fine but was
+        dropped because the row already held ``self._row_size`` items; today's more
+        detailed unresolved-artists line only ever covered the former.
         """
         try:
             candidates = [
@@ -567,16 +741,19 @@ class DigarrProvider(PluginProvider):
         artist_ids: dict[str, int] = {}
         mbid_artist_ids: dict[str, int] = {}
         unresolved: list[str] = []
+        dropped_by_cap = 0
         for rec, artist in zip(candidates, resolved, strict=True):
             if artist is None:
                 unresolved.append(rec.artist_name)
                 continue
-            if len(items) < self._row_size:
-                items.append(artist)
-                rec_ids[artist.uri] = rec.id
-                mbid_rec_ids[rec.artist_mbid] = rec.id
-                artist_ids[artist.uri] = rec.artist_id
-                mbid_artist_ids[rec.artist_mbid] = rec.artist_id
+            if len(items) >= self._row_size:
+                dropped_by_cap += 1
+                continue
+            items.append(artist)
+            rec_ids[artist.uri] = rec.id
+            mbid_rec_ids[rec.artist_mbid] = rec.id
+            artist_ids[artist.uri] = rec.artist_id
+            mbid_artist_ids[rec.artist_mbid] = rec.artist_id
 
         self._items = items
         self._rec_ids = rec_ids
@@ -584,13 +761,21 @@ class DigarrProvider(PluginProvider):
         self._artist_ids = artist_ids
         self._mbid_artist_ids = mbid_artist_ids
 
+        message = (
+            "digarr: refresh fetched %s pending recommendation(s): %s resolved into the "
+            "row, %s unresolved on any provider, %s dropped by the row size cap (%s)"
+        )
+        args: list[Any] = [
+            len(candidates),
+            len(items),
+            len(unresolved),
+            dropped_by_cap,
+            self._row_size,
+        ]
         if unresolved:
-            self.logger.info(
-                "digarr: %s of %s recommendations resolved to nothing on any provider: %s",
-                len(unresolved),
-                len(candidates),
-                ", ".join(unresolved[:10]),
-            )
+            message += ": %s"
+            args.append(", ".join(unresolved[:10]))
+        self.logger.info(message, *args)
 
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
 

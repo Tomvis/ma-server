@@ -76,42 +76,6 @@ async def test_test_connection_surfaces_an_auth_failure(provider: DigarrProvider
     assert "revoked" in (entries["test_error_label"].description or "")
 
 
-async def test_client_uses_setup_flow_collected_values() -> None:
-    """
-    The client is built from setup_data, not from config.get_value.
-
-    A freshly-created instance's config.values is {} (session.finish() persists
-    collected fields into setup_data, not values), so reading CONF_URL/CONF_API_KEY
-    through config.get_value resolves to DEFAULT_URL / "" no matter what the user
-    entered during setup. This constructs a provider whose config.get_value is
-    rigged to return deliberately-wrong values, so the test only passes if the
-    client actually read through get_setup_value's setup_data path instead.
-    """
-    mass = MagicMock()
-    mass.http_session = MagicMock()
-    setup_data = {CONF_URL: "http://real-digarr:9999", CONF_API_KEY: "real-secret"}
-    mass.config.get = MagicMock(return_value=setup_data)
-    mass.config.decrypt_string = MagicMock(side_effect=lambda value: value)
-    manifest = MagicMock()
-    manifest.type = ProviderType.PLUGIN
-    manifest.domain = "digarr"
-    config = MagicMock()
-    config.name = "digarr - Tom"
-    config.instance_id = "digarr--abcd1234"
-    config.values = {}
-    config.get_value = MagicMock(
-        side_effect=lambda key, default=None: {
-            CONF_URL: "http://wrong-should-not-be-read:1",
-            CONF_API_KEY: "wrong-should-not-be-read",
-        }.get(key, default)
-    )
-
-    provider = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
-
-    assert provider._client._base == "http://real-digarr:9999"
-    assert provider._client._api_key == "real-secret"
-
-
 async def test_ma_user_entry_is_not_required(provider: DigarrProvider) -> None:
     """
     CONF_MA_USER must not be required.

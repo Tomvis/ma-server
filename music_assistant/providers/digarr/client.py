@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DigarrError(Exception):
@@ -59,13 +62,26 @@ class DigarrClient:
             # real item, and a card that cannot be opened is worse than no card.
             if not mbid:
                 continue
+            # A missing/non-numeric id is a malformed record, not something a caller
+            # catching DigarrError (e.g. _refresh) would expect as a bare KeyError --
+            # but it must not be fatal to the whole page: one bad record discarding
+            # every other, good, recommendation in the same response would be worse
+            # than just dropping the one card that cannot be resolved.
+            try:
+                rec_id = int(raw["id"])
+                artist_id = int(artist["id"])
+            except (KeyError, TypeError, ValueError) as err:
+                _LOGGER.warning(
+                    "digarr: skipping malformed pending recommendation (%s): %s", err, raw
+                )
+                continue
             results.append(
                 DigarrRecommendation(
-                    id=int(raw["id"]),
+                    id=rec_id,
                     kind=str(raw.get("kind", "artist")),
                     score=float(raw.get("score", 0.0)),
                     status=str(raw.get("status", "pending")),
-                    artist_id=int(artist["id"]),
+                    artist_id=artist_id,
                     artist_name=str(artist.get("name") or "Unknown Artist"),
                     artist_mbid=str(mbid),
                     image_url=artist.get("imageUrl"),
