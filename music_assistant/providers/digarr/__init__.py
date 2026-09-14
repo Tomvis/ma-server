@@ -12,11 +12,16 @@ user because plugin rows bypass the core provider filter.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
+from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
-from music_assistant_models.enums import ConfigEntryType, ProviderFeature
+from music_assistant_models.enums import ConfigEntryType, ExternalID, ProviderFeature
+from music_assistant_models.media_items import RecommendationFolder, UniqueList
 
+from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.digarr.client import DigarrClient, DigarrError
 from music_assistant.providers.digarr.constants import (
@@ -29,11 +34,22 @@ from music_assistant.providers.digarr.constants import (
     CONF_ROW_SIZE,
     CONF_URL,
     DEFAULT_URL,
+    EVENT_RECOMMENDATIONS_UPDATED,
+    REFRESH_TASK_ID,
+    RESOLUTION_BUFFER,
+    ROW_ID,
     ROW_ITEM_TARGET,
 )
+from music_assistant.providers.digarr.parsers import resolve_artist
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.media_items import (
+        Artist,
+        BrowseFolder,
+        ItemMapping,
+        MediaItemType,
+    )
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -42,6 +58,19 @@ if TYPE_CHECKING:
 SUPPORTED_FEATURES: set[ProviderFeature] = {
     ProviderFeature.RECOMMENDATIONS,
 }
+
+
+def mbid_of(item: Artist | ItemMapping) -> str | None:
+    """
+    Return an item's MusicBrainz artist id, if it has one.
+
+    Defined at module level (rather than as a method) purely so tests can patch
+    it directly.
+
+    :param item: The resolved item to read the identifier from.
+    """
+    mbid: str | None = item.get_external_id(ExternalID.MB_ARTIST)
+    return mbid
 
 
 async def setup(
@@ -79,6 +108,12 @@ class DigarrProvider(PluginProvider):
         self._ma_user = cast("str", config.get_value(CONF_MA_USER, ""))
         self._row_size = int(cast("int", config.get_value(CONF_ROW_SIZE, ROW_ITEM_TARGET)))
         self._min_score = float(cast("float", config.get_value(CONF_MIN_SCORE, 0.0)))
+        # The Discover row's current generation. Populated by _refresh; kept here (rather
+        # than in handle_async_init) so a fresh instance always has a well-defined, empty
+        # row instead of racing the first refresh with an AttributeError.
+        self._items: list[Artist] = []
+        self._rec_ids: dict[str, int] = {}
+        self._mbid_rec_ids: dict[str, int] = {}
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """
@@ -179,6 +214,103 @@ class DigarrProvider(PluginProvider):
             self._test_error = f"{type(err).__name__}: {err}"
         return await self.get_config_entries()
 
+    async def handle_async_init(self) -> None:
+        """
+        Arm the recurring refresh and an initial delayed populate.
+
+        Runs after ``get_config_entries`` was already resolved, so config-derived
+        attributes (``self._ma_user``, ``self._row_size``, ``self._min_score``)
+        are already set by the time this runs.
+        """
+        self._unregister_handles: list[Callable[[], None]] = []
+        self.mass.tasks.register_scheduled_task(
+            task_id=f"{REFRESH_TASK_ID}_{self.instance_id}",
+            name="Refresh digarr recommendations",
+            handler=self._refresh,
+            schedule=TaskSchedule.hourly(every=6),
+            translation_key="refresh_digarr_recommendations",
+            translation_owner=self.translation_owner,
+        )
+        # Delayed so streaming providers have finished loading and can be searched.
+        self.mass.call_later(
+            20, self._refresh, task_id=f"{REFRESH_TASK_ID}_initial_{self.instance_id}"
+        )
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """
+        Tear down the scheduled refresh and any other registered handles.
+
+        :param is_removed: Whether the provider instance itself is being removed,
+            as opposed to a reload; passed through so the task's persisted state
+            (e.g. last-run bookkeeping) is dropped only on real removal.
+        """
+        self.mass.tasks.unregister_scheduled_task(
+            f"{REFRESH_TASK_ID}_{self.instance_id}",
+            clear_persisted_state=is_removed,
+        )
+        for unregister in self._unregister_handles:
+            unregister()
+        self._unregister_handles.clear()
+        await super().unload(is_removed)
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """
+        Return this instance's single Discover row descriptor, gated to its bound user.
+
+        ``_apply_user_provider_filter`` (controllers/music/controller.py:2796) only
+        checks ``ProviderType.MUSIC`` providers, so a plugin row like this one is
+        handed to every viewer unless the provider gates itself here. Must do no
+        I/O: this runs inside the 5s ``RECOMMENDATIONS_ROWS_TIMEOUT``, so the row
+        descriptor is built from state ``_refresh`` already computed.
+        """
+        user = get_current_user()
+        if user is None or user.username != self._ma_user:
+            return []
+        return [
+            RecommendationFolder(
+                item_id=ROW_ID,
+                provider=self.instance_id,
+                name="digarr — Up Next",
+                translation_key=ROW_ID,
+                icon="mdi-radar",
+            )
+        ]
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Return the items backing the Discover row.
+
+        An empty result is a valid, deliberate response (an empty row still
+        renders so a broken integration looks broken rather than absent); an
+        unrecognised ``item_id`` returns the same empty list.
+
+        :param item_id: The item_id of the row, as returned by get_recommendations.
+        """
+        if item_id != ROW_ID:
+            return UniqueList()
+        return UniqueList(self._items)
+
+    def recommendation_id_for(self, uri: str, item: Artist | ItemMapping) -> int | None:
+        """
+        Map a resolved item back to the digarr recommendation id it came from.
+
+        Tries the uri recorded at the last successful refresh first, then falls
+        back to the item's MusicBrainz artist id for a uri that has since
+        rotated (e.g. a streaming provider reissuing an id). Never falls back to
+        a name match: approving the wrong artist triggers a real Lidarr download.
+
+        :param uri: The resolved item's uri.
+        :param item: The resolved item itself, used for its MusicBrainz id as a
+            fallback lookup key.
+        """
+        if (rec_id := self._rec_ids.get(uri)) is not None:
+            return rec_id
+        if (mbid := mbid_of(item)) is not None:
+            return self._mbid_rec_ids.get(mbid)
+        return None
+
     async def _ma_usernames(self) -> list[ConfigValueOption]:
         """List MA usernames so the bound user is a picker, not free text."""
         # controllers/webserver/auth.py:832. Note it requires the users.read
@@ -190,3 +322,57 @@ class DigarrProvider(PluginProvider):
             self.logger.warning("Could not list Music Assistant users: %s", err)
             return []
         return [ConfigValueOption(user.username, user.username) for user in users]
+
+    async def _refresh(self) -> None:
+        """
+        Rebuild the Discover row from digarr's current pending recommendations.
+
+        Candidates below ``self._min_score`` never reach resolution. The rest are
+        resolved concurrently (the search semaphore lives in parsers.py), and the
+        first ``self._row_size`` that resolve become the new row. The new item
+        list and both id maps are built into local variables and assigned to
+        instance state only at the end, so a slow or failing refresh keeps
+        serving the previous generation instead of blanking the row. A
+        ``DigarrError`` is logged and swallowed for the same reason: this runs
+        from a background schedule with no caller to raise to.
+        """
+        try:
+            candidates = [
+                rec
+                for rec in await self._client.get_pending(limit=RESOLUTION_BUFFER)
+                if rec.score >= self._min_score
+            ]
+        except DigarrError as err:
+            self.logger.warning("digarr: could not fetch pending recommendations: %s", err)
+            return
+
+        resolved = await asyncio.gather(
+            *[resolve_artist(rec, self.mass, self.instance_id) for rec in candidates]
+        )
+
+        items: list[Artist] = []
+        rec_ids: dict[str, int] = {}
+        mbid_rec_ids: dict[str, int] = {}
+        unresolved: list[str] = []
+        for rec, artist in zip(candidates, resolved, strict=True):
+            if artist is None:
+                unresolved.append(rec.artist_name)
+                continue
+            if len(items) < self._row_size:
+                items.append(artist)
+                rec_ids[artist.uri] = rec.id
+                mbid_rec_ids[rec.artist_mbid] = rec.id
+
+        self._items = items
+        self._rec_ids = rec_ids
+        self._mbid_rec_ids = mbid_rec_ids
+
+        if unresolved:
+            self.logger.info(
+                "digarr: %s of %s recommendations resolved to nothing on any provider: %s",
+                len(unresolved),
+                len(candidates),
+                ", ".join(unresolved[:10]),
+            )
+
+        self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
