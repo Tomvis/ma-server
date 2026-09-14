@@ -263,8 +263,7 @@ class DigarrProvider(PluginProvider):
         I/O: this runs inside the 5s ``RECOMMENDATIONS_ROWS_TIMEOUT``, so the row
         descriptor is built from state ``_refresh`` already computed.
         """
-        user = get_current_user()
-        if user is None or user.username != self._ma_user:
+        if not self._viewer_is_bound_user():
             return []
         return [
             RecommendationFolder(
@@ -282,13 +281,22 @@ class DigarrProvider(PluginProvider):
         """
         Return the items backing the Discover row.
 
-        An empty result is a valid, deliberate response (an empty row still
-        renders so a broken integration looks broken rather than absent); an
-        unrecognised ``item_id`` returns the same empty list.
+        Gated the same way as get_recommendations: the recommendations controller's
+        own re-check of ``_apply_user_provider_filter`` does not gate plugin
+        providers, so without this a client that already knows the row id and this
+        instance id could fetch another user's row items directly. That matters
+        beyond row visibility -- a future approve/reject/block action resolves an
+        item uri back to a recommendation id via this instance's own API key (i.e.
+        as its bound user), so an ungated items call is the first half of one user
+        acting as another.
+
+        An empty result is otherwise a valid, deliberate response for the bound
+        user too (an empty row still renders so a broken integration looks broken
+        rather than absent); an unrecognised ``item_id`` returns the same empty list.
 
         :param item_id: The item_id of the row, as returned by get_recommendations.
         """
-        if item_id != ROW_ID:
+        if not self._viewer_is_bound_user() or item_id != ROW_ID:
             return UniqueList()
         return UniqueList(self._items)
 
@@ -376,3 +384,15 @@ class DigarrProvider(PluginProvider):
             )
 
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
+
+    def _viewer_is_bound_user(self) -> bool:
+        """
+        Return whether the current viewer is the Music Assistant user this instance is bound to.
+
+        The single check backing both get_recommendations and get_recommendation_items,
+        so the two entry points can never drift apart. Plugin providers are not gated by
+        ``_apply_user_provider_filter`` (controllers/music/controller.py:2796), so without
+        this every viewer would see -- and could fetch -- every digarr instance's row.
+        """
+        user = get_current_user()
+        return user is not None and user.username == self._ma_user

@@ -91,13 +91,39 @@ async def test_row_survives_an_empty_result(provider: DigarrProvider) -> None:
     """An empty row still renders, so a broken integration looks broken, not absent."""
     with as_user("tom"):
         rows = await provider.get_recommendations()
+        items = await provider.get_recommendation_items(ROW_ID)
     assert len(rows) == 1
-    assert await provider.get_recommendation_items(ROW_ID) == []
+    assert items == []
 
 
 async def test_unknown_row_id_returns_empty(provider: DigarrProvider) -> None:
     """An unrecognised row id yields nothing rather than raising."""
-    assert await provider.get_recommendation_items("not-a-row") == []
+    with as_user("tom"):
+        assert await provider.get_recommendation_items("not-a-row") == []
+
+
+async def test_items_are_returned_to_the_bound_user(provider: DigarrProvider) -> None:
+    """The configured user can fetch the row's items."""
+    existing = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._items = [existing]
+    with as_user("tom"):
+        assert await provider.get_recommendation_items(ROW_ID) == [existing]
+
+
+async def test_items_are_hidden_from_every_other_user(provider: DigarrProvider) -> None:
+    """Lera must not be able to fetch Tom's row items directly, even knowing the row id."""
+    existing = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._items = [existing]
+    with as_user("lera"):
+        assert await provider.get_recommendation_items(ROW_ID) == []
+
+
+async def test_items_are_hidden_when_there_is_no_current_user(provider: DigarrProvider) -> None:
+    """No identifiable viewer means no items either."""
+    existing = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._items = [existing]
+    with as_user(None):
+        assert await provider.get_recommendation_items(ROW_ID) == []
 
 
 async def test_refresh_populates_items_and_the_id_map(provider: DigarrProvider) -> None:
