@@ -84,6 +84,30 @@ def as_user(username: str | None) -> AbstractContextManager[MagicMock]:
     return patch("music_assistant.providers.digarr.get_current_user", return_value=user)
 
 
+def _wire_setup_data_passthrough(mass: MagicMock, api_key: str) -> None:
+    """
+    Make a mocked ``mass.config`` answer ``get_setup_value(CONF_API_KEY, ...)`` with ``api_key``.
+
+    ``get_setup_value`` (models/provider.py:330) reads ``mass.config.get(".../setup_data")``
+    and decrypts any string it finds through ``mass.config.decrypt_string``. Left
+    unconfigured, an auto-mocked ``mass.config`` answers both with more auto-mocks, so
+    the client ends up built from a value that matches nothing -- fine as long as
+    nothing compares it, but the api_key/values-mismatch warning in ``loaded_in_mass``
+    now does exactly that. Wiring a real (identity-decrypting) passthrough here keeps
+    ``config.get_value(CONF_API_KEY)`` (below) and the client's actual key consistent,
+    the same way they always are outside these mocks.
+
+    :param mass: The mock ``mass`` a DigarrProvider is about to be constructed with.
+    :param api_key: The api_key value setup_data should answer with.
+    """
+
+    def _fake_config_get(key: str, default: Any = None) -> Any:
+        return {CONF_API_KEY: api_key} if key.endswith("/setup_data") else default
+
+    mass.config.get = MagicMock(side_effect=_fake_config_get)
+    mass.config.decrypt_string = MagicMock(side_effect=lambda value: value)
+
+
 @pytest.fixture
 def provider() -> Generator[DigarrProvider]:
     """
@@ -104,6 +128,7 @@ def provider() -> Generator[DigarrProvider]:
     config.instance_id = "digarr--abcd1234"
     values = {CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: "tom"}
     config.get_value = MagicMock(side_effect=lambda key, default=None: values.get(key, default))
+    _wire_setup_data_passthrough(mass, "k")
     prov = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
     prov._items = []
     prov._rec_ids = {}
@@ -174,6 +199,7 @@ def make_provider(mass: MagicMock, *, ma_user: str, instance_id: str, name: str)
     config.instance_id = instance_id
     values = {CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: ma_user}
     config.get_value = MagicMock(side_effect=lambda key, default=None: values.get(key, default))
+    _wire_setup_data_passthrough(mass, "k")
     prov = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
     prov._items = []
     prov._rec_ids = {}
