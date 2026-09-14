@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from music_assistant.providers.digarr.client import (
@@ -119,42 +121,54 @@ async def test_skips_records_with_no_mbid(session: FakeSession) -> None:
     assert await client.get_pending(limit=15) == []
 
 
-async def test_missing_recommendation_id_raises_digarr_error(session: FakeSession) -> None:
+async def test_missing_recommendation_id_is_skipped_not_fatal(
+    session: FakeSession, caplog: pytest.LogCaptureFixture
+) -> None:
     """
-    A malformed response missing the recommendation id must not escape as a bare KeyError.
+    A malformed record missing the recommendation id must not escape as a bare KeyError.
 
-    _refresh (and any other caller) reasonably catches DigarrError; a bare KeyError
-    would propagate as an unexpected exception instead.
+    Nor may it abort the whole page: a good recommendation in the same response must
+    still come back, with the malformed one just dropped and logged.
     """
     session.queue(
         FakeResponse(
             200,
             {
-                "total": 1,
+                "total": 2,
                 "items": [
                     {
                         "kind": "artist",
                         "score": 1.0,
                         "status": "pending",
                         "artist": {"id": 1, "name": "X", "mbid": "some-mbid"},
-                    }
+                    },
+                    {
+                        "id": 2,
+                        "kind": "artist",
+                        "score": 1.0,
+                        "status": "pending",
+                        "artist": {"id": 2, "name": "Good", "mbid": "good-mbid"},
+                    },
                 ],
             },
         )
     )
     client = DigarrClient(BASE, "k", session)
 
-    with pytest.raises(DigarrError):
-        await client.get_pending(limit=15)
+    with caplog.at_level(logging.WARNING):
+        recs = await client.get_pending(limit=15)
+
+    assert [r.id for r in recs] == [2]
+    assert any("malformed" in record.message.lower() for record in caplog.records)
 
 
-async def test_missing_artist_id_raises_digarr_error(session: FakeSession) -> None:
-    """A malformed response missing the nested artist's id must also raise DigarrError."""
+async def test_missing_artist_id_is_skipped_not_fatal(session: FakeSession) -> None:
+    """A malformed record missing the nested artist's id is dropped, not raised."""
     session.queue(
         FakeResponse(
             200,
             {
-                "total": 1,
+                "total": 2,
                 "items": [
                     {
                         "id": 1,
@@ -162,15 +176,23 @@ async def test_missing_artist_id_raises_digarr_error(session: FakeSession) -> No
                         "score": 1.0,
                         "status": "pending",
                         "artist": {"name": "X", "mbid": "some-mbid"},
-                    }
+                    },
+                    {
+                        "id": 2,
+                        "kind": "artist",
+                        "score": 1.0,
+                        "status": "pending",
+                        "artist": {"id": 2, "name": "Good", "mbid": "good-mbid"},
+                    },
                 ],
             },
         )
     )
     client = DigarrClient(BASE, "k", session)
 
-    with pytest.raises(DigarrError):
-        await client.get_pending(limit=15)
+    recs = await client.get_pending(limit=15)
+
+    assert [r.id for r in recs] == [2]
 
 
 @pytest.mark.parametrize("status", [401, 403])
