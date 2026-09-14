@@ -166,7 +166,8 @@ async def test_refresh_summary_distinguishes_unresolved_from_row_cap_drops(
     An item that resolved but was cut by the row-size cap is not the same as an unresolvable one.
 
     Today both reasons an item does not appear in the row were invisible or
-    conflated; the summary line must report them as distinct counts.
+    conflated; the summary line must report them as distinct counts. Both counts
+    are folded into the one summary line (not a second, separate log call).
     """
     provider._row_size = 1
     resolved_a = Artist(item_id="a", provider="ytmusic", name="A", provider_mappings=set())
@@ -185,11 +186,13 @@ async def test_refresh_summary_distinguishes_unresolved_from_row_cap_drops(
         await provider._refresh()
 
     assert provider._items == [resolved_a]
-    summary_args = provider.logger.info.call_args_list[0].args
-    summary = summary_args[0] % summary_args[1:]
+    provider.logger.info.assert_called_once()
+    args = provider.logger.info.call_args.args
+    summary = args[0] % args[1:]
     assert "1 resolved into the row" in summary
     assert "1 unresolved on any provider" in summary
     assert "1 dropped by the row size cap" in summary
+    assert "C" in summary
 
 
 async def test_refresh_signals_the_frontend(provider: DigarrProvider) -> None:

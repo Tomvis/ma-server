@@ -743,22 +743,21 @@ class DigarrProvider(PluginProvider):
         self._artist_ids = artist_ids
         self._mbid_artist_ids = mbid_artist_ids
 
-        self.logger.info(
+        message = (
             "digarr: refresh fetched %s pending recommendation(s): %s resolved into the "
-            "row, %s unresolved on any provider, %s dropped by the row size cap (%s)",
+            "row, %s unresolved on any provider, %s dropped by the row size cap (%s)"
+        )
+        args: list[Any] = [
             len(candidates),
             len(items),
             len(unresolved),
             dropped_by_cap,
             self._row_size,
-        )
+        ]
         if unresolved:
-            self.logger.info(
-                "digarr: %s of %s recommendations resolved to nothing on any provider: %s",
-                len(unresolved),
-                len(candidates),
-                ", ".join(unresolved[:10]),
-            )
+            message += ": %s"
+            args.append(", ".join(unresolved[:10]))
+        self.logger.info(message, *args)
 
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
 
