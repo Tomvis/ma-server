@@ -56,13 +56,24 @@ async def test_reject_sets_the_rejected_status(provider) -> None:
 
 
 async def test_block_rejects_and_blocks_the_artist(provider) -> None:
-    """Block rejects the recommendation, then permanently blocks its digarr artist id."""
+    """
+    Block rejects the recommendation, then permanently blocks its digarr artist id.
+
+    The two client calls are attached to a shared parent mock so their relative order
+    is asserted directly, not just that each happened: if blocking fails after the
+    rejection, the recommendation is already rejected and the next refresh drops it
+    from _rec_ids, leaving a failed block unretriable from Music Assistant. Swapping
+    the two calls in block() must fail this test.
+    """
     artist = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
     provider.mass.music.get_item_by_uri = AsyncMock(return_value=artist)
     provider._rec_ids = {artist.uri: 42}
     provider._artist_ids = {artist.uri: 101}
     provider._client.set_status = AsyncMock(return_value={"status": "rejected"})
     provider._client.block_artist = AsyncMock()
+    call_order = MagicMock()
+    call_order.attach_mock(provider._client.block_artist, "block_artist")
+    call_order.attach_mock(provider._client.set_status, "set_status")
     provider._refresh = AsyncMock()
 
     result = await provider.block(artist.uri)
@@ -71,6 +82,7 @@ async def test_block_rejects_and_blocks_the_artist(provider) -> None:
     provider._client.block_artist.assert_awaited_once_with(101)
     provider._refresh.assert_awaited_once()
     assert result["status"] == "rejected"
+    assert [call[0] for call in call_order.mock_calls] == ["block_artist", "set_status"]
 
 
 async def test_block_refuses_an_artist_with_no_tracked_artist_id(provider) -> None:
