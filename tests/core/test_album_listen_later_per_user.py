@@ -296,6 +296,14 @@ async def test_shelf_sorts_on_the_association_timestamp(mass: MusicAssistant) ->
     looks almost right. So the two orders are deliberately made opposite here -- the
     legacy column says Older-Legacy is the newer save, the association says Newer-
     Legacy is. Sorting on the column yields the exact reverse of both assertions.
+
+    One wrinkle worth knowing before reading this as a weaker test than it is: the
+    sort key that bites is the *qualified* `albums.listen_later_added_at`. The bare
+    `listen_later_added_at` the old key used now resolves to the SELECT alias, which
+    is already the per-user subquery, so it is not a second behaviour this test could
+    distinguish -- it is the same one. Reordering the SELECT so the alias lands on the
+    legacy column breaks this too, and is pinned by
+    test_the_legacy_column_never_wins_a_read.
     """
     alice = await _make_user(mass, "alice")
     first = await _add_album(mass, "Older Legacy")
