@@ -59,13 +59,28 @@ class DigarrClient:
             # real item, and a card that cannot be opened is worse than no card.
             if not mbid:
                 continue
+            # A missing/non-numeric id is a malformed response, not a KeyError a
+            # caller catching DigarrError (e.g. _refresh) would ever expect.
+            try:
+                rec_id = int(raw["id"])
+            except (KeyError, TypeError, ValueError) as err:
+                raise DigarrError(
+                    f"Malformed recommendation from digarr: invalid or missing id: {err}"
+                ) from err
+            try:
+                artist_id = int(artist["id"])
+            except (KeyError, TypeError, ValueError) as err:
+                raise DigarrError(
+                    f"Malformed recommendation {rec_id} from digarr: invalid or missing "
+                    f"artist id: {err}"
+                ) from err
             results.append(
                 DigarrRecommendation(
-                    id=int(raw["id"]),
+                    id=rec_id,
                     kind=str(raw.get("kind", "artist")),
                     score=float(raw.get("score", 0.0)),
                     status=str(raw.get("status", "pending")),
-                    artist_id=int(artist["id"]),
+                    artist_id=artist_id,
                     artist_name=str(artist.get("name") or "Unknown Artist"),
                     artist_mbid=str(mbid),
                     image_url=artist.get("imageUrl"),

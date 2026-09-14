@@ -119,6 +119,60 @@ async def test_skips_records_with_no_mbid(session: FakeSession) -> None:
     assert await client.get_pending(limit=15) == []
 
 
+async def test_missing_recommendation_id_raises_digarr_error(session: FakeSession) -> None:
+    """
+    A malformed response missing the recommendation id must not escape as a bare KeyError.
+
+    _refresh (and any other caller) reasonably catches DigarrError; a bare KeyError
+    would propagate as an unexpected exception instead.
+    """
+    session.queue(
+        FakeResponse(
+            200,
+            {
+                "total": 1,
+                "items": [
+                    {
+                        "kind": "artist",
+                        "score": 1.0,
+                        "status": "pending",
+                        "artist": {"id": 1, "name": "X", "mbid": "some-mbid"},
+                    }
+                ],
+            },
+        )
+    )
+    client = DigarrClient(BASE, "k", session)
+
+    with pytest.raises(DigarrError):
+        await client.get_pending(limit=15)
+
+
+async def test_missing_artist_id_raises_digarr_error(session: FakeSession) -> None:
+    """A malformed response missing the nested artist's id must also raise DigarrError."""
+    session.queue(
+        FakeResponse(
+            200,
+            {
+                "total": 1,
+                "items": [
+                    {
+                        "id": 1,
+                        "kind": "artist",
+                        "score": 1.0,
+                        "status": "pending",
+                        "artist": {"name": "X", "mbid": "some-mbid"},
+                    }
+                ],
+            },
+        )
+    )
+    client = DigarrClient(BASE, "k", session)
+
+    with pytest.raises(DigarrError):
+        await client.get_pending(limit=15)
+
+
 @pytest.mark.parametrize("status", [401, 403])
 async def test_rejected_key_raises_auth_error(session: FakeSession, status: int) -> None:
     """A revoked key, or one missing a scope, is distinguishable from a transport failure."""
