@@ -1040,9 +1040,10 @@ class AlbumsController(MediaControllerBase[Album]):
         :param item_id: Library album item_id (database id).
         :param listen_later: Whether the album should be on the user's shelf.
         :param userid: Whose shelf to write. Defaults to the calling user. It is a
-            parameter rather than always-ambient so background callers (the backfill,
-            tests) can be explicit; an ambient-only lookup would make those callers
-            impossible to write without faking a request context.
+            parameter rather than always-ambient so a caller with no request context
+            (a maintenance script replaying the retired household shelf, a test) can be
+            explicit; an ambient-only lookup would make those callers impossible to
+            write without faking a request context.
         """
         if userid is None:
             user = get_current_user()

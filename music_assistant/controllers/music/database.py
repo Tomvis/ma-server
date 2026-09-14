@@ -307,6 +307,15 @@ class MusicDatabaseSetupMixin:
                     [album_type] TEXT NOT NULL,
                     [year] INTEGER,
                     [favorite] BOOLEAN NOT NULL DEFAULT 0,
+                    -- RETIRED as of schema 61, and RETAINED on purpose: the shelf is
+                    -- per-user now and lives in album_listen_later. Nothing reads these
+                    -- two any more, which makes them look like dead weight -- they are
+                    -- not. They are the only surviving record of what the old
+                    -- household-wide shelf held (3,347 albums on the install this was
+                    -- written for), the migration could not attribute it to anyone
+                    -- because the old schema never stored who saved what, and dropping
+                    -- them destroys it irrecoverably. The <= 60 step in migrations.py
+                    -- carries the query that replays one onto a user's shelf.
                     [listen_later] BOOLEAN NOT NULL DEFAULT 0,
                     [listen_later_added_at] INTEGER,
                     [metadata] json NOT NULL,

@@ -780,7 +780,15 @@ async def test_migration_adds_listen_later_columns_to_a_stock_database_stamped_5
 async def test_migration_adds_the_per_user_listen_later_table(
     database: DatabaseConnection,
 ) -> None:
-    """A database at schema 60 gains the per-user shelf table, and keeps its old rows."""
+    """
+    A database at 60 gains the per-user shelf table, empty, and keeps its legacy record.
+
+    "Empty" is the final state, not a step on the way to one: nothing attributes the old
+    household shelf, because the pre-61 schema recorded only that an album was saved and
+    never by whom. What makes that survivable is the second half of this test -- the
+    retired columns still hold the shelf, so it can be replayed onto an account by hand.
+    Dropping them is what this pins against.
+    """
     await database.execute("ALTER TABLE albums ADD COLUMN [listen_later] BOOLEAN DEFAULT 0")
     await database.execute("ALTER TABLE albums ADD COLUMN [listen_later_added_at] INTEGER")
     await database.execute(
@@ -804,11 +812,13 @@ async def test_migration_adds_the_per_user_listen_later_table(
         "userid",
         "added_at",
     }
-    # the step only creates the table: it cannot reach the users, which live in a
-    # separate database that is not open this early in the boot. Attribution is
-    # listen_later_backfill.py, run once the webserver is up.
+    # nobody inherits the household shelf -- there is nothing in the old schema saying
+    # who saved what, so the migration invents no owner rather than guessing one
     assert await database.get_count_from_query(f"SELECT * FROM {DB_TABLE_ALBUM_LISTEN_LATER}") == 0
-    # and the legacy row it will read is still there
+    # ...which is only acceptable because the record itself survives: the retired
+    # columns are the sole copy of what was on the shelf, and the migration must not
+    # drop or clear them. This is the assertion that fails if someone tidies them away.
+    assert {"listen_later", "listen_later_added_at"} <= await _table_columns(database, "albums")
     rows = await database.get_rows_from_query(
         "SELECT item_id, listen_later_added_at FROM albums WHERE listen_later = 1", limit=0
     )

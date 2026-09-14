@@ -5,9 +5,14 @@ The shelf used to be one boolean on the shared album row, so every account in a
 household saw one pile. It is now the `album_listen_later` association table, keyed
 on (item_id, userid).
 
-Every test here is written to fail against the old global implementation -- a shelf
-test with a single user, or over an empty shelf, passes just as happily against a
-household-wide bit or against a backfill that does nothing at all.
+Nothing attributes the old household shelf to anyone: the pre-61 schema recorded only
+*that* an album was saved, never by whom, so every shelf starts empty and the retired
+`albums.listen_later` columns are kept purely as the record of what it held.
+
+Every test here is written to fail against the old global implementation. A shelf test
+with a single user cannot distinguish a per-user shelf from a household-wide bit at
+all -- both hand back "the album I just saved" -- so each one below uses two accounts
+that want different things.
 """
 
 from __future__ import annotations
@@ -23,11 +28,8 @@ from music_assistant_models.errors import InsufficientPermissions
 from music_assistant_models.media_items import Album, AudioFormat, ProviderMapping
 
 from music_assistant.constants import (
-    CONF_LISTEN_LATER_BACKFILLED,
     DB_TABLE_ALBUM_LISTEN_LATER,
-    HOMEASSISTANT_SYSTEM_USER,
 )
-from music_assistant.controllers.music.listen_later_backfill import backfill_listen_later
 from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
 
 if TYPE_CHECKING:
@@ -72,13 +74,9 @@ async def _add_album(mass: MusicAssistant, name: str) -> int:
     return int(album.item_id)
 
 
-async def _make_user(mass: MusicAssistant, username: str, **overrides: Any) -> User:
-    """Create a user, optionally rewriting stored columns (e.g. created_at) after."""
-    user = await mass.webserver.auth.create_user(username=username, role=UserRole.USER)
-    if overrides:
-        await mass.webserver.auth.database.update("users", {"user_id": user.user_id}, overrides)
-        await mass.webserver.auth.database.commit()
-    return user
+async def _make_user(mass: MusicAssistant, username: str) -> User:
+    """Create a signed-up user on the instance."""
+    return await mass.webserver.auth.create_user(username=username, role=UserRole.USER)
 
 
 async def _shelf_names(mass: MusicAssistant, order_by: str = "sort_name") -> list[str]:
@@ -193,7 +191,12 @@ async def test_the_legacy_column_never_wins_a_read(mass: MusicAssistant) -> None
     Row resolves a duplicate name to the *first* column, which is why the computed
     columns are emitted ahead of `albums.*` -- appended after, they would be silently
     ignored and every read would quietly fall back to the household-wide bit. Nothing
-    else in the suite would notice, because the backfill makes the two agree.
+    else in the suite would notice: nothing writes the legacy columns any more, so on a
+    database built by the current code the two always agree and a read falling through
+    to the wrong one is invisible. This test is the only place they disagree.
+
+    It doubles as the pin on "every shelf starts empty at 61": a database arriving with
+    listen_later = 1 rows puts them on nobody's shelf.
     """
     alice = await _make_user(mass, "alice")
     stale = await _add_album(mass, "Stale Global Save")
@@ -360,171 +363,3 @@ async def test_each_user_sorts_by_their_own_save_time(mass: MusicAssistant) -> N
         "Album One",
         "Album Two",
     ]
-
-
-# --------------------------------------------------------------------------------------
-# 3. the backfill attributes the pre-existing shelf to the oldest account
-# --------------------------------------------------------------------------------------
-
-
-async def _arm_backfill(mass: MusicAssistant) -> None:
-    """Clear the run-once flag the booted fixture already set."""
-    mass.config.set(CONF_LISTEN_LATER_BACKFILLED, False, immediate=True)
-
-
-async def test_backfill_attributes_the_shelf_to_the_oldest_account(
-    mass: MusicAssistant,
-) -> None:
-    """
-    The rows of the old household shelf land on the oldest personal account.
-
-    Two bites at once. First, the shelf is *not empty*: a backfill that does nothing
-    passes an empty-shelf test trivially, so there are two legacy rows here and both
-    must arrive, with their original timestamps. Second, the oldest account is not the
-    first row: `bob` is created first and therefore sorts first by insertion (and by
-    rowid), but `alice`'s created_at is rewritten to be older -- so a backfill that
-    takes whatever row the users table hands back first attributes the shelf to bob
-    and fails.
-    """
-    bob = await _make_user(mass, "bob", created_at="2026-06-01T00:00:00+00:00")
-    alice = await _make_user(mass, "alice", created_at="2020-01-01T00:00:00+00:00")
-    first = await _add_album(mass, "Legacy One")
-    second = await _add_album(mass, "Legacy Two")
-    await _set_legacy_shelf(mass, first, added_at=111)
-    await _set_legacy_shelf(mass, second, added_at=222)
-
-    await _arm_backfill(mass)
-    await backfill_listen_later(mass)
-
-    assert await _shelf_rows(mass) == [
-        {"item_id": first, "userid": alice.user_id, "added_at": 111},
-        {"item_id": second, "userid": alice.user_id, "added_at": 222},
-    ]
-    assert mass.config.get(CONF_LISTEN_LATER_BACKFILLED, False) is True
-
-    # and it is actually visible as alice's shelf, not merely present as rows
-    set_current_user(alice)
-    assert sorted(await _shelf_names(mass)) == ["Legacy One", "Legacy Two"]
-    set_current_user(bob)
-    assert await _shelf_names(mass) == []
-
-
-async def test_backfill_ignores_non_personal_accounts(mass: MusicAssistant) -> None:
-    """
-    A service or guest account never inherits the shelf, however old it is.
-
-    The Home Assistant system user is created during onboarding and so is frequently
-    the *oldest* row in the table. Attributing a household's saves to it would hide
-    them behind an account nobody signs into -- indistinguishable, from the user's
-    side, from having lost them.
-    """
-    await _make_user(mass, HOMEASSISTANT_SYSTEM_USER, created_at="2019-01-01T00:00:00+00:00")
-    await mass.webserver.auth.create_user(username="guest-user", role=UserRole.GUEST)
-    await mass.webserver.auth.database.update(
-        "users", {"username": "guest-user"}, {"created_at": "2019-06-01T00:00:00+00:00"}
-    )
-    alice = await _make_user(mass, "alice", created_at="2021-01-01T00:00:00+00:00")
-    album = await _add_album(mass, "Legacy One")
-    await _set_legacy_shelf(mass, album, added_at=111)
-
-    await _arm_backfill(mass)
-    await backfill_listen_later(mass)
-
-    assert await _shelf_rows(mass) == [{"item_id": album, "userid": alice.user_id, "added_at": 111}]
-
-
-async def test_backfill_defers_when_there_is_no_account_to_attribute_to(
-    mass: MusicAssistant,
-) -> None:
-    """
-    With no personal account the shelf is left alone and the backfill retries.
-
-    Giving up permanently here would silently discard the shelf of an install that
-    upgrades before it finishes onboarding. The legacy columns are the only record of
-    it, so they must survive, and the flag must stay unset so the next boot -- by
-    which time an account exists -- picks the work back up.
-    """
-    await _make_user(mass, HOMEASSISTANT_SYSTEM_USER)
-    album = await _add_album(mass, "Legacy One")
-    await _set_legacy_shelf(mass, album, added_at=111)
-
-    await _arm_backfill(mass)
-    await backfill_listen_later(mass)
-
-    assert await _shelf_rows(mass) == []
-    assert mass.config.get(CONF_LISTEN_LATER_BACKFILLED, False) is False
-    # the legacy record is intact, so a later run can still do the work
-    rows = await mass.music.database.get_rows_from_query(
-        "SELECT item_id FROM albums WHERE listen_later = 1", limit=0
-    )
-    assert [row["item_id"] for row in rows] == [album]
-
-    # ...and it does, once somebody signs up
-    alice = await _make_user(mass, "alice")
-    await backfill_listen_later(mass)
-    assert await _shelf_rows(mass) == [{"item_id": album, "userid": alice.user_id, "added_at": 111}]
-
-
-async def test_backfill_does_not_resurrect_a_save_the_user_has_since_cleared(
-    mass: MusicAssistant,
-) -> None:
-    """
-    Re-running the backfill is a no-op, including after the user has tidied up.
-
-    The legacy columns are deliberately kept, so the input of the conversion is still
-    sitting there on every later boot. The run-once flag is what stops it being
-    replayed -- without it, an album the user took off their shelf would come back at
-    the next restart, forever.
-    """
-    alice = await _make_user(mass, "alice")
-    album = await _add_album(mass, "Legacy One")
-    await _set_legacy_shelf(mass, album, added_at=111)
-
-    await _arm_backfill(mass)
-    await backfill_listen_later(mass)
-    assert len(await _shelf_rows(mass)) == 1
-
-    set_current_user(alice)
-    await mass.music.albums.set_listen_later(album, False)
-    assert await _shelf_rows(mass) == []
-
-    await backfill_listen_later(mass)
-    assert await _shelf_rows(mass) == []
-
-
-async def test_backfill_is_idempotent_when_replayed(mass: MusicAssistant) -> None:
-    """An interrupted run that is retried does not duplicate or overwrite rows."""
-    alice = await _make_user(mass, "alice")
-    album = await _add_album(mass, "Legacy One")
-    await _set_legacy_shelf(mass, album, added_at=111)
-
-    await _arm_backfill(mass)
-    await backfill_listen_later(mass)
-    await _arm_backfill(mass)  # simulate a crash before the flag was persisted
-    await backfill_listen_later(mass)
-
-    assert await _shelf_rows(mass) == [{"item_id": album, "userid": alice.user_id, "added_at": 111}]
-
-
-async def test_backfill_never_raises_when_the_auth_database_is_unreadable(
-    mass: MusicAssistant,
-) -> None:
-    """
-    A failure to read the accounts aborts the attribution, not the boot.
-
-    This runs during startup; an escape here would leave the server dead. The flag
-    must stay unset so the next boot retries.
-    """
-    album = await _add_album(mass, "Legacy One")
-    await _set_legacy_shelf(mass, album, added_at=111)
-    await _arm_backfill(mass)
-
-    original = mass.webserver.auth.database
-    mass.webserver.auth.database = None  # type: ignore[assignment]
-    try:
-        await backfill_listen_later(mass)
-    finally:
-        mass.webserver.auth.database = original
-
-    assert await _shelf_rows(mass) == []
-    assert mass.config.get(CONF_LISTEN_LATER_BACKFILLED, False) is False
