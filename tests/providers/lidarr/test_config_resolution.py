@@ -12,8 +12,9 @@ the same objects `_update_provider_config` operates on -- against `mass_minimal`
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.enums import ProviderType
 from music_assistant_models.provider import ProviderManifest
@@ -112,12 +113,13 @@ async def test_url_survives_two_consecutive_unrelated_saves(mass_minimal: MusicA
 
     Regression test for mirroring get_config_entries()'s default_value to the field's
     own current value: Config.to_raw() persists an entry only when value !=
-    default_value, so a default that tracks the live value converges to match it
-    after one reload -- and the *next* save of any field then silently drops it from
-    storage. This reproduces the exact deployed state (url in `values`, nothing in
-    `setup_data`) and resaves an unrelated field (verify_ssl) twice in a row, since
-    the erasure only manifests from the *second* save onward once the default has
-    had one reload to converge.
+    default_value. Against the pre-fix code this erases url on the very *first*
+    unrelated save, not a later one -- get_config_entries() computes that default
+    from the provider's already-loaded, already-rehydrated self.config (which
+    already holds the live url the moment the instance exists), not from some
+    pre-rehydrate snapshot that would need a reload to catch up. Resaves an
+    unrelated field (verify_ssl) twice in a row here only to also confirm the
+    already-broken state doesn't regress any further on a second save.
     """
     provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
     assert provider._client._base == "http://music-rater"
@@ -188,3 +190,63 @@ async def test_explicit_options_edit_overrides_a_setup_value(mass_minimal: Music
     )
 
     assert provider._client._base == "http://fixed-with-port:4533"
+
+
+async def test_url_in_neither_store_fails_to_construct(mass_minimal: MusicAssistant) -> None:
+    """
+    The fourth url-location cell (present in neither `values` nor `setup_data`) must fail.
+
+    Pins current (unchanged by any of today's fixes) behaviour rather than the
+    cleaner outcome it might look like at a glance: `_config_or_setup_value` returns
+    None here (nothing to prefer, nothing to fall back to), and MusicRaterClient's
+    constructor dereferences that url immediately (`url.rstrip("/")`) before
+    Config.validate() ever gets a chance to run and report "url is required"
+    instead. The real load path (mass.py's `_provider_load_step`) re-raises this
+    unwrapped rather than turning it into a SetupFailedError, since a non-empty
+    `str(err)` skips that wrapping -- so this is a raw AttributeError, not a clean
+    validation failure. Only pinned here, not fixed: no url-location cell this file
+    covers is worse off than before today's fixes, and hardening this one further
+    (e.g. giving MusicRaterClient a tolerant default) is a separate change.
+    """
+    with pytest.raises(AttributeError):
+        await _load_provider(mass_minimal, values={}, setup_data={})
+
+
+async def test_loaded_in_mass_warns_when_reconfigure_was_silently_overridden(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    A Reconfigure whose new url lost to a stale `values` entry must be flagged.
+
+    `_finish_provider_reconfigure` (controllers/config/flows.py) only ever writes
+    setup_data, never `values` -- so on the deployed shape (url already in `values`),
+    submitting a new url via Reconfigure is silently overridden by
+    `_config_or_setup_value`'s values-wins precedence: the reload reports success and
+    nothing tells the admin their new url was ignored. This warns instead.
+    """
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://music-rater"},
+        setup_data={CONF_URL: "http://just-reconfigured"},
+    )
+    provider._client.ping = AsyncMock()  # type: ignore[method-assign]
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    assert provider.logger.warning.call_count == 1
+    message = provider.logger.warning.call_args.args[0] % provider.logger.warning.call_args.args[1:]
+    assert "reconfigure" in message.lower()
+
+
+async def test_loaded_in_mass_does_not_warn_without_a_conflicting_reconfigure(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """No spurious warning for the ordinary deployed shape (nothing in setup_data at all)."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
+    provider._client.ping = AsyncMock()  # type: ignore[method-assign]
+    provider.logger = MagicMock()
+
+    await provider.loaded_in_mass()
+
+    provider.logger.warning.assert_not_called()

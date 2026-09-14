@@ -240,9 +240,16 @@ class DigarrProvider(PluginProvider):
         rejects a required entry with neither a value nor a default, which would
         stop the instance loading with no default to fall back to.
         """
-        # Cached for loaded_in_mass() to reuse -- see _known_ma_usernames's docstring
-        # in __init__.
-        users = self._known_ma_usernames = await ma_usernames(self.mass, self.logger)
+        users = await ma_usernames(self.mass, self.logger)
+        if self._known_ma_usernames is None:
+            # Cached for loaded_in_mass() to reuse -- see _known_ma_usernames's
+            # docstring in __init__. Guarded on "still None": this method also runs
+            # on every options-page open, not just at load, so an already-populated
+            # cache must not be overwritten by a later, possibly lower-scope caller
+            # (ma_usernames returns [] on a missing users.read scope) -- only the
+            # first call (always the load-time one, since rehydrate resolves this
+            # before loaded_in_mass ever runs) gets to seed it.
+            self._known_ma_usernames = users
         return (
             ConfigEntry(
                 key=CONF_URL,
@@ -530,8 +537,9 @@ class DigarrProvider(PluginProvider):
 
         Known gap, left unfixed here: this hook is never called at all when the
         instance is unavailable at save time. ``_update_provider_config``
-        (controllers/config/providers.py:698-705) only calls ``provider.update_config``
-        on its "loaded and available" branch; the "enabled but not available" branch
+        (controllers/config/providers.py: the branch condition at line 695, this
+        hook's call at line 697) only calls ``provider.update_config`` on its "loaded
+        and available" branch; the "enabled but not available" branch (lines 706-708)
         instead calls ``mass.load_provider_config(config)`` directly, which tears this
         instance down and reconstructs a brand new one from ``config`` without ever
         calling this method. A rotation submitted while unavailable therefore lands in
@@ -539,15 +547,17 @@ class DigarrProvider(PluginProvider):
         the reconstructed instance's ``__init__`` builds its client from the *old*
         setup_data key and the rotation is silently lost.
 
-        Not fixed within this provider: the fresh instance's ``__init__`` has no
-        ``changed_keys`` to tell "a rotation the controller just skipped mirroring"
-        apart from "a stale pre-fix values/api_key that must stay ignored and only
-        warned about" (see the warning in ``loaded_in_mass``) -- both look identical
-        in storage (a value present in ``config.values`` that differs from
-        setup_data), and only the controller, at the moment of the actual save, still
-        has the information needed to distinguish them. A correct fix needs
-        ``_update_provider_config`` to call (or equivalently invoke) this hook on its
-        unavailable branch too, before it reconstructs the instance.
+        Not fixed within this provider -- not because a reconciliation is impossible,
+        but because it would have to apply a single policy to two cases the fresh
+        instance's ``__init__`` cannot tell apart: "a rotation the controller just
+        skipped mirroring" (should become active) and "a stale pre-fix values/api_key"
+        (must stay ignored and only warned about, per ``loaded_in_mass``). Both look
+        identical in storage -- a value present in ``config.values`` that differs from
+        setup_data -- and only the controller, at the moment of the actual save, still
+        has ``changed_keys`` and can tell which one this is. A correct fix therefore
+        belongs in ``_update_provider_config``: call (or equivalently invoke) this hook
+        on its unavailable branch too, before it reconstructs the instance, so the
+        rotation is mirrored with the same certainty it has on the available branch.
 
         :param config: The freshly saved config, with the new values already applied
             in memory (not yet encrypted -- only ``to_raw()`` does that).

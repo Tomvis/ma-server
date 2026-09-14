@@ -150,6 +150,16 @@ class LidarrProvider(PluginProvider):
         to that (deliberately static) check, but is honest about the actual runtime
         behaviour: this entry has no real default beyond "whatever the setup flow (or
         an options-page edit, via ``entry.value``) provided".
+
+        Note the asymmetry this creates: for a fresh instance (url only in
+        setup_data), that url becomes ``entry.default_value`` here, and
+        ``Config.__post_serialize__`` masks a SECURE_STRING's ``value`` but never
+        touches ``default_value`` of any type -- so a url containing embedded
+        ``user:pass@`` credentials is served in plaintext to any caller with
+        ``CONFIG_PROVIDERS_READ``, not just this instance's owner. Unavoidable given
+        ``required=True`` needing *some* default (see above) -- but worth naming,
+        since this provider otherwise strips userinfo everywhere a url reaches a log
+        or a toast (``_sanitized_url``, ``_host_port``).
         """
         return (
             ConfigEntry(
@@ -206,7 +216,7 @@ class LidarrProvider(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """
-        Register the WebSocket command and probe music-rater for connectivity.
+        Register the WebSocket command, probe music-rater, and flag an ignored Reconfigure.
 
         The command is registered unconditionally so users still see the action
         in the UI when music-rater is down — invocations will fail with a useful
@@ -227,6 +237,26 @@ class LidarrProvider(PluginProvider):
                 "action will surface this error on first use.",
                 self._sanitized_url(),
                 err,
+            )
+
+        # _finish_provider_reconfigure (controllers/config/flows.py) only ever writes
+        # setup_data, never `values` -- and _config_or_setup_value always prefers an
+        # explicit `values` entry. So on an instance that already has a url in
+        # `values` (the deployed one), a Reconfigure that submits a new url is
+        # accepted, the reload reports success, last_error clears -- and the client
+        # keeps using the old, options-page url. Nothing else would tell the admin
+        # their Reconfigure silently did nothing, so warn once per load while the two
+        # disagree. Compared with the *active* url (not `values` directly) so the
+        # warning clears itself the moment either side is edited to match.
+        setup_url = cast("str | None", self._setup_data_only(CONF_URL))
+        if setup_url and setup_url.rstrip("/") != self._client._base:
+            self.logger.warning(
+                "lidarr: url %r was submitted via Reconfigure, but the options-page "
+                "value %r is still active and takes priority over it -- edit (or "
+                "clear) the url on this instance's options page directly; "
+                "submitting Reconfigure again will not change it.",
+                setup_url,
+                self._client._base,
             )
 
     async def unload(self, is_removed: bool = False) -> None:

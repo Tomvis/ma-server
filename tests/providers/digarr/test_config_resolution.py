@@ -351,7 +351,7 @@ async def test_loaded_in_mass_does_not_refetch_ma_usernames(mass_minimal: MusicA
         await provider.loaded_in_mass()
 
 
-async def test_warns_once_when_a_pre_fix_values_api_key_is_being_ignored(
+async def test_warns_exactly_once_when_a_pre_fix_values_api_key_is_being_ignored(
     mass_minimal: MusicAssistant,
 ) -> None:
     """
@@ -362,6 +362,12 @@ async def test_warns_once_when_a_pre_fix_values_api_key_is_being_ignored(
     that state silently keeps using the old key with nothing telling the user their
     rotation never took effect -- the options page only ever shows the masked
     substitute, so there is no way to spot this from the UI either.
+
+    Asserts the exact call count (not just "some warning matched"): there is no
+    de-dup mechanism behind this warning -- it is naturally single-fire because
+    loaded_in_mass() itself only runs once per load and the check has no loop -- and
+    an assertion that only checks a match among the calls would not catch a second,
+    accidental warning appearing alongside it.
     """
     provider = await _load_provider(
         mass_minimal,
@@ -376,8 +382,9 @@ async def test_warns_once_when_a_pre_fix_values_api_key_is_being_ignored(
 
     await provider.loaded_in_mass()
 
-    warnings = [call.args[0] % call.args[1:] for call in provider.logger.warning.call_args_list]
-    assert any("re-enter the api_key" in message.lower() for message in warnings)
+    assert provider.logger.warning.call_count == 1
+    message = provider.logger.warning.call_args.args[0] % provider.logger.warning.call_args.args[1:]
+    assert "re-enter the api_key" in message.lower()
 
 
 async def test_does_not_warn_when_values_api_key_matches_the_active_one(
