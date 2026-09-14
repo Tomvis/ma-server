@@ -1,0 +1,33 @@
+{
+  "manifest": {
+    "description": "Surfaces your digarr recommendations on Discover, so you can hear an artist before approving it into Lidarr."
+  },
+  "config_entries": {
+    "url": {
+      "label": "digarr URL",
+      "description": "Base URL of your digarr instance, reachable from the Music Assistant container."
+    },
+    "api_key": {
+      "label": "API key",
+      "description": "A digarr API key with the 'read' and 'write' scopes. Create one in digarr under Settings -> Account."
+    },
+    "ma_user": {
+      "label": "Music Assistant user",
+      "description": "Only this user sees this instance's Discover row. Each digarr user gets their own instance and their own key."
+    },
+    "row_size": { "label": "Items in the row" },
+    "min_score": {
+      "label": "Minimum score",
+      "description": "Hide recommendations digarr scored below this value."
+    },
+    "test_connection": { "label": "Test connection" },
+    "test_ok_label": { "label": "Connected to digarr." },
+    "test_error_label": { "label": "Couldn't reach digarr." },
+    "clear_cache": { "label": "Clear resolved item cache" }
+  },
+  "media": {
+    "recommendations": {
+      "up_next": { "name": "digarr — Up Next" }
+    }
+  }
+}

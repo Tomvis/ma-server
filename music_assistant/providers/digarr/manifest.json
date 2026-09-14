@@ -1,0 +1,12 @@
+{
+  "type": "plugin",
+  "domain": "digarr",
+  "stage": "experimental",
+  "name": "digarr",
+  "description": "Surfaces your digarr recommendations on Discover, so you can hear an artist before approving it into Lidarr.",
+  "codeowners": ["@stereotom"],
+  "credits": ["[digarr](https://github.com/iuliandita/digarr)"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": true
+}
