@@ -76,16 +76,16 @@ async def test_test_connection_surfaces_an_auth_failure(provider: DigarrProvider
     assert "revoked" in (entries["test_error_label"].description or "")
 
 
-async def test_client_uses_setup_flow_collected_values() -> None:
+async def test_client_falls_back_to_setup_value_when_options_are_unset() -> None:
     """
-    The client is built from setup_data, not from config.get_value.
+    The client falls back to setup_data when the options page holds nothing for it.
 
     A freshly-created instance's config.values is {} (session.finish() persists
-    collected fields into setup_data, not values), so reading CONF_URL/CONF_API_KEY
-    through config.get_value resolves to DEFAULT_URL / "" no matter what the user
-    entered during setup. This constructs a provider whose config.get_value is
-    rigged to return deliberately-wrong values, so the test only passes if the
-    client actually read through get_setup_value's setup_data path instead.
+    collected fields into setup_data, not values): a real (unseeded) Config.get_value
+    raises KeyError internally for an unset key and returns whatever default it was
+    given, so this rigs config.get_value the same way (always returning the passed
+    default) to prove _config_or_setup_value falls through to the setup-collected
+    value instead of resolving to some unrelated default.
     """
     mass = MagicMock()
     mass.http_session = MagicMock()
@@ -99,17 +99,78 @@ async def test_client_uses_setup_flow_collected_values() -> None:
     config.name = "digarr - Tom"
     config.instance_id = "digarr--abcd1234"
     config.values = {}
-    config.get_value = MagicMock(
-        side_effect=lambda key, default=None: {
-            CONF_URL: "http://wrong-should-not-be-read:1",
-            CONF_API_KEY: "wrong-should-not-be-read",
-        }.get(key, default)
-    )
+    config.get_value = MagicMock(side_effect=lambda _key, default=None: default)
 
     provider = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
     assert provider._client._base == "http://real-digarr:9999"
     assert provider._client._api_key == "real-secret"
+
+
+async def test_options_edit_overrides_the_setup_value() -> None:
+    """
+    An explicit options-page edit permanently wins over the value collected at setup.
+
+    Regression test for the production bug where a URL entered without its port could
+    not be fixed from the options page: get_setup_value gave setup_data unconditional
+    priority over any later options edit. config.get_value returning a real value here
+    simulates the options page having actually persisted an edit (the real framework
+    only puts a key in config.values when it was genuinely saved there) -- both the
+    client and the options page's own displayed default must reflect that edit, not
+    the stale setup_data value.
+    """
+    mass = MagicMock()
+    mass.http_session = MagicMock()
+    setup_data = {CONF_URL: "http://stale-no-port", CONF_API_KEY: "stale-secret"}
+    mass.config.get = MagicMock(return_value=setup_data)
+    mass.config.decrypt_string = MagicMock(side_effect=lambda value: value)
+    manifest = MagicMock()
+    manifest.type = ProviderType.PLUGIN
+    manifest.domain = "digarr"
+    config = MagicMock()
+    config.name = "digarr - Tom"
+    config.instance_id = "digarr--abcd1234"
+    edited = {CONF_URL: "http://fixed-with-port:4533", CONF_API_KEY: "rotated-secret"}
+    config.values = dict.fromkeys(edited)
+    config.get_value = MagicMock(side_effect=lambda key, default=None: edited.get(key, default))
+
+    provider = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+    assert provider._client._base == "http://fixed-with-port:4533"
+    assert provider._client._api_key == "rotated-secret"
+
+    entries = {entry.key: entry for entry in await provider.get_config_entries()}
+    assert entries[CONF_URL].default_value == "http://fixed-with-port:4533"
+    assert entries[CONF_API_KEY].default_value == "rotated-secret"
+
+
+async def test_ma_user_is_read_from_setup_data_when_options_are_unset() -> None:
+    """
+    A freshly set-up instance is bound to a user without ever visiting the options page.
+
+    Before this, CONF_MA_USER was options-only, so a brand-new instance always loaded
+    with ma_user=None and its Discover row was invisible to every viewer with no error
+    explaining why. The setup flow now collects it into setup_data exactly like url and
+    api_key, so it must be read back the same way (falling through to setup_data when
+    the options page holds nothing for it).
+    """
+    mass = MagicMock()
+    mass.http_session = MagicMock()
+    setup_data = {CONF_URL: "http://digarr:3000", CONF_API_KEY: "k", CONF_MA_USER: "tom"}
+    mass.config.get = MagicMock(return_value=setup_data)
+    mass.config.decrypt_string = MagicMock(side_effect=lambda value: value)
+    manifest = MagicMock()
+    manifest.type = ProviderType.PLUGIN
+    manifest.domain = "digarr"
+    config = MagicMock()
+    config.name = "digarr - Tom"
+    config.instance_id = "digarr--abcd1234"
+    config.values = {}
+    config.get_value = MagicMock(side_effect=lambda _key, default=None: default)
+
+    provider = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+    assert provider._ma_user == "tom"
 
 
 async def test_ma_user_entry_is_not_required(provider: DigarrProvider) -> None:

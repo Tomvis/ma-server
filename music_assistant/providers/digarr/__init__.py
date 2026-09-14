@@ -13,12 +13,13 @@ user because plugin rows bypass the core provider filter.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, ExternalID, ProviderFeature
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 from music_assistant_models.media_items import RecommendationFolder, UniqueList
@@ -74,6 +75,28 @@ def mbid_of(item: Artist | ItemMapping) -> str | None:
     """
     mbid: str | None = item.get_external_id(ExternalID.MB_ARTIST)
     return mbid
+
+
+async def ma_usernames(mass: MusicAssistant, logger: logging.Logger) -> list[ConfigValueOption]:
+    """
+    List MA usernames so the bound user is a picker, not free text.
+
+    Module level (like ``mbid_of``) so both this provider's own ``get_config_entries``
+    and the setup flow -- which has no loaded instance to call a method on -- share the
+    exact same lookup and empty-result fallback.
+
+    :param mass: The MusicAssistant instance to query for its user list.
+    :param logger: Logger to report a failed lookup to.
+    """
+    # controllers/webserver/auth.py:832. Note it requires the users.read
+    # scope, so wrap it: a config page (or the setup flow) opened without that
+    # scope must fall back to free text rather than failing to render at all.
+    try:
+        users = await mass.webserver.auth.list_users()
+    except Exception as err:
+        logger.warning("Could not list Music Assistant users: %s", err)
+        return []
+    return [ConfigValueOption(user.username, user.username) for user in users]
 
 
 def _build_command_dispatcher(
@@ -138,18 +161,19 @@ class DigarrProvider(PluginProvider):
         super().__init__(mass, manifest, config, supported_features)
         self._test_ok = False
         self._test_error: str | None = None
-        # CONF_URL/CONF_API_KEY are collected by the setup flow into setup_data, not
-        # values -- a freshly-created instance's config.values is {} (see
-        # controllers/config/flows.py's _finish_provider_setup), so config.get_value
-        # would silently resolve to DEFAULT_URL / "" on first load. get_setup_value
-        # reads setup_data first and falls back to the active config value, so it
-        # covers both first load and every load after the options page is re-saved.
+        # CONF_URL/CONF_API_KEY/CONF_MA_USER are all collected by the setup flow into
+        # setup_data, not values -- a freshly-created instance's config.values is {}
+        # (see controllers/config/flows.py's _finish_provider_setup) -- but all three
+        # are also declared as editable options entries, so an explicit edit on the
+        # options page must be able to permanently override the setup-collected value.
+        # _config_or_setup_value is what gives that edit priority; see its docstring
+        # for how it tells "never edited" apart from "edited to this same value".
         self._client = DigarrClient(
-            url=cast("str", self.get_setup_value(CONF_URL, DEFAULT_URL)),
-            api_key=cast("str", self.get_setup_value(CONF_API_KEY, "")),
+            url=cast("str", self._config_or_setup_value(CONF_URL, DEFAULT_URL)),
+            api_key=cast("str", self._config_or_setup_value(CONF_API_KEY, "")),
             session=mass.http_session,
         )
-        self._ma_user = cast("str", config.get_value(CONF_MA_USER, ""))
+        self._ma_user = cast("str", self._config_or_setup_value(CONF_MA_USER, ""))
         self._row_size = int(cast("int", config.get_value(CONF_ROW_SIZE, ROW_ITEM_TARGET)))
         self._min_score = float(cast("float", config.get_value(CONF_MIN_SCORE, 0.0)))
         # The Discover row's current generation. Populated by _refresh; kept here (rather
@@ -171,29 +195,33 @@ class DigarrProvider(PluginProvider):
         """
         Return the options entries shown for this (loaded) instance.
 
-        CONF_URL and CONF_API_KEY are collected by the setup flow but must be
-        declared here as well: the framework re-parses the stored config against
-        exactly these entries after construction, so a key missing from this tuple
-        reads back as None for the rest of the instance's life.
+        CONF_URL, CONF_API_KEY and CONF_MA_USER are all collected by the setup flow
+        but must be declared here as well: the framework re-parses the stored config
+        against exactly these entries after construction, so a key missing from this
+        tuple reads back as None for the rest of the instance's life.
         """
-        users = await self._ma_usernames()
+        users = await ma_usernames(self.mass, self.logger)
         return (
             ConfigEntry(
                 key=CONF_URL,
                 type=ConfigEntryType.STRING,
                 required=True,
-                default_value=self.get_setup_value(CONF_URL, DEFAULT_URL),
+                # _config_or_setup_value (not get_setup_value) so this reflects an
+                # options-page edit rather than being permanently shadowed by the
+                # value collected at setup time.
+                default_value=self._config_or_setup_value(CONF_URL, DEFAULT_URL),
             ),
             ConfigEntry(
                 key=CONF_API_KEY,
                 type=ConfigEntryType.SECURE_STRING,
                 required=True,
-                default_value=self.get_setup_value(CONF_API_KEY),
+                default_value=self._config_or_setup_value(CONF_API_KEY),
             ),
             ConfigEntry(
                 key=CONF_MA_USER,
                 type=ConfigEntryType.STRING,
-                # Left optional: on first load no user has been picked yet, and a
+                # Left optional: an existing instance predating this being collected at
+                # setup, or one whose lookup failed, has no user picked yet, and a
                 # required entry with an unresolvable default (None) fails
                 # Config.validate() and rolls the whole instance back before it ever
                 # gets to load. The Discover row just doesn't render until one is set.
@@ -201,7 +229,7 @@ class DigarrProvider(PluginProvider):
                 # An empty list is the framework's own "no options" value: it's what makes
                 # this render as free text instead of an unusable empty picker.
                 options=users,
-                default_value=self.config.get_value(CONF_MA_USER),
+                default_value=self._config_or_setup_value(CONF_MA_USER),
             ),
             ConfigEntry(
                 key=CONF_ROW_SIZE,
@@ -346,7 +374,7 @@ class DigarrProvider(PluginProvider):
             self.logger.warning(
                 "digarr at %s unreachable on load: %s. The context-menu actions will "
                 "surface this error on first use.",
-                self.get_setup_value(CONF_URL, DEFAULT_URL),
+                self._config_or_setup_value(CONF_URL, DEFAULT_URL),
                 err,
             )
 
@@ -522,17 +550,37 @@ class DigarrProvider(PluginProvider):
         """
         return await self._act(item, "pending", remove_lidarr_artist=True)
 
-    async def _ma_usernames(self) -> list[ConfigValueOption]:
-        """List MA usernames so the bound user is a picker, not free text."""
-        # controllers/webserver/auth.py:832. Note it requires the users.read
-        # scope, so wrap it: a config page opened without that scope must fall
-        # back to free text rather than failing to render at all.
-        try:
-            users = await self.mass.webserver.auth.list_users()
-        except Exception as err:
-            self.logger.warning("Could not list Music Assistant users: %s", err)
-            return []
-        return [ConfigValueOption(user.username, user.username) for user in users]
+    def _config_or_setup_value(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
+        """
+        Resolve a setup-collected, options-editable key, preferring an explicit options edit.
+
+        ``get_setup_value`` gives the value collected once at setup time unconditional
+        priority, so an edit made later on the options page -- which lands in
+        ``config.values``, not ``setup_data`` -- would otherwise be silently ignored
+        forever (this shipped as a real bug for CONF_URL). This reverses that: an
+        explicit options value wins, and only when the key has never actually been
+        saved through the options page does the setup-collected value apply.
+
+        The crux is telling "never edited" apart from "edited to a value that happens
+        to match a default": a key the options page has never saved is not present in
+        ``self.config.values`` at load time (the load-time config is seeded only with
+        the raw stored ``values``, before this provider's own declared entries -- and
+        therefore before any default_value -- are applied; see
+        ``ConfigController.seed_stored_config_values``/``rehydrate_provider_config``),
+        so ``config.get_value`` reads back falsy/None for it there rather than
+        resolving to a baked-in default. Only a key genuinely present in stored
+        ``values`` -- something an options edit actually persisted -- reads back
+        non-empty at that point, so the default this method is passed is never able to
+        shadow a setup value the user never typed.
+
+        :param key: The config/setup key to resolve (CONF_URL, CONF_API_KEY or
+            CONF_MA_USER).
+        :param default: Value to fall back to when neither an options edit nor a
+            setup value is present.
+        """
+        if value := self.config.get_value(key):
+            return value
+        return self.get_setup_value(key, default)
 
     async def _refresh(self) -> None:
         """
