@@ -1052,21 +1052,32 @@ async def migrate_database(  # noqa: PLR0915
         # bit for the whole install: in a household with more than one account,
         # everybody's saves landed on one shelf.
         #
-        # This step creates the association table and nothing else. It deliberately
-        # does NOT attribute the existing rows to anyone: the users live in auth.db,
-        # and at this point in the boot that database is not open yet -- music.setup()
-        # runs in the core-controller TaskGroup, webserver.setup() (which creates
-        # mass.webserver.auth.database) only afterwards. Reading users from here would
-        # hit None every time, and since a migration may not raise, the failure would
-        # be swallowed into a silent no-op backfill that looks like it worked. The
-        # attribution is listen_later_backfill.py, run from MusicAssistant.start()
-        # once the webserver is up.
+        # This step creates the association table and nothing else. Every shelf starts
+        # empty: the old schema records only *that* an album was saved, never by whom,
+        # so there is nothing to attribute with and any owner this picked would be a
+        # guess. That is a deliberate decision, not an omission. Nothing anywhere in
+        # the codebase attributes these rows -- there is no backfill to go looking for.
         #
-        # The old columns are deliberately NOT dropped. They are the only record of
-        # what was on the shelf before -- the backfill reads them, and it may have to
-        # wait several boots for an account to exist to attribute them to. SQLite drops
-        # are whole-table rewrites, and this migration must never raise: a failed
-        # library migration resets the database and costs a full rescan.
+        # DO NOT DROP albums.listen_later / albums.listen_later_added_at. They are not
+        # kept out of caution -- they are the only surviving record of what the
+        # household shelf held, and dropping them destroys it irrecoverably. On the
+        # install this was written for that is 3,347 albums out of 5,556. Nothing reads
+        # them any more, which is exactly what makes them look like dead weight.
+        #
+        # To give a shelf back to somebody, take their user_id from the `users` table
+        # in auth.db -- a separate database file, so open it separately; it is never
+        # ATTACHed to this one -- and replay the columns into the association table:
+        #
+        #     INSERT OR IGNORE INTO album_listen_later (item_id, userid, added_at)
+        #     SELECT item_id, '<their user_id>', listen_later_added_at
+        #     FROM albums WHERE listen_later = 1;
+        #
+        # added_at is then the household-wide save time, which is the best the old
+        # schema can offer; albums that were never saved carry NULL there and sort last.
+        #
+        # SQLite drops are whole-table rewrites in any case, and this migration must
+        # never raise: a failed library migration resets the database and costs a full
+        # rescan.
         try:
             await database.execute(
                 f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_ALBUM_LISTEN_LATER}(

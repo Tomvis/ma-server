@@ -18,19 +18,30 @@ that want different things.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
 from music_assistant_models.auth import UserRole
-from music_assistant_models.enums import AlbumType
+from music_assistant_models.config_entries import ProviderConfig
+from music_assistant_models.enums import (
+    AlbumType,
+    MediaType,
+    ProviderFeature,
+    ProviderType,
+)
 from music_assistant_models.errors import InsufficientPermissions
 from music_assistant_models.media_items import Album, AudioFormat, ProviderMapping
+from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.constants import (
     DB_TABLE_ALBUM_LISTEN_LATER,
 )
 from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
+from music_assistant.models.music_provider import (
+    CACHE_CATEGORY_PREV_LIBRARY_IDS,
+    MusicProvider,
+)
 
 if TYPE_CHECKING:
     from music_assistant_models.auth import User
@@ -92,16 +103,6 @@ async def _set_legacy_shelf(mass: MusicAssistant, db_id: int, added_at: int) -> 
         "WHERE item_id = :item_id",
         {"item_id": db_id, "added_at": added_at},
     )
-
-
-async def _shelf_rows(mass: MusicAssistant) -> list[dict[str, Any]]:
-    """Return every association row, as plain dicts."""
-    return [
-        dict(row)
-        for row in await mass.music.database.get_rows_from_query(
-            f"SELECT * FROM {DB_TABLE_ALBUM_LISTEN_LATER} ORDER BY item_id, userid", limit=0
-        )
-    ]
 
 
 # --------------------------------------------------------------------------------------
@@ -363,3 +364,170 @@ async def test_each_user_sorts_by_their_own_save_time(mass: MusicAssistant) -> N
         "Album One",
         "Album Two",
     ]
+
+
+# --------------------------------------------------------------------------------------
+# 3. the household-wide reads, which have no calling user and must not be scoped to one
+# --------------------------------------------------------------------------------------
+
+
+class _DroppedEverythingProvider(MusicProvider):
+    """A non-streaming music provider whose library has gone empty."""
+
+    @property
+    def supported_features(self) -> set[ProviderFeature]:
+        return {ProviderFeature.LIBRARY_ALBUMS}
+
+    @property
+    def is_streaming_provider(self) -> bool:
+        # non-streaming, so a vanished item is a real deletion candidate rather than
+        # something the provider merely un-starred
+        return False
+
+    def library_supported(self, media_type: MediaType) -> bool:
+        return bool(media_type == MediaType.ALBUM)
+
+    # the provider's library, which this test always leaves empty; typed as a plain
+    # tuple so the generator below stays a generator without an unreachable `yield`
+    catalog: tuple[Album, ...] = ()
+
+    async def get_library_albums(self) -> AsyncGenerator[Album]:
+        """Yield the provider's library, which is empty: everything it had is gone."""
+        for album in self.catalog:
+            yield album
+
+
+def _register_dropping_provider(mass: MusicAssistant) -> _DroppedEverythingProvider:
+    """Register a provider that reports an empty library on its next sync."""
+    manifest = ProviderManifest(
+        type=ProviderType.MUSIC,
+        domain="dropper",
+        name="Dropper",
+        description="Provider whose library went empty",
+        codeowners=["@music-assistant"],
+    )
+    config = ProviderConfig(
+        values={},
+        type=ProviderType.MUSIC,
+        domain="dropper",
+        instance_id="dropper--instance",
+        name="Dropper",
+    )
+    # "GLOBAL" keeps the base class's log-level resolution valid; every boolean sync
+    # option this path reads (library_sync_deletions in particular) is truthy from it
+    config.get_value = lambda *_a, **_k: "GLOBAL"
+    provider = _DroppedEverythingProvider(mass, manifest, config)
+    provider.available = True
+    mass._providers[provider.instance_id] = provider
+    return provider
+
+
+async def test_provider_deletion_keeps_an_album_another_user_has_saved(
+    mass: MusicAssistant,
+) -> None:
+    """
+    A provider dropping an album must not delete a row somebody has on their shelf.
+
+    This is the data-loss path. The sync loop runs as a background task with no calling
+    user, so an anchor check that reads the *item's* listen_later sees False no matter
+    who has the album saved, and the row is deleted out from under them -- silently, as
+    a side effect of an unrelated provider going quiet.
+
+    Driven through the real `sync_library` rather than a re-implementation of its
+    logic in the test body, so reverting the fix actually fails it.
+    """
+    alice = await _make_user(mass, "alice")
+    provider = _register_dropping_provider(mass)
+    try:
+        album = await mass.music.albums.add_item_to_library(
+            Album(
+                item_id="0",
+                provider="library",
+                name="Dropped But Saved",
+                album_type=AlbumType.ALBUM,
+                provider_mappings={
+                    ProviderMapping(
+                        item_id="gone-1",
+                        provider_domain="dropper",
+                        provider_instance=provider.instance_id,
+                        audio_format=AudioFormat(),
+                        in_library=True,
+                    )
+                },
+            )
+        )
+        db_id = int(album.item_id)
+        # alice saves it; nothing else anchors the row -- not favorited, never played,
+        # and after the sync no provider will have it in library either
+        set_current_user(alice)
+        await mass.music.albums.set_listen_later(db_id, True)
+        set_current_user(None)
+
+        # the previous sync saw this album; this one will not
+        await mass.cache.set(
+            key=MediaType.ALBUM.value,
+            data=[db_id],
+            provider=provider.instance_id,
+            category=CACHE_CATEGORY_PREV_LIBRARY_IDS,
+        )
+        await provider.sync_library(MediaType.ALBUM)
+
+        # the row survives...
+        survivor = await mass.music.albums.get_library_item(db_id)
+        assert survivor.name == "Dropped But Saved"
+        # ...demoted out of the library proper, which is the whole point of keeping it
+        assert not any(pm.in_library for pm in survivor.provider_mappings)
+        # ...and it is still on alice's shelf, not merely present as a row
+        set_current_user(alice)
+        assert await _shelf_names(mass) == ["Dropped But Saved"]
+    finally:
+        mass._providers.pop(provider.instance_id, None)
+
+
+async def test_entering_the_library_clears_every_users_shelf(
+    mass: MusicAssistant,
+) -> None:
+    """
+    An album that joins the library proper leaves everybody's shelf, not just the caller's.
+
+    Library membership and listen-later are mutually exclusive. The clear used to be
+    gated on the item's own listen_later, which is now the *calling* user's bit -- so an
+    album added by (or synced for) one account would be cleared from that account's
+    shelf and left on every other account's, sitting in both views at once, which is the
+    state the rule exists to prevent. The sync loop that most often triggers it has no
+    calling user at all, in which case it would clear nobody's.
+    """
+    alice = await _make_user(mass, "alice")
+    bob = await _make_user(mass, "bob")
+    db_id = await _add_album(mass, "Graduates To Library")
+
+    set_current_user(alice)
+    await mass.music.albums.set_listen_later(db_id, True)
+    set_current_user(bob)
+    await mass.music.albums.set_listen_later(db_id, True)
+
+    # the album is added to the library proper, by nobody in particular
+    set_current_user(None)
+    await mass.music.albums.update_item_in_library(
+        db_id,
+        Album(
+            item_id=str(db_id),
+            provider="library",
+            name="Graduates To Library",
+            album_type=AlbumType.ALBUM,
+            provider_mappings={
+                ProviderMapping(
+                    item_id="prov-graduate",
+                    provider_domain="prov_a",
+                    provider_instance="prov_a_inst",
+                    audio_format=AudioFormat(),
+                    in_library=True,
+                )
+            },
+        ),
+    )
+
+    set_current_user(alice)
+    assert await _shelf_names(mass) == []
+    set_current_user(bob)
+    assert await _shelf_names(mass) == []
