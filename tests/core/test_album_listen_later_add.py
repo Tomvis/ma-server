@@ -39,6 +39,8 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import set_cu
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
+    from music_assistant_models.auth import User
+
     from music_assistant.mass import MusicAssistant
 
 
@@ -155,7 +157,7 @@ def _make_album(
 
 
 @pytest.fixture(autouse=True)
-async def signed_in_user(mass: MusicAssistant) -> AsyncGenerator[str]:
+async def signed_in_user(mass: MusicAssistant) -> AsyncGenerator[User]:
     """
     Sign a user in for the duration of each test in this module.
 
@@ -168,7 +170,7 @@ async def signed_in_user(mass: MusicAssistant) -> AsyncGenerator[str]:
     user = await mass.webserver.auth.create_user(username="listener", role=UserRole.USER)
     set_current_user(user)
     try:
-        yield user.user_id
+        yield user
     finally:
         set_current_user(None)
 
@@ -600,3 +602,43 @@ async def test_resolver_prefers_streaming_over_local_provider(
     finally:
         mass._providers.pop(local.instance_id, None)
         mass._providers.pop(streaming.instance_id, None)
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_a_second_user_can_save_an_album_the_first_already_saved(
+    mass: MusicAssistant, signed_in_user: User
+) -> None:
+    """
+    Two accounts can hold the same album on their shelves at the same time.
+
+    This is the headline symptom of the household-wide shelf, at the command level:
+    `add_album_to_listen_later` refuses a re-add with AlreadyInListenLaterError, and
+    when "already saved" was one bit on the shared album row, the first person in a
+    household to save an album locked everybody else out of saving it. The check now
+    reads the *caller's* shelf, so the second save is a first save.
+
+    Nothing else asserts this. The per-user reads are covered a level down, in
+    tests/core/test_album_listen_later_per_user.py, but the refusal lives here in the
+    command and only a second account reaching for an album the first already has can
+    reach it.
+    """
+    uri = f"{_PROVIDER_INSTANCE}://album/alb-1"
+    first = await mass.music.add_album_to_listen_later(item=uri)
+    assert first.listen_later is True
+    assert first.name == "Kid A"
+
+    # a second account reaches for the very same album -- this must not raise
+    second_user = await mass.webserver.auth.create_user(username="housemate", role=UserRole.USER)
+    set_current_user(second_user)
+    second = await mass.music.add_album_to_listen_later(item=uri)
+    assert second.listen_later is True
+    # the same library row, shared: this is one album on two shelves, not a duplicate
+    assert second.item_id == first.item_id
+
+    shelf = await mass.music.albums.library_items(listen_later=True, limit=0)
+    assert [album.name for album in shelf] == ["Kid A"]
+
+    # and the first account's shelf is untouched by any of it
+    set_current_user(signed_in_user)
+    shelf = await mass.music.albums.library_items(listen_later=True, limit=0)
+    assert [album.name for album in shelf] == ["Kid A"]
