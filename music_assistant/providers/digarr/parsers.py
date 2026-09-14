@@ -6,6 +6,13 @@ a shared import. That module is UPSTREAM code (confirmed via
 `git ls-tree origin/dev`); extracting a common helper would place fork edits in
 an upstream file and cost a merge conflict on every rebase. The duplication is
 bounded and lives in a file no upstream commit will ever touch.
+
+The only intentional behavioural difference from the Last.fm original is in
+`resolve_artist`: digarr guarantees an MBID on every recommendation, so
+`(ExternalID.MB_ARTIST, mbid)` is the primary resolution route here rather than
+an optional extra. Everything else -- the controller-mediated search (query
+sanitisation, provider-type/feature/media-type gating), the streaming-provider
+discovery, and the narrow `MusicAssistantError` catch -- is ported unchanged.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID, MediaType, ProviderFeature
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album, Artist, ItemMapping, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
@@ -107,44 +115,40 @@ def _get_streaming_providers(
     """
     Return streaming providers that support the ItemMapping's media type.
 
-    Sourced from `mass.get_providers_supporting_feature` (rather than walking
-    `mass.music.providers` and checking `supported_features` by hand, as the
-    Last.fm original does) since that helper already does exactly this lookup.
-
     :param mass: MusicAssistant instance.
     :param item_mapping: ItemMapping with the media type to search for.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
     """
-    if item_mapping.media_type == MediaType.ARTIST:
-        feature = ProviderFeature.LIBRARY_ARTISTS
-    elif item_mapping.media_type == MediaType.ALBUM:
-        feature = ProviderFeature.LIBRARY_ALBUMS
-    elif item_mapping.media_type == MediaType.TRACK:
-        feature = ProviderFeature.LIBRARY_TRACKS
-    else:
-        return []
+    streaming_providers = []
+    for p in mass.music.providers:
+        if p.instance_id == provider_instance_to_skip:
+            continue
+        if not p.is_streaming_provider:
+            continue
 
-    return [
-        p
-        for p in mass.get_providers_supporting_feature(feature)
-        if p.instance_id != provider_instance_to_skip and p.is_streaming_provider
-    ]
+        if item_mapping.media_type == MediaType.ARTIST:
+            if ProviderFeature.LIBRARY_ARTISTS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.ALBUM:
+            if ProviderFeature.LIBRARY_ALBUMS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.TRACK:
+            if ProviderFeature.LIBRARY_TRACKS not in p.supported_features:
+                continue
+
+        streaming_providers.append(p)
+    return streaming_providers
 
 
 async def _search_provider(
+    ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     provider: Any,
 ) -> Artist | Album | Track | None:
     """
     Search a single provider for a matching item.
 
-    Calls the provider's own `search()` directly rather than routing through
-    the media controller's `search()` (as the Last.fm original does): the
-    provider object is already in hand from `_get_streaming_providers`, and
-    catching broadly here (not just `MusicAssistantError`) means one
-    misbehaving provider -- a timeout, a malformed response, anything -- can
-    never sink resolution against the others.
-
+    :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
     :param provider: Provider instance to search.
     """
@@ -157,26 +161,20 @@ async def _search_provider(
                 item_mapping.name,
             )
             # Use a higher limit to work around provider bugs (e.g. Spotify misbehaves at limit=1).
-            search_results = await provider.search(
-                item_mapping.name, [item_mapping.media_type], PROVIDER_SEARCH_LIMIT
+            search_results = await ctrl.search(
+                item_mapping.name, provider.instance_id, limit=PROVIDER_SEARCH_LIMIT
             )
-            if item_mapping.media_type == MediaType.ARTIST:
-                candidates = search_results.artists
-            elif item_mapping.media_type == MediaType.ALBUM:
-                candidates = search_results.albums
-            else:
-                candidates = search_results.tracks
-
-            if not candidates:
+            if not search_results:
                 return None
 
-            return cast("Artist | Album | Track", candidates[0])
-        except Exception as err:
+            return search_results[0]
+        except MusicAssistantError as err:
             LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
             return None
 
 
 async def _search_providers_concurrent(
+    ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     providers: list[Any],
     artist_name: str | None,
@@ -184,12 +182,14 @@ async def _search_providers_concurrent(
     """
     Search multiple providers concurrently and return the first verified match.
 
+    :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
     :param providers: List of providers to search.
     :param artist_name: Artist name to verify candidate matches against, if known.
     """
     tasks = [
-        asyncio.create_task(_search_provider(item_mapping, provider)) for provider in providers
+        asyncio.create_task(_search_provider(ctrl, item_mapping, provider))
+        for provider in providers
     ]
 
     for task in asyncio.as_completed(tasks):
@@ -260,7 +260,9 @@ async def _resolve_item(
         LOGGER.debug("No streaming providers available for resolution")
         return None
 
-    result = await _search_providers_concurrent(item_mapping, streaming_providers, artist_name)
+    result = await _search_providers_concurrent(
+        ctrl, item_mapping, streaming_providers, artist_name
+    )
     if result is None:
         LOGGER.debug("Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name)
         return None

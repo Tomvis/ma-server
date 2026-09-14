@@ -5,7 +5,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ExternalID
+from music_assistant_models.enums import ExternalID, ProviderFeature
+from music_assistant_models.errors import ProviderUnavailableError
 from music_assistant_models.media_items import Artist
 
 from music_assistant.providers.digarr.client import DigarrRecommendation
@@ -34,12 +35,26 @@ def make_rec(**overrides) -> DigarrRecommendation:
     return DigarrRecommendation(**base)
 
 
+def make_provider(instance_id: str) -> MagicMock:
+    """
+    Build a streaming-provider double that passes `_get_streaming_providers`'s gates.
+
+    :param instance_id: The provider instance id to expose.
+    """
+    provider = MagicMock()
+    provider.instance_id = instance_id
+    provider.is_streaming_provider = True
+    provider.supported_features = {ProviderFeature.LIBRARY_ARTISTS}
+    return provider
+
+
 @pytest.fixture
 def mass() -> MagicMock:
     """Return a mass double whose library and providers both miss by default."""
     mass = MagicMock()
     mass.music.artists.get_library_item_by_external_ids = AsyncMock(return_value=None)
-    mass.get_providers_supporting_feature = MagicMock(return_value=[])
+    mass.music.artists.search = AsyncMock(return_value=[])
+    mass.music.providers = []
     return mass
 
 
@@ -51,7 +66,7 @@ async def test_prefers_the_library_copy(mass: MagicMock) -> None:
     resolved = await resolve_artist(make_rec(), mass, "digarr--x")
 
     assert resolved is library_artist
-    mass.get_providers_supporting_feature.assert_not_called()
+    mass.music.artists.search.assert_not_called()
 
 
 async def test_looks_up_the_library_by_musicbrainz_id(mass: MagicMock) -> None:
@@ -66,10 +81,8 @@ async def test_falls_back_to_a_streaming_provider(mass: MagicMock) -> None:
     streaming_artist = Artist(
         item_id="ytm123", provider="ytmusic", name="Opeth", provider_mappings=set()
     )
-    provider = MagicMock()
-    provider.instance_id = "ytmusic--1"
-    provider.search = AsyncMock(return_value=MagicMock(artists=[streaming_artist]))
-    mass.get_providers_supporting_feature = MagicMock(return_value=[provider])
+    mass.music.providers = [make_provider("ytmusic--1")]
+    mass.music.artists.search = AsyncMock(return_value=[streaming_artist])
 
     resolved = await resolve_artist(make_rec(), mass, "digarr--x")
 
@@ -85,10 +98,8 @@ async def test_rejects_a_mismatched_search_hit(mass: MagicMock) -> None:
         name="Completely Different Band",
         provider_mappings=set(),
     )
-    provider = MagicMock()
-    provider.instance_id = "ytmusic--1"
-    provider.search = AsyncMock(return_value=MagicMock(artists=[wrong]))
-    mass.get_providers_supporting_feature = MagicMock(return_value=[provider])
+    mass.music.providers = [make_provider("ytmusic--1")]
+    mass.music.artists.search = AsyncMock(return_value=[wrong])
 
     assert await resolve_artist(make_rec(), mass, "digarr--x") is None
 
@@ -100,28 +111,23 @@ async def test_returns_none_when_nothing_resolves(mass: MagicMock) -> None:
 
 async def test_never_searches_its_own_instance(mass: MagicMock) -> None:
     """The digarr instance is skipped: it owns no music and would recurse."""
-    own = MagicMock()
-    own.instance_id = "digarr--x"
-    mass.get_providers_supporting_feature = MagicMock(return_value=[own])
+    mass.music.providers = [make_provider("digarr--x")]
 
     await resolve_artist(make_rec(), mass, "digarr--x")
 
-    own.search.assert_not_called()
+    mass.music.artists.search.assert_not_called()
 
 
 async def test_a_provider_error_does_not_sink_the_whole_resolution(mass: MagicMock) -> None:
     """One failing provider must not prevent another from resolving the artist."""
-    broken = MagicMock()
-    broken.instance_id = "tidal--1"
-    broken.search = AsyncMock(side_effect=RuntimeError("tidal is down"))
-    good = MagicMock()
-    good.instance_id = "ytmusic--1"
-    good.search = AsyncMock(
-        return_value=MagicMock(
-            artists=[Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())]
-        )
-    )
-    mass.get_providers_supporting_feature = MagicMock(return_value=[broken, good])
+    mass.music.providers = [make_provider("tidal--1"), make_provider("ytmusic--1")]
+
+    def fake_search(name: str, instance_id: str, limit: int) -> list[Artist]:  # noqa: ARG001
+        if instance_id == "tidal--1":
+            raise ProviderUnavailableError("tidal is down")
+        return [Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())]
+
+    mass.music.artists.search = AsyncMock(side_effect=fake_search)
 
     resolved = await resolve_artist(make_rec(), mass, "digarr--x")
 
