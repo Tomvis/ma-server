@@ -1242,6 +1242,8 @@
   "provider.digarr.config_entries.min_score.label": "Minimum score",
   "provider.digarr.config_entries.row_size.label": "Items in the row",
   "provider.digarr.config_entries.test_connection.label": "Test connection",
+  "provider.digarr.config_entries.test_error_label.label": "Couldn't reach digarr.",
+  "provider.digarr.config_entries.test_ok_label.label": "Connected to digarr.",
   "provider.digarr.config_entries.url.description": "Base URL of your digarr instance, reachable from the Music Assistant container.",
   "provider.digarr.config_entries.url.label": "digarr URL",
   "provider.digarr.manifest.description": "Surfaces your digarr recommendations on Discover, so you can hear an artist before approving it into Lidarr.",

@@ -65,9 +65,15 @@ class DigarrProvider(PluginProvider):
         super().__init__(mass, manifest, config, supported_features)
         self._test_ok = False
         self._test_error: str | None = None
+        # CONF_URL/CONF_API_KEY are collected by the setup flow into setup_data, not
+        # values -- a freshly-created instance's config.values is {} (see
+        # controllers/config/flows.py's _finish_provider_setup), so config.get_value
+        # would silently resolve to DEFAULT_URL / "" on first load. get_setup_value
+        # reads setup_data first and falls back to the active config value, so it
+        # covers both first load and every load after the options page is re-saved.
         self._client = DigarrClient(
-            url=cast("str", config.get_value(CONF_URL, DEFAULT_URL)),
-            api_key=cast("str", config.get_value(CONF_API_KEY, "")),
+            url=cast("str", self.get_setup_value(CONF_URL, DEFAULT_URL)),
+            api_key=cast("str", self.get_setup_value(CONF_API_KEY, "")),
             session=mass.http_session,
         )
         self._ma_user = cast("str", config.get_value(CONF_MA_USER, ""))
@@ -89,18 +95,22 @@ class DigarrProvider(PluginProvider):
                 key=CONF_URL,
                 type=ConfigEntryType.STRING,
                 required=True,
-                default_value=self.config.get_value(CONF_URL, DEFAULT_URL),
+                default_value=self.get_setup_value(CONF_URL, DEFAULT_URL),
             ),
             ConfigEntry(
                 key=CONF_API_KEY,
                 type=ConfigEntryType.SECURE_STRING,
                 required=True,
-                default_value=self.config.get_value(CONF_API_KEY),
+                default_value=self.get_setup_value(CONF_API_KEY),
             ),
             ConfigEntry(
                 key=CONF_MA_USER,
                 type=ConfigEntryType.STRING,
-                required=True,
+                # Left optional: on first load no user has been picked yet, and a
+                # required entry with an unresolvable default (None) fails
+                # Config.validate() and rolls the whole instance back before it ever
+                # gets to load. The Discover row just doesn't render until one is set.
+                required=False,
                 # An empty list is the framework's own "no options" value: it's what makes
                 # this render as free text instead of an unusable empty picker.
                 options=users,
@@ -176,6 +186,7 @@ class DigarrProvider(PluginProvider):
         # back to free text rather than failing to render at all.
         try:
             users = await self.mass.webserver.auth.list_users()
-        except Exception:
+        except Exception as err:
+            self.logger.warning("Could not list Music Assistant users: %s", err)
             return []
         return [ConfigValueOption(user.username, user.username) for user in users]

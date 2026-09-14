@@ -21,6 +21,8 @@
       "description": "Hide recommendations digarr scored below this value."
     },
     "test_connection": { "label": "Test connection" },
+    "test_ok_label": { "label": "Connected to digarr." },
+    "test_error_label": { "label": "Couldn't reach digarr." },
     "clear_cache": { "label": "Clear resolved item cache" }
   },
   "media": {
