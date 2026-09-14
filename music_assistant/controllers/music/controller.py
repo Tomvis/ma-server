@@ -1552,9 +1552,16 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             return
         # Query the DB row for play history (via the shared helper) so it
         # actually anchors the album as documented.
+        #
+        # Another account still having the album on its shelf anchors it too: the shelf
+        # is per-user, so without this one member of a household clearing their own save
+        # would delete the row — and with it everybody else's. `library_item` cannot
+        # answer that, its listen_later is scoped to this caller (and is False by now
+        # anyway), so ask the controller for the household-wide answer.
         has_anchor = (
             library_item.favorite
             or any(pm.in_library for pm in library_item.provider_mappings)
+            or await self.albums.has_listen_later_anchor(library_item_id)
             or await self.albums.has_play_history(library_item_id)
         )
         if not has_anchor:

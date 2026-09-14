@@ -2,9 +2,15 @@
 Listen Later plugin provider.
 
 Contributes a single Discover row listing the albums on the Listen Later shelf.
-The shelf itself lives in the library core (the `albums.listen_later` column);
-this provider only surfaces it, delegating every query to the albums controller
-so the row can never drift from the dedicated Listen Later view.
+The shelf itself lives in the library core (the per-user `album_listen_later`
+association table); this provider only surfaces it, delegating every query to the
+albums controller so the row can never drift from the dedicated Listen Later view.
+
+The row's *contents* are per-user -- get_recommendation_items runs in the caller's
+request context, so each account sees its own shelf. The refresh *signal* is not: it
+is broadcast to every client, which then re-fetches and gets its own scoped list. So
+the snapshot this provider keeps to debounce that signal is deliberately the
+household-wide "is this album on anyone's shelf" set.
 """
 
 from __future__ import annotations
@@ -72,10 +78,7 @@ class ListenLaterProvider(PluginProvider):
         # MEDIA_ITEM_UPDATED), but without a seed the first ordinary metadata update
         # of each already-saved album would read as a false 0->1 transition and fire
         # a spurious refresh.
-        saved = await self.mass.music.albums.library_items(
-            listen_later=True, order_by="listen_later_added_at_desc", limit=0
-        )
-        self._saved_uris = {album.uri for album in saved if album.uri}
+        self._saved_uris = await self.mass.music.albums.listen_later_uris_all_users()
         # loaded_in_mass runs in a detached task that unload_provider() does not
         # await, so an unload can complete while the seed query above is still in
         # flight. Bail out rather than register a live subscription onto a provider
@@ -131,7 +134,14 @@ class ListenLaterProvider(PluginProvider):
         item = event.data
         if not isinstance(item, Album) or not item.uri:
             return
-        saved = bool(item.listen_later)
+        if item.provider != "library":
+            # only a library row can be on a shelf, and only its item_id is the db id
+            # the association table is keyed on
+            return
+        # not `item.listen_later`: that is scoped to whichever user's context produced
+        # the event (and to none at all for a background write), so a save by one
+        # account would read as "not saved" and never refresh anybody's row.
+        saved = await self.mass.music.albums.has_listen_later_anchor(item.item_id)
         if saved == (item.uri in self._saved_uris):
             return
         if saved:

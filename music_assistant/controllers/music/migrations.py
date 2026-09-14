@@ -18,6 +18,7 @@ from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.helpers import create_safe_string
 
 from music_assistant.constants import (
+    DB_TABLE_ALBUM_LISTEN_LATER,
     DB_TABLE_ALBUMS,
     DB_TABLE_ARTISTS,
     DB_TABLE_AUDIO_ANALYSIS,
@@ -1045,6 +1046,38 @@ async def migrate_database(  # noqa: PLR0915
             except Exception as err:
                 if "duplicate column" not in str(err):
                     raise
+
+    if prev_version <= 60:
+        # The listen-later shelf becomes per-user. `albums.listen_later` was a single
+        # bit for the whole install: in a household with more than one account,
+        # everybody's saves landed on one shelf.
+        #
+        # This step creates the association table and nothing else. It deliberately
+        # does NOT attribute the existing rows to anyone: the users live in auth.db,
+        # and at this point in the boot that database is not open yet -- music.setup()
+        # runs in the core-controller TaskGroup, webserver.setup() (which creates
+        # mass.webserver.auth.database) only afterwards. Reading users from here would
+        # hit None every time, and since a migration may not raise, the failure would
+        # be swallowed into a silent no-op backfill that looks like it worked. The
+        # attribution is listen_later_backfill.py, run from MusicAssistant.start()
+        # once the webserver is up.
+        #
+        # The old columns are deliberately NOT dropped. They are the only record of
+        # what was on the shelf before -- the backfill reads them, and it may have to
+        # wait several boots for an account to exist to attribute them to. SQLite drops
+        # are whole-table rewrites, and this migration must never raise: a failed
+        # library migration resets the database and costs a full rescan.
+        try:
+            await database.execute(
+                f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_ALBUM_LISTEN_LATER}(
+                        [item_id] INTEGER NOT NULL,
+                        [userid] TEXT NOT NULL,
+                        [added_at] INTEGER,
+                        UNIQUE(item_id, userid)
+                    );"""
+            )
+        except Exception as err:
+            logger.warning("Could not create %s: %s", DB_TABLE_ALBUM_LISTEN_LATER, err)
 
     if 40 <= prev_version <= 41 and await _table_exists(
         database, DB_TABLE_GENRE_MEDIA_ITEM_MAPPING

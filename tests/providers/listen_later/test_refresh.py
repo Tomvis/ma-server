@@ -29,6 +29,24 @@ def _album(uri: str, *, listen_later: bool) -> Album:
     )
 
 
+def _stub_shelf(mass: MagicMock, item_ids: set[str]) -> None:
+    """
+    Point the stubbed albums controller at a household shelf holding these album ids.
+
+    The provider no longer trusts `item.listen_later` off the event -- that field is
+    scoped to whichever user's context produced the event -- so the shelf state a test
+    wants has to be expressed here, on the controller, rather than on the Album.
+    """
+    mass.music.albums.listen_later_uris_all_users = AsyncMock(
+        return_value={f"library://album/{item_id}" for item_id in item_ids}
+    )
+
+    async def _anchor(item_id: str | int) -> bool:
+        return str(item_id) in item_ids
+
+    mass.music.albums.has_listen_later_anchor = AsyncMock(side_effect=_anchor)
+
+
 def _event(item: Album | Track) -> MassEvent:
     """Wrap a media item in a MEDIA_ITEM_UPDATED event."""
     return MassEvent(event=EventType.MEDIA_ITEM_UPDATED, object_id=item.uri, data=item)
@@ -55,9 +73,7 @@ async def plugin() -> tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock
     config.instance_id = "listen_later"
     config.get_value = MagicMock(return_value="GLOBAL")
     # Seeded shelf: one album already saved.
-    mass.music.albums.library_items = AsyncMock(
-        return_value=[_album("library://album/1", listen_later=True)]
-    )
+    _stub_shelf(mass, {"1"})
     unregister = MagicMock()
     mass.subscribe = MagicMock(return_value=unregister)
     provider = ListenLaterProvider(mass, manifest, config, SUPPORTED_FEATURES)
@@ -72,7 +88,8 @@ async def test_saving_a_new_album_signals_a_refresh(
     plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """An album newly flipped to saved refreshes the Discover row."""
-    provider, signal, _unregister, _mass = plugin
+    provider, signal, _unregister, mass = plugin
+    _stub_shelf(mass, {"1", "2"})
     await provider._on_media_item_updated(_event(_album("library://album/2", listen_later=True)))
     signal.assert_called_once_with({"event": EVENT_RECOMMENDATIONS_UPDATED})
 
@@ -81,7 +98,8 @@ async def test_unsaving_a_known_album_signals_a_refresh(
     plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """An album flipped from saved to unsaved refreshes the Discover row."""
-    provider, signal, _unregister, _mass = plugin
+    provider, signal, _unregister, mass = plugin
+    _stub_shelf(mass, set())
     await provider._on_media_item_updated(_event(_album("library://album/1", listen_later=False)))
     signal.assert_called_once_with({"event": EVENT_RECOMMENDATIONS_UPDATED})
 
@@ -108,6 +126,25 @@ async def test_unrelated_unsaved_album_signals_nothing(
     provider, signal, _unregister, _mass = plugin
     await provider._on_media_item_updated(_event(_album("library://album/99", listen_later=False)))
     signal.assert_not_called()
+
+
+async def test_shelf_membership_beats_the_event_flag(
+    plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """
+    The household shelf decides, not the listen_later carried on the event.
+
+    `item.listen_later` is scoped to whoever's context produced the event, and is
+    False outright for a background write. So one account saving an album another
+    account had not saved arrives as listen_later=False; trusting it would leave the
+    Discover row stale for everybody. Here the event says "not saved" while the shelf
+    says "saved" -- the signal must still fire.
+    """
+    provider, signal, _unregister, mass = plugin
+    _stub_shelf(mass, {"1", "2"})
+    await provider._on_media_item_updated(_event(_album("library://album/2", listen_later=False)))
+    signal.assert_called_once_with({"event": EVENT_RECOMMENDATIONS_UPDATED})
+    assert "library://album/2" in provider._saved_uris
 
 
 async def test_non_album_items_are_ignored(
@@ -157,14 +194,20 @@ async def test_subscribes_to_media_item_updated(
     mass.subscribe.assert_any_call(provider._on_media_item_updated, EventType.MEDIA_ITEM_UPDATED)
 
 
-async def test_seed_query_requests_the_full_shelf(
+async def test_seed_query_requests_the_whole_household_shelf(
     plugin: tuple[ListenLaterProvider, MagicMock, MagicMock, MagicMock],
 ) -> None:
-    """The seed snapshot in loaded_in_mass() must not truncate a large shelf."""
-    _provider, _signal, _unregister, mass = plugin
-    mass.music.albums.library_items.assert_awaited_once_with(
-        listen_later=True, order_by="listen_later_added_at_desc", limit=0
-    )
+    """
+    The seed snapshot is taken household-wide, and in full.
+
+    It must not go through library_items(listen_later=True): that is scoped to the
+    calling user, and loaded_in_mass() runs at provider load with no request context
+    -- so it would seed empty on every boot, and the first ordinary metadata update
+    of each already-saved album would then misread as a fresh save.
+    """
+    provider, _signal, _unregister, mass = plugin
+    mass.music.albums.listen_later_uris_all_users.assert_awaited_once_with()
+    assert provider._saved_uris == {"library://album/1"}
 
 
 async def test_unloading_before_subscribe_skips_the_subscription() -> None:
@@ -184,9 +227,7 @@ async def test_unloading_before_subscribe_skips_the_subscription() -> None:
     config.name = "Listen Later"
     config.instance_id = "listen_later"
     config.get_value = MagicMock(return_value="GLOBAL")
-    mass.music.albums.library_items = AsyncMock(
-        return_value=[_album("library://album/1", listen_later=True)]
-    )
+    _stub_shelf(mass, {"1"})
     mass.subscribe = MagicMock(return_value=MagicMock())
     provider = ListenLaterProvider(mass, manifest, config, SUPPORTED_FEATURES)
     await provider.handle_async_init()

@@ -12,8 +12,15 @@ from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 from music_assistant_models.auth import Scope
-from music_assistant_models.enums import AlbumType, ExternalID, MediaType, ProviderFeature
+from music_assistant_models.enums import (
+    AlbumType,
+    EventType,
+    ExternalID,
+    MediaType,
+    ProviderFeature,
+)
 from music_assistant_models.errors import (
+    InsufficientPermissions,
     InvalidDataError,
     MediaNotFoundError,
     MusicAssistantError,
@@ -32,12 +39,18 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.media_items.metadata import CriticalReception, MediaItemMetadata
 
-from music_assistant.constants import DB_TABLE_ALBUM_ARTISTS, DB_TABLE_ALBUM_TRACKS, DB_TABLE_ALBUMS
+from music_assistant.constants import (
+    DB_TABLE_ALBUM_ARTISTS,
+    DB_TABLE_ALBUM_LISTEN_LATER,
+    DB_TABLE_ALBUM_TRACKS,
+    DB_TABLE_ALBUMS,
+)
 from music_assistant.controllers.music.helpers import (
     metadata_for_update,
     provider_mappings_for_update,
     search_name_match_clause,
 )
+from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.compare import (
     ALBUM_RETAIL_SUFFIX_KEYS,
     AlbumMatchEvidence,
@@ -124,6 +137,43 @@ _CR_SOURCES_EACH = "json_each(albums.metadata, '$.critical_reception.sources')"
 # _CR_SOURCES_EACH: it feeds the DR bucket filter, both dr sort keys, the summary
 # query and the sync-details query, so a schema move stays a single edit.
 _DR_JSON = "json_extract(albums.metadata, '$.dynamic_range')"
+
+# The listen-later shelf is per-user: it lives in the album_listen_later association
+# table, keyed on (item_id, userid), not on the `albums.listen_later` column that a
+# fork database still carries. Every read below is bound to :listen_later_userid.
+#
+# The legacy columns are still on the albums row and still selected by `albums.*`, so
+# the computed columns MUST come first in the SELECT list. With duplicate column names
+# aiosqlite/sqlite3 Row resolves to the FIRST match, so an override appended after
+# `albums.*` would be silently ignored and every read would fall back to the global
+# bit. tests/core/test_album_listen_later_per_user.py pins that ordering.
+_LISTEN_LATER_ADDED_AT_SQL = (
+    f"(SELECT added_at FROM {DB_TABLE_ALBUM_LISTEN_LATER} "
+    "WHERE item_id = albums.item_id AND userid = :listen_later_userid)"
+)
+_LISTEN_LATER_FLAG_SQL = (
+    f"EXISTS(SELECT 1 FROM {DB_TABLE_ALBUM_LISTEN_LATER} "
+    "WHERE item_id = albums.item_id AND userid = :listen_later_userid)"
+)
+# the membership test used by the `listen_later=` filter; phrased over albums.item_id
+# so it composes with the other WHERE fragments without needing a JOIN
+_LISTEN_LATER_MEMBER_SQL = (
+    f"albums.item_id IN (SELECT item_id FROM {DB_TABLE_ALBUM_LISTEN_LATER} "
+    "WHERE userid = :listen_later_userid)"
+)
+
+
+def _current_userid() -> str:
+    """
+    Return the calling user's id for a listen-later query, or "" when there is none.
+
+    Fails closed on purpose. `userid` is NOT NULL and no account has an empty id, so ""
+    matches no association row: a background task or an unauthenticated caller sees an
+    empty shelf rather than the union of everyone's saves.
+    """
+    user = get_current_user()
+    return user.user_id if user else ""
+
 
 # Rating-bucket vocabulary per CR source: the selector values a client may send and
 # the width of the bucket each selector spans. AMG rates in half stars, the full 0.5-5.0
@@ -470,8 +520,13 @@ def _apply_album_specific_filters(  # noqa: PLR0913
         query_parts.append("albums.album_type IN :album_types")
         query_params["album_types"] = [x.value for x in album_types]
     if listen_later is not None:
-        query_parts.append("albums.listen_later = :listen_later_flag")
-        query_params["listen_later_flag"] = listen_later
+        # Scoped to the calling user: the shelf is per-user, so an unscoped query would
+        # show everyone in the household everyone else's saves. `NOT (...)` rather than
+        # a negated subquery so an album nobody saved still matches listen_later=False.
+        query_parts.append(
+            _LISTEN_LATER_MEMBER_SQL if listen_later else f"NOT ({_LISTEN_LATER_MEMBER_SQL})"
+        )
+        query_params["listen_later_userid"] = _current_userid()
     _apply_critical_reception_filters(
         query_parts=query_parts,
         query_params=query_params,
@@ -515,8 +570,11 @@ class AlbumsController(MediaControllerBase[Album]):
     # sorts target `albums.metadata` JSON fields that only exist on this table.
     extra_sort_keys: Mapping[str, str] = MappingProxyType(
         {
-            "listen_later_added_at": "listen_later_added_at ASC NULLS LAST",
-            "listen_later_added_at_desc": "listen_later_added_at DESC NULLS LAST",
+            # the *association's* timestamp, not albums.listen_later_added_at: that
+            # column is the retired household-wide stamp, so sorting on it would order
+            # one user's shelf by when somebody else saved the album.
+            "listen_later_added_at": f"{_LISTEN_LATER_ADDED_AT_SQL} ASC NULLS LAST",
+            "listen_later_added_at_desc": f"{_LISTEN_LATER_ADDED_AT_SQL} DESC NULLS LAST",
             # `dr` sorts on the canonical (measured) album dynamic range — not the
             # AMG-review-reported value, which lives at $.critical_reception.amg_dr.
             # NULLS LAST so albums without a measured DR don't float to the top of
@@ -548,6 +606,8 @@ class AlbumsController(MediaControllerBase[Album]):
         """Return the base SELECT query for albums and its bound query params."""
         query = f"""
         SELECT
+            {_LISTEN_LATER_FLAG_SQL} AS listen_later,
+            {_LISTEN_LATER_ADDED_AT_SQL} AS listen_later_added_at,
             albums.*,
             {self._external_ids_query()} AS external_ids,
             {self._provider_mappings_query()} AS provider_mappings,
@@ -560,7 +620,7 @@ class AlbumsController(MediaControllerBase[Album]):
                     'media_type', 'artist'
                 )) FROM artists JOIN album_artists on album_artists.album_id = albums.item_id  WHERE artists.item_id = album_artists.artist_id) AS artists
             FROM albums"""
-        return query, {}
+        return query, {"listen_later_userid": _current_userid()}
 
     @property
     def summary_query(self) -> tuple[str, dict[str, Any]]:
@@ -572,14 +632,14 @@ class AlbumsController(MediaControllerBase[Album]):
             albums.version,
             albums.year,
             albums.album_type,
-            albums.listen_later,
-            albums.listen_later_added_at,
+            {_LISTEN_LATER_FLAG_SQL} AS listen_later,
+            {_LISTEN_LATER_ADDED_AT_SQL} AS listen_later_added_at,
             json_extract(albums.metadata, '$.critical_reception') AS critical_reception,
             {_DR_JSON} AS dynamic_range,
             {self._provider_mappings_query()} AS provider_mappings,
             {artists_query} AS artists
             FROM albums"""
-        return query, {}
+        return query, {"listen_later_userid": _current_userid()}
 
     async def get(
         self,
@@ -958,29 +1018,96 @@ class AlbumsController(MediaControllerBase[Album]):
         await self.mass.music.database.delete(DB_TABLE_ALBUM_TRACKS, {"album_id": db_id})
         # delete entry(s) from album artists table
         await self.mass.music.database.delete(DB_TABLE_ALBUM_ARTISTS, {"album_id": db_id})
+        # delete this album from every user's listen-later shelf
+        await self.mass.music.database.delete(DB_TABLE_ALBUM_LISTEN_LATER, {"item_id": db_id})
         # delete the album itself from db
         # this will raise if the item still has references and recursive is false
         await super().remove_item_from_library(item_id)
 
-    async def set_listen_later(self, item_id: str | int, listen_later: bool) -> None:
+    async def set_listen_later(
+        self, item_id: str | int, listen_later: bool, userid: str | None = None
+    ) -> None:
         """
-        Set the listen_later flag on a library album.
+        Set the listen_later flag on a library album, for one user.
 
         Independent of `favorite` — this is the Roon-style "save for later" pile,
-        not a library/favorites add. Stamps `listen_later_added_at` with the
-        current epoch on flip-to-true so the dedicated view can sort newest-first.
+        not a library/favorites add. Stamps `added_at` with the current epoch on
+        flip-to-true so the dedicated view can sort newest-first.
+
+        The shelf is per-user: this writes a row in the album_listen_later
+        association table, not the (retired) `albums.listen_later` column.
+
+        :param item_id: Library album item_id (database id).
+        :param listen_later: Whether the album should be on the user's shelf.
+        :param userid: Whose shelf to write. Defaults to the calling user. It is a
+            parameter rather than always-ambient so background callers (the backfill,
+            tests) can be explicit; an ambient-only lookup would make those callers
+            impossible to write without faking a request context.
         """
+        if userid is None:
+            user = get_current_user()
+            if user is None:
+                raise InsufficientPermissions("listen-later requires a signed-in user")
+            userid = user.user_id
         db_id = int(item_id)
-        library_item = await self.get_library_item(db_id)
-        if library_item.listen_later == listen_later:
-            return
-        await self._set_flag_columns(
-            db_id,
-            {
-                "listen_later": listen_later,
-                "listen_later_added_at": int(utc_timestamp()) if listen_later else None,
-            },
+        if listen_later:
+            await self.mass.music.database.insert_or_replace(
+                DB_TABLE_ALBUM_LISTEN_LATER,
+                {"item_id": db_id, "userid": userid, "added_at": int(utc_timestamp())},
+            )
+        else:
+            await self.mass.music.database.delete(
+                DB_TABLE_ALBUM_LISTEN_LATER, {"item_id": db_id, "userid": userid}
+            )
+        await self._signal_listen_later_change(db_id)
+
+    async def clear_listen_later_for_all_users(self, item_id: str | int) -> None:
+        """
+        Take an album off every user's listen-later shelf.
+
+        For the household-wide transitions, where the album stops being a "saved for
+        later" candidate for everyone at once rather than for one person: it entered
+        the library proper, or it is being deleted. Clearing only the calling user's
+        row would leave the album on everyone else's shelf *and* in the library, which
+        is exactly the both-views state the mutual exclusivity rule exists to prevent —
+        and the sync loop that triggers it has no calling user at all.
+
+        :param item_id: Library album item_id (database id).
+        """
+        await self.mass.music.database.delete(
+            DB_TABLE_ALBUM_LISTEN_LATER, {"item_id": int(item_id)}
         )
+
+    async def has_listen_later_anchor(self, item_id: str | int) -> bool:
+        """
+        Return whether the album sits on *any* user's listen-later shelf.
+
+        Deliberately household-wide and independent of the calling user: this answers
+        "does anybody still want this album", which is what the provider sync loop asks
+        before deleting a row whose provider dropped it. Asking it per-user would let a
+        background sync — which has no calling user, so reads an empty shelf — delete an
+        album that another account has saved.
+
+        :param item_id: Library album item_id (database id).
+        """
+        return bool(
+            await self.mass.music.database.get_row(
+                DB_TABLE_ALBUM_LISTEN_LATER, {"item_id": int(item_id)}
+            )
+        )
+
+    async def listen_later_uris_all_users(self) -> set[str]:
+        """
+        Return the library uri of every album on any user's listen-later shelf.
+
+        Household-wide, for the Discover row's refresh-debounce snapshot: that signal
+        is broadcast to every client, so what it tracks is "did the shelf change for
+        anyone", not "for me".
+        """
+        rows = await self.mass.music.database.get_rows_from_query(
+            f"SELECT DISTINCT item_id FROM {DB_TABLE_ALBUM_LISTEN_LATER}", limit=0
+        )
+        return {f"library://album/{row['item_id']}" for row in rows}
 
     async def set_release_group(
         self,
@@ -1374,17 +1501,18 @@ class AlbumsController(MediaControllerBase[Album]):
         # gains an in_library mapping it graduates out of the listen-later pile, so a
         # saved album that's later added to the library (or synced in) never lingers in
         # both. New rows default listen_later=0, so this only matters on update.
-        if cur_item.listen_later and any(pm.in_library for pm in provider_mappings):
+        if any(pm.in_library for pm in provider_mappings):
             # Clear listen-later inline rather than via set_listen_later(): the
             # surrounding update_item_in_library/add_item_to_library re-reads the row
             # and emits a single MEDIA_ITEM_UPDATED once the whole update (incl. the
             # artists set below) has landed. Calling set_listen_later here would add
             # two redundant re-reads plus a premature event for a half-updated row.
-            await self.mass.music.database.update(
-                self.db_table,
-                {"item_id": db_id},
-                {"listen_later": False, "listen_later_added_at": None},
-            )
+            #
+            # Unconditional now, and household-wide: `cur_item.listen_later` only ever
+            # reported the *calling* user's shelf, so gating on it would leave the album
+            # on every other account's shelf while it sits in the library. The delete is
+            # a no-op when no shelf row exists, which is the common case.
+            await self.clear_listen_later_for_all_users(db_id)
         # set album artist(s)
         artists = update.artists if overwrite else cur_item.artists + update.artists
         await self._set_album_artists(db_id, artists, overwrite=overwrite)
@@ -1680,6 +1808,19 @@ class AlbumsController(MediaControllerBase[Album]):
         )
         return ItemMapping.from_item(db_artist)
 
+    async def _signal_listen_later_change(self, db_id: int) -> None:
+        """
+        Re-read the album and announce the change, mirroring _set_flag_columns.
+
+        The shelf write lands in an association table rather than on the item row, so
+        it cannot go through _set_flag_columns — but the same re-read / signal_event
+        contract has to hold, or the Discover row never learns the shelf changed.
+
+        :param db_id: Library album item_id (database id) that was just written.
+        """
+        library_item = await self.get_library_item(db_id)
+        self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
+
     async def _set_album_track(self, db_id: int, db_track_id: int, track: Track) -> None:
         """Store Album Track info."""
         # write (or update) record in album_tracks table
@@ -1697,8 +1838,13 @@ class AlbumsController(MediaControllerBase[Album]):
         """Return extra (columns, joins, params) for the albums sync-details query."""
         # the sync loop needs the listen-later flag plus the review/DR metadata to
         # decide whether anything actually changed, without hydrating a full Album
+        # household-wide EXISTS, not the calling user's shelf: the sync loop runs as a
+        # background task with no calling user, and the demotion it drives takes the
+        # album off *everyone's* shelf. A per-user read here would always be False and
+        # the demotion would never fire.
         extra_columns = f"""
-            , {DB_TABLE_ALBUMS}.listen_later
+            , EXISTS(SELECT 1 FROM {DB_TABLE_ALBUM_LISTEN_LATER}
+                WHERE item_id = {DB_TABLE_ALBUMS}.item_id) AS listen_later
             , json_extract({DB_TABLE_ALBUMS}.metadata, '$.critical_reception')
                 AS critical_reception
             , {_DR_JSON} AS dynamic_range

@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 
 import pytest
+from music_assistant_models.auth import UserRole
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.enums import MediaType, ProviderFeature, ProviderType
 from music_assistant_models.errors import (
@@ -34,6 +35,7 @@ from music_assistant_models.media_items.metadata import (
 from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.controllers.music import controller as music_controller
+from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -150,6 +152,25 @@ def _make_album(
             )
         },
     )
+
+
+@pytest.fixture(autouse=True)
+async def signed_in_user(mass: MusicAssistant) -> AsyncGenerator[str]:
+    """
+    Sign a user in for the duration of each test in this module.
+
+    The listen-later shelf is per-user, so every one of these API calls needs a
+    calling user to attribute the save to. Autouse because that is a precondition of
+    the endpoints under test, not a property any single test is asserting -- and MA
+    itself enforces it: an install with no users refuses every websocket connection
+    with "Setup required", so a signed-in caller is what production always has.
+    """
+    user = await mass.webserver.auth.create_user(username="listener", role=UserRole.USER)
+    set_current_user(user)
+    try:
+        yield user.user_id
+    finally:
+        set_current_user(None)
 
 
 def _register_provider(

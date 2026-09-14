@@ -16,7 +16,16 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # "prev_version not in (0, DB_SCHEMA_VERSION)" guard in database.py would skip
 # migration entirely at 59, and every playlist read then fails on the missing
 # "access" column. The <= 59 step in migrations.py backfills it.
-DB_SCHEMA_VERSION: Final[int] = 60
+#
+# 61: the listen-later shelf moved off the `albums.listen_later` column and into the
+# per-user `album_listen_later` association table. The <= 60 step only creates that
+# table -- it cannot attribute the existing rows, because the users live in auth.db
+# and the auth database is not open yet when the library migration runs (music.setup()
+# is in the core-controller TaskGroup, webserver.setup() comes after it). The
+# attribution is a separate one-off, listen_later_backfill.py, run from
+# MusicAssistant.start() once the webserver is up -- the same shape as
+# provider_access_migration.py, and for the same reason.
+DB_SCHEMA_VERSION: Final[int] = 61
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60

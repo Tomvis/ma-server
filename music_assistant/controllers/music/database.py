@@ -22,6 +22,7 @@ from music_assistant_models.errors import MusicAssistantError
 
 from music_assistant.constants import (
     DB_TABLE_ALBUM_ARTISTS,
+    DB_TABLE_ALBUM_LISTEN_LATER,
     DB_TABLE_ALBUM_TRACKS,
     DB_TABLE_ALBUMS,
     DB_TABLE_ARTISTS,
@@ -160,6 +161,7 @@ class MusicDatabaseSetupMixin:
         # relation. Sweep them here rather than rely on foreign keys, which sqlite has off.
         for table, column, parent_table in (
             (DB_TABLE_ALBUM_ARTISTS, "album_id", DB_TABLE_ALBUMS),
+            (DB_TABLE_ALBUM_LISTEN_LATER, "item_id", DB_TABLE_ALBUMS),
             (DB_TABLE_ALBUM_ARTISTS, "artist_id", DB_TABLE_ARTISTS),
             (DB_TABLE_ALBUM_TRACKS, "album_id", DB_TABLE_ALBUMS),
             (DB_TABLE_ALBUM_TRACKS, "track_id", DB_TABLE_TRACKS),
@@ -534,6 +536,19 @@ class MusicDatabaseSetupMixin:
             UNIQUE(album_id, artist_id)
             );"""
         )
+        # The listen-later shelf, one row per (album, user). `userid` carries no
+        # FOREIGN KEY on purpose: the users live in auth.db, a separate SQLite file
+        # opened by a separate connection that nothing ATTACHes here, so the
+        # constraint is not expressible. Same shape as DB_TABLE_PLAYLOG.userid.
+        await self.database.execute(
+            f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_ALBUM_LISTEN_LATER}(
+            [item_id] INTEGER NOT NULL,
+            [userid] TEXT NOT NULL,
+            [added_at] INTEGER,
+            FOREIGN KEY([item_id]) REFERENCES [albums]([item_id]),
+            UNIQUE(item_id, userid)
+            );"""
+        )
         await self.database.execute(
             f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_AUDIOBOOK_ARTISTS}(
             [audiobook_id] INTEGER NOT NULL,
@@ -685,6 +700,13 @@ class MusicDatabaseSetupMixin:
             f"on {DB_TABLE_TRACK_ARTISTS}(artist_id);"
         )
         # indexes on album_artists table
+        # the UNIQUE(item_id, userid) constraint's implicit index leads with item_id,
+        # so it cannot seek the "every album on MY shelf, newest first" query that the
+        # listen-later view and Discover row both run. This one covers it outright.
+        await self.database.execute(
+            f"CREATE INDEX IF NOT EXISTS {DB_TABLE_ALBUM_LISTEN_LATER}_userid_added_at_idx "
+            f"on {DB_TABLE_ALBUM_LISTEN_LATER}(userid,added_at);"
+        )
         await self.database.execute(
             f"CREATE INDEX IF NOT EXISTS {DB_TABLE_ALBUM_ARTISTS}_album_id_idx "
             f"on {DB_TABLE_ALBUM_ARTISTS}(album_id);"

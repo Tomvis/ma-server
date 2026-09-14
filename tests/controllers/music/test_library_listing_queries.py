@@ -249,7 +249,14 @@ def _legacy_query(  # noqa: PLR0913
             "AND provider_mappings.media_type = :provider_media_type "
             "AND provider_mappings.in_library = 1"
         )
-    sql_query = base_query if base_query is not None else controller.base_query[0]
+    if base_query is None:
+        # take the controller's own bound params too, not just the SQL: the albums
+        # base query binds :listen_later_userid for the per-user shelf columns, and
+        # production merges those in the same way (_build_final_query's caller does
+        # a setdefault over them). Dropping them leaves the param unbound.
+        base_query, base_params = controller.base_query
+        params = {**base_params, **params}
+    sql_query = base_query
     if join_parts:
         sql_query += f" {' '.join(join_parts)} "
     if query_parts:

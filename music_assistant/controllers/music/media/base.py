@@ -1101,6 +1101,18 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             return
         await self._set_flag_columns(db_id, {"favorite": favorite})
 
+    async def has_listen_later_anchor(self, item_id: str | int) -> bool:
+        """
+        Return whether any user has this item on a listen-later shelf.
+
+        Only albums have a shelf, so the base implementation is always False; the
+        albums controller overrides it. It exists on the base so the provider sync
+        loop can ask the question of any controller without a type check.
+
+        :param item_id: Library item id (database id).
+        """
+        return False
+
     @final
     async def has_play_history(self, item_id: str | int) -> bool:
         """Return whether the library item has any recorded play history."""

@@ -11,6 +11,7 @@ from music_assistant_models.enums import ExternalID
 from music_assistant_models.errors import MusicAssistantError
 
 from music_assistant.constants import (
+    DB_TABLE_ALBUM_LISTEN_LATER,
     DB_TABLE_AUDIO_ANALYSIS,
     DB_TABLE_EXTERNAL_ID_LOOKUP,
     DB_TABLE_PLAYLOG,
@@ -774,3 +775,64 @@ async def test_migration_adds_listen_later_columns_to_a_stock_database_stamped_5
     columns = await _table_columns(database, "albums")
     assert "listen_later" in columns
     assert "listen_later_added_at" in columns
+
+
+async def test_migration_adds_the_per_user_listen_later_table(
+    database: DatabaseConnection,
+) -> None:
+    """A database at schema 60 gains the per-user shelf table, and keeps its old rows."""
+    await database.execute("ALTER TABLE albums ADD COLUMN [listen_later] BOOLEAN DEFAULT 0")
+    await database.execute("ALTER TABLE albums ADD COLUMN [listen_later_added_at] INTEGER")
+    await database.execute(
+        "INSERT INTO albums (item_id, listen_later, listen_later_added_at) VALUES (1, 1, 555)"
+    )
+    await database.commit()
+    assert not await _table_columns(database, DB_TABLE_ALBUM_LISTEN_LATER)
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    await migrate_database(
+        mass,
+        database,
+        MagicMock(),
+        prev_version=60,
+        create_tables=AsyncMock(),
+    )
+
+    assert await _table_columns(database, DB_TABLE_ALBUM_LISTEN_LATER) == {
+        "item_id",
+        "userid",
+        "added_at",
+    }
+    # the step only creates the table: it cannot reach the users, which live in a
+    # separate database that is not open this early in the boot. Attribution is
+    # listen_later_backfill.py, run once the webserver is up.
+    assert await database.get_count_from_query(f"SELECT * FROM {DB_TABLE_ALBUM_LISTEN_LATER}") == 0
+    # and the legacy row it will read is still there
+    rows = await database.get_rows_from_query(
+        "SELECT item_id, listen_later_added_at FROM albums WHERE listen_later = 1", limit=0
+    )
+    assert [(row["item_id"], row["listen_later_added_at"]) for row in rows] == [(1, 555)]
+
+
+async def test_listen_later_table_migration_is_idempotent(
+    database: DatabaseConnection,
+) -> None:
+    """Re-running the step over an already-migrated database neither raises nor wipes it."""
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    await migrate_database(mass, database, MagicMock(), prev_version=60, create_tables=AsyncMock())
+    await database.execute(
+        f"INSERT INTO {DB_TABLE_ALBUM_LISTEN_LATER} (item_id, userid, added_at) "
+        "VALUES (1, 'user-a', 555)"
+    )
+    await database.commit()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=60, create_tables=AsyncMock())
+
+    rows = await database.get_rows_from_query(
+        f"SELECT * FROM {DB_TABLE_ALBUM_LISTEN_LATER}", limit=0
+    )
+    assert [(row["item_id"], row["userid"], row["added_at"]) for row in rows] == [
+        (1, "user-a", 555)
+    ]

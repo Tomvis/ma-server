@@ -66,6 +66,9 @@ from music_assistant.controllers.diagnostics import DiagnosticsController
 from music_assistant.controllers.discovery import DiscoveryController
 from music_assistant.controllers.metadata import MetaDataController
 from music_assistant.controllers.music import MusicController
+from music_assistant.controllers.music.listen_later_backfill import (
+    backfill_listen_later,
+)
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.streams import StreamsController
@@ -338,6 +341,11 @@ class MusicAssistant:
         # provider load so no provider is served a record that is still to be written.
         # TODO: remove after 2.11 release
         await migrate_provider_access(self)
+        # one-off: give the household-wide listen-later shelf to the account it belongs
+        # to, now that the shelf is per-user. Needs the users from the auth database, so
+        # it cannot run with the library migration that created the table.
+        # TODO: remove once no install can still be on schema <= 60
+        await backfill_listen_later(self)
         # repair sidebar shortcuts left pointing at a provider instance that no longer exists:
         # those never resolve, so the frontend cannot render them and the user cannot remove
         # them. Reads the provider config, so it must not wait for the providers to load.

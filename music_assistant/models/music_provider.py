@@ -1119,9 +1119,14 @@ class MusicProvider(Provider):
                         delete_candidate = (
                             not remaining_providers_in_library and not self.is_streaming_provider
                         )
+                        # listen-later is asked of the controller, not of
+                        # library_item.listen_later: the shelf is per-user and this sync
+                        # runs as a background task with no calling user, so the item's
+                        # own flag always reads False here. Consulting it would delete an
+                        # album that another account still has saved.
                         has_user_anchor = delete_candidate and (
                             library_item.favorite
-                            or library_item.listen_later
+                            or await controller.has_listen_later_anchor(db_id)
                             or await controller.has_play_history(db_id)
                         )
                         if delete_candidate and not has_user_anchor:
@@ -1393,10 +1398,12 @@ class MusicProvider(Provider):
                     # library, so clear the flag or it shows up in both views. The
                     # pre-flight check in add_album_to_listen_later guards the write
                     # path; this guards the read-back path where sync wins the race.
+                    # household-wide: the album is in the library proper now, so it
+                    # leaves every account's shelf, not just the (absent) caller's.
                     if getattr(sync_details, "listen_later", False) and any(
                         pm.in_library for pm in prov_item.provider_mappings
                     ):
-                        await self.mass.music.albums.set_listen_later(db_id, False)
+                        await self.mass.music.albums.clear_listen_later_for_all_users(db_id)
                 await asyncio.sleep(0)  # yield to eventloop
             except Exception as err:
                 self._handle_sync_item_failure(MediaType.ALBUM, prov_item.uri, err)
