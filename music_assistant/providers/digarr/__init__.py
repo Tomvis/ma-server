@@ -594,6 +594,13 @@ class DigarrProvider(PluginProvider):
         serving the previous generation instead of blanking the row. A
         ``DigarrError`` is logged and swallowed for the same reason: this runs
         from a background schedule with no caller to raise to.
+
+        Always logs one INFO summary line -- even when every candidate resolved and
+        nothing is otherwise worth reporting -- so "did the row populate?" is
+        answerable from the logs alone. That summary also separates a candidate that
+        resolved to nothing on any provider from one that resolved fine but was
+        dropped because the row already held ``self._row_size`` items; today's more
+        detailed unresolved-artists line only ever covered the former.
         """
         try:
             candidates = [
@@ -615,16 +622,19 @@ class DigarrProvider(PluginProvider):
         artist_ids: dict[str, int] = {}
         mbid_artist_ids: dict[str, int] = {}
         unresolved: list[str] = []
+        dropped_by_cap = 0
         for rec, artist in zip(candidates, resolved, strict=True):
             if artist is None:
                 unresolved.append(rec.artist_name)
                 continue
-            if len(items) < self._row_size:
-                items.append(artist)
-                rec_ids[artist.uri] = rec.id
-                mbid_rec_ids[rec.artist_mbid] = rec.id
-                artist_ids[artist.uri] = rec.artist_id
-                mbid_artist_ids[rec.artist_mbid] = rec.artist_id
+            if len(items) >= self._row_size:
+                dropped_by_cap += 1
+                continue
+            items.append(artist)
+            rec_ids[artist.uri] = rec.id
+            mbid_rec_ids[rec.artist_mbid] = rec.id
+            artist_ids[artist.uri] = rec.artist_id
+            mbid_artist_ids[rec.artist_mbid] = rec.artist_id
 
         self._items = items
         self._rec_ids = rec_ids
@@ -632,6 +642,15 @@ class DigarrProvider(PluginProvider):
         self._artist_ids = artist_ids
         self._mbid_artist_ids = mbid_artist_ids
 
+        self.logger.info(
+            "digarr: refresh fetched %s pending recommendation(s): %s resolved into the "
+            "row, %s unresolved on any provider, %s dropped by the row size cap (%s)",
+            len(candidates),
+            len(items),
+            len(unresolved),
+            dropped_by_cap,
+            self._row_size,
+        )
         if unresolved:
             self.logger.info(
                 "digarr: %s of %s recommendations resolved to nothing on any provider: %s",

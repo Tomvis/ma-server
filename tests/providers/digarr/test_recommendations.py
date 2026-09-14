@@ -134,6 +134,64 @@ async def test_refresh_keeps_the_previous_generation_when_digarr_fails(
     assert provider._rec_ids == {existing.uri: 42}
 
 
+async def test_refresh_logs_a_summary_even_when_everything_resolves(
+    provider: DigarrProvider,
+) -> None:
+    """
+    A fully successful refresh still leaves a positive signal in the logs.
+
+    Before this, only unresolved recommendations were logged, so a refresh where
+    everything resolved produced no log line at all -- "did the row populate?" was
+    unanswerable from the logs alone.
+    """
+    resolved = Artist(item_id="ytm1", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(return_value=[make_rec(rec_id=42)])
+    provider.logger = MagicMock()
+
+    with patch("music_assistant.providers.digarr.resolve_artist", AsyncMock(return_value=resolved)):
+        await provider._refresh()
+
+    provider.logger.info.assert_called_once()
+    args = provider.logger.info.call_args.args
+    message = args[0] % args[1:]
+    assert "1 resolved into the row" in message
+    assert "0 unresolved" in message
+    assert "0 dropped by the row size cap" in message
+
+
+async def test_refresh_summary_distinguishes_unresolved_from_row_cap_drops(
+    provider: DigarrProvider,
+) -> None:
+    """
+    An item that resolved but was cut by the row-size cap is not the same as an unresolvable one.
+
+    Today both reasons an item does not appear in the row were invisible or
+    conflated; the summary line must report them as distinct counts.
+    """
+    provider._row_size = 1
+    resolved_a = Artist(item_id="a", provider="ytmusic", name="A", provider_mappings=set())
+    resolved_b = Artist(item_id="b", provider="ytmusic", name="B", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(
+        return_value=[
+            make_rec(rec_id=1, name="A"),
+            make_rec(rec_id=2, name="B"),
+            make_rec(rec_id=3, name="C"),
+        ]
+    )
+    resolve = AsyncMock(side_effect=[resolved_a, resolved_b, None])
+    provider.logger = MagicMock()
+
+    with patch("music_assistant.providers.digarr.resolve_artist", resolve):
+        await provider._refresh()
+
+    assert provider._items == [resolved_a]
+    summary_args = provider.logger.info.call_args_list[0].args
+    summary = summary_args[0] % summary_args[1:]
+    assert "1 resolved into the row" in summary
+    assert "1 unresolved on any provider" in summary
+    assert "1 dropped by the row size cap" in summary
+
+
 async def test_refresh_signals_the_frontend(provider: DigarrProvider) -> None:
     """The Discover page refreshes itself off this event; no client code needed."""
     provider.signal_provider_event = MagicMock()
