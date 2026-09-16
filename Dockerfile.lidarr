@@ -8,9 +8,9 @@
 # tracking `latest` or `nightly`, both of which move: the overlay replaces the
 # music_assistant source wholesale, so a base that has drifted past the merged
 # source ships a venv resolved for different pins than the code layered over it.
-# 2.11 line: `enhanced` is merged to the 2.11.0.dev2026091303 tag exactly, so this
-# base's venv matches the layered code pin-for-pin (aiosonos 0.1.13, models 1.1.211,
-# frontend 2.17.307, aiosendspin still 9.1.1). Stopping at the tag rather than
+# 2.11 line: `enhanced` is merged to the 2.11.0.dev2026091603 tag exactly, so this
+# base's venv matches the layered code pin-for-pin (aiosonos 0.1.13, models 1.1.212,
+# frontend 2.17.310, aiosendspin still 9.1.1). Stopping at the tag rather than
 # origin/dev HEAD is deliberate: only a tag has a published ghcr image to layer onto.
 ARG UPSTREAM=ghcr.io/music-assistant/server:2.11.0.dev2026091603
 FROM ${UPSTREAM}
