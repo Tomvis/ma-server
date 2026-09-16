@@ -240,6 +240,15 @@ class DatabaseConnection:
             0, int(default_mmap_bytes if mmap_size_bytes is None else mmap_size_bytes)
         )
         self._db = await aiosqlite.connect(self.db_path)
+        # Every row this connection returns is a sqlite3.Row, NOT a dict, even though the
+        # read helpers below all cast their result to Mapping[str, Any]. sqlite3.Row is not
+        # a Mapping: it has __getitem__, keys(), __len__ and iteration, and nothing else.
+        # Because that is a cast rather than a conversion, mypy cannot see the difference,
+        # so the three dict habits all fail only at runtime, on a user's install:
+        #   row.get("col")     -> AttributeError
+        #   row["absent"]      -> IndexError, NOT KeyError, so `except KeyError` never fires
+        #   "col" in row       -> searches the VALUES; use `"col" in row.keys()`
+        # Pinned by test_every_read_helper_returns_a_row_that_is_not_a_dict.
         self._db.row_factory = aiosqlite.Row
         # setup some default settings for more performance
         await self.execute("PRAGMA analysis_limit=10000;")

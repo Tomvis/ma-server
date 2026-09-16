@@ -6,7 +6,7 @@ import os
 import pathlib
 import time
 from collections.abc import AsyncGenerator
-from sqlite3 import OperationalError
+from sqlite3 import OperationalError, Row
 from typing import Any
 
 import pytest
@@ -361,6 +361,70 @@ async def test_upsert_many_empty_is_noop(db_with_table: DatabaseConnection) -> N
     commits = _count_commits(db_with_table)
     await db_with_table.upsert_many("items", [])
     assert len(commits) == 0
+
+
+async def test_every_read_helper_returns_a_row_that_is_not_a_dict(
+    db_with_table: DatabaseConnection,
+) -> None:
+    """
+    Test that the read helpers hand back sqlite3.Row, whatever they annotate.
+
+    setup() sets row_factory = aiosqlite.Row, and every read helper then casts the
+    result to Mapping[str, Any]. sqlite3.Row is not a Mapping -- it implements only
+    __getitem__, keys(), __len__ and iteration -- so that cast is a promise the rows
+    do not keep, and because it is a cast, mypy cannot see it being broken. Calling
+    .get() on one raises AttributeError at runtime, which is how the listen-later
+    attribution died on a live install. Pinned for every entry point, because the
+    next caller will reach for whichever one is nearest.
+    """
+    await db_with_table.insert("items", {"name": "a", "url": "http://a", "plays": 1})
+    rows_from_query = await db_with_table.get_rows_from_query("SELECT * FROM items")
+    streamed = [row async for row in db_with_table.iter_rows_from_query("SELECT * FROM items")]
+    single = await db_with_table.get_row("items", {"name": "a"})
+    assert single is not None
+    # widened to object deliberately. The declared Mapping is the thing on trial, and
+    # mypy believes it -- left at their declared type it calls the isinstance below
+    # impossible and everything after it unreachable, which is the bug in miniature.
+    every_row: tuple[object, ...] = (
+        single,
+        *await db_with_table.get_rows("items"),
+        *rows_from_query,
+        *streamed,
+        *await db_with_table.search("items", "a"),
+    )
+    assert len(every_row) == 5
+    for row in every_row:
+        assert not isinstance(row, dict)
+        assert isinstance(row, Row)
+        assert not hasattr(row, "get")
+
+
+async def test_a_column_the_query_did_not_select_raises_indexerror(
+    db_with_table: DatabaseConnection,
+) -> None:
+    """
+    Test that asking a row for an absent column raises IndexError, not KeyError.
+
+    The dict-shaped guess is `except KeyError`, and it never fires: sqlite3.Row
+    raises IndexError for an unknown column name, so a guard written that way lets
+    the error through while reading as though it handles it. `in row.keys()` is the
+    form that actually answers the question -- and `in row` is not, because Row
+    iterates its values, so it answers about the data rather than the schema.
+    """
+    await db_with_table.insert("items", {"name": "a", "plays": 1})
+    rows = await db_with_table.get_rows_from_query("SELECT name FROM items")
+    row = rows[0]
+    with pytest.raises(IndexError):
+        row["plays"]
+    # SIM118 wants these two written as `in row`, which is the whole point: on a Row
+    # that is a different question with a different answer, as the next two asserts show.
+    assert "plays" not in row.keys()  # noqa: SIM118
+    assert "name" in row.keys()  # noqa: SIM118
+    # membership on the row itself tests the values, which is why it must not be used
+    # to test for a column: the column that IS selected reads as absent, and its value
+    # reads as present.
+    assert "name" not in row
+    assert "a" in row
 
 
 def test_query_params_expands_list_values() -> None:
