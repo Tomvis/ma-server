@@ -15,6 +15,7 @@ from music_assistant.constants import (
     DB_TABLE_AUDIO_ANALYSIS,
     DB_TABLE_EXTERNAL_ID_LOOKUP,
     DB_TABLE_PLAYLOG,
+    DB_TABLE_PROVIDER_MAPPINGS,
     DB_TABLE_SETTINGS,
 )
 from music_assistant.controllers.music import MusicController
@@ -753,6 +754,73 @@ async def test_migration_adds_access_column_to_a_fork_database_stamped_59(
         )
 
     assert "access" in await _table_columns(database, "playlists")
+
+
+async def test_migration_drops_none_provider_mappings(database: DatabaseConnection) -> None:
+    """A pre-60 database drops the bogus "None" self-mappings and keeps the real ones."""
+    await database.execute(
+        f"CREATE TABLE {DB_TABLE_PROVIDER_MAPPINGS}([media_type] TEXT, [item_id] INTEGER, "
+        "[provider_domain] TEXT, [provider_instance] TEXT, [provider_item_id] TEXT)"
+    )
+    await database.execute(
+        f"INSERT INTO {DB_TABLE_PROVIDER_MAPPINGS} "
+        "(media_type, item_id, provider_domain, provider_instance, provider_item_id) VALUES "
+        "('artist', 1, 'qobuz', 'qobuz--1', 'q1'), "
+        "('artist', 1, 'None', 'None', '1'), "
+        "('artist', 2, 'None', 'None', '2')"
+    )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    # a second pass must be a harmless no-op
+    for _ in range(2):
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=59,
+            create_tables=AsyncMock(),
+        )
+
+    rows = await database.get_rows_from_query(
+        f"SELECT item_id, provider_domain, provider_instance FROM {DB_TABLE_PROVIDER_MAPPINGS}"
+    )
+    assert [(r["provider_domain"], r["provider_instance"]) for r in rows] == [("qobuz", "qobuz--1")]
+
+
+async def test_migration_drops_none_provider_mappings_from_a_fork_database_stamped_61(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 61 by this branch still drops the bogus "None" self-mappings.
+
+    Upstream gates that cleanup at "prev_version <= 59", but this branch was already
+    stamped 61 by the time it landed, so upstream's gate can never fire for a fork
+    database and the bogus mappings would survive forever. The catch-up step is widened
+    to "<= 61" (and DB_SCHEMA_VERSION moved to 62) so every fork database runs it once.
+    Revert that gate to <= 59 and this test fails.
+    """
+    await database.execute(
+        f"CREATE TABLE {DB_TABLE_PROVIDER_MAPPINGS}([media_type] TEXT, [item_id] INTEGER, "
+        "[provider_domain] TEXT, [provider_instance] TEXT, [provider_item_id] TEXT)"
+    )
+    await database.execute(
+        f"INSERT INTO {DB_TABLE_PROVIDER_MAPPINGS} "
+        "(media_type, item_id, provider_domain, provider_instance, provider_item_id) VALUES "
+        "('artist', 1, 'qobuz', 'qobuz--1', 'q1'), "
+        "('artist', 1, 'None', 'None', '1')"
+    )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    await migrate_database(mass, database, MagicMock(), prev_version=61, create_tables=AsyncMock())
+
+    rows = await database.get_rows_from_query(
+        f"SELECT provider_domain, provider_instance FROM {DB_TABLE_PROVIDER_MAPPINGS}"
+    )
+    assert [(r["provider_domain"], r["provider_instance"]) for r in rows] == [("qobuz", "qobuz--1")]
 
 
 async def test_migration_adds_listen_later_columns_to_a_stock_database_stamped_59(

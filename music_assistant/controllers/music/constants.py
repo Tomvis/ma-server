@@ -23,7 +23,13 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # records only *that* an album was saved and never *who* saved it, so any attribution
 # would be a guess. The retired columns are kept as the record of what was on the
 # household shelf -- see the <= 60 step in migrations.py for how to read one back.
-DB_SCHEMA_VERSION: Final[int] = 61
+#
+# 62: upstream took 60 for its own step (dropping the bogus "None" provider mappings)
+# and gated it at "prev_version <= 59". This branch was already stamped 61, so that
+# gate can never fire for a fork database and the bogus mappings would survive
+# forever. The catch-up step in migrations.py is therefore widened to "<= 61" and the
+# version moved to 62 so every fork database is re-migrated exactly once.
+DB_SCHEMA_VERSION: Final[int] = 62
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60

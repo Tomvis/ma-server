@@ -1167,6 +1167,28 @@ async def migrate_database(  # noqa: PLR0915
             f"SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS} "
             "WHERE media_type = 'album' AND in_library = 1)"
         )
+    if prev_version <= 61:
+        # Upstream gates this at "prev_version <= 59", but this branch was already
+        # stamped 61 by then, so upstream's gate can never fire for a fork database and
+        # the bogus mappings below would survive forever. Widened to <= 61 (and
+        # DB_SCHEMA_VERSION moved to 62) so every fork database runs it exactly once.
+        # The DELETE is idempotent, so a stock database that already took upstream's
+        # step simply deletes nothing.
+        # a library item mapping has no provider of its own, but was briefly stored as a
+        # self-referential mapping with the literal string "None" as domain and instance.
+        # Such a mapping never resolves and makes the item page query a provider that does
+        # not exist, so drop it.
+        provider_mappings_table_exists = await database.get_rows_from_query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :table_name",
+            {"table_name": DB_TABLE_PROVIDER_MAPPINGS},
+            limit=1,
+        )
+        if provider_mappings_table_exists:
+            await database.execute(
+                f"DELETE FROM {DB_TABLE_PROVIDER_MAPPINGS} "
+                "WHERE provider_domain = 'None' OR provider_instance = 'None'"
+            )
+
     # NOTE: this genre restore runs after the <= 50 step on purpose: it inserts genres
     # with the current code/schema, so the external_ids column must be gone first.
     if prev_version <= 47:
