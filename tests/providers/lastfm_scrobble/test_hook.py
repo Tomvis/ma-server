@@ -123,3 +123,11 @@ async def test_a_transient_error_keeps_scrobbling(status: str | int) -> None:
     assert network.update_now_playing.call_count == 2
     assert provider._handler is not None
     unload_with_error.assert_not_called()
+
+
+async def test_the_handler_can_resolve_library_items() -> None:
+    """The handler gets the server, so a provider exclusion can unwrap a library item."""
+    provider = await _authenticated_provider(_network())
+
+    assert provider._handler is not None
+    assert provider._handler.mass is provider.mass

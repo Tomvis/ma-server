@@ -95,6 +95,8 @@
   "common.config_entries.enable_icy_metadata.options.basic": "Profile 1 - basic info",
   "common.config_entries.enable_icy_metadata.options.disabled": "Disabled - do not send ICY metadata",
   "common.config_entries.enable_icy_metadata.options.full": "Profile 2 - full info (including image)",
+  "common.config_entries.exclude_providers.description": "Leave plays from the selected music sources to another scrobbler. Use this when a source already reports your plays elsewhere, to avoid scrobbling them twice. Leave empty to scrobble from all sources.",
+  "common.config_entries.exclude_providers.label": "Never scrobble from these music sources",
   "common.config_entries.expose_player_to_ha.description": "Expose this player to the Home Assistant integration. \nIf disabled, this player will not be imported into Home Assistant.",
   "common.config_entries.expose_player_to_ha.label": "Expose this player to Home Assistant",
   "common.config_entries.flow_mode.description": "Enable \"flow\" mode where all queue tracks are sent as a continuous audio stream.\nUse for players that do not natively support gapless and/or crossfading or if the player has trouble transitioning between tracks.",

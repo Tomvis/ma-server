@@ -11,9 +11,10 @@ from music_assistant_models.config_entries import (
     ConfigValueOption,
     ConfigValueType,
 )
-from music_assistant_models.enums import ConfigEntryType, MediaType
+from music_assistant_models.enums import ConfigEntryType, MediaType, ProviderType
 
 from music_assistant.helpers.config_entries import PLAYBACK_TARGET_TYPES
+from music_assistant.helpers.uri import parse_uri
 
 if TYPE_CHECKING:
     from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
@@ -26,12 +27,13 @@ class ScrobblerHelper:
     Base class to aid scrobbling media items.
 
     A plugin declaring ProviderFeature.SCROBBLE forwards its ``on_media_item_played`` hook
-    to this helper, which applies the configured user and player filters.
+    to this helper, which applies the configured user, player and music source filters.
     """
 
     logger: logging.Logger
     config: ScrobblerConfig
     supported_media_types: frozenset[MediaType] | None
+    mass: MusicAssistant | None = None
     currently_playing: str | None = None
     last_scrobbled: str | None = None
     # Exceptions the concrete scrobble client raises when a submission can't reach
@@ -45,11 +47,13 @@ class ScrobblerHelper:
         logger: logging.Logger,
         config: ScrobblerConfig | None = None,
         supported_media_types: frozenset[MediaType] | None = None,
+        mass: MusicAssistant | None = None,
     ) -> None:
         """Initialize."""
         self.logger = logger
         self.config = config or ScrobblerConfig(suffix_version=False)
         self.supported_media_types = supported_media_types
+        self.mass = mass
 
     def get_name(self, report: MediaItemPlaybackProgressReport) -> str:
         """Get the track name to use for scrobbling, possibly appended with version info."""
@@ -96,6 +100,11 @@ class ScrobblerHelper:
             )
             return
 
+        # handle optional provider exclusions, for items another scrobbler already reports
+        if await self._is_excluded_source(report):
+            self.logger.debug("skipped scrobbling %s due to provider filter", report.uri)
+            return
+
         # poor mans attempt to detect a song on loop
         if not report.fully_played and report.uri == self.last_scrobbled:
             self.logger.debug(
@@ -129,6 +138,33 @@ class ScrobblerHelper:
         if self.should_scrobble(report):
             await scrobble()
 
+    async def _is_excluded_source(self, report: MediaItemPlaybackProgressReport) -> bool:
+        """
+        Return whether the played item comes from a provider this scrobbler must not report.
+
+        Used to hand a source over to another scrobbler wholesale - e.g. letting the
+        Subsonic scrobbler report library items to the media server (which forwards them
+        on) while this scrobbler only covers the providers that server never sees.
+        """
+        if not self.config.exclude_providers:
+            return False
+        media_type, provider_instance_id_or_domain, item_id = await parse_uri(report.uri)
+        if provider_instance_id_or_domain != "library":
+            return provider_instance_id_or_domain in self.config.exclude_providers
+        if self.mass is None:
+            # no server to unwrap the library item with, so we cannot tell - report it
+            return False
+        library_item = await self.mass.music.get_library_item_by_prov_id(
+            media_type, item_id, provider_instance_id_or_domain
+        )
+        if library_item is None:
+            return False
+        return any(
+            mapping.provider_instance in self.config.exclude_providers
+            or mapping.provider_domain in self.config.exclude_providers
+            for mapping in library_item.provider_mappings
+        )
+
     def _is_configured(self) -> bool:
         """Override if subclass needs specific configuration."""
         return True
@@ -143,6 +179,7 @@ class ScrobblerHelper:
 CONF_VERSION_SUFFIX = "suffix_version"
 CONF_SCROBBLE_USERS = "scrobble_users"
 CONF_SCROBBLE_PLAYERS = "scrobble_players"
+CONF_EXCLUDE_PROVIDERS = "exclude_providers"
 
 
 class ScrobblerConfig:
@@ -153,11 +190,13 @@ class ScrobblerConfig:
         suffix_version: bool,
         mass_userids: list[str] | None = None,
         mass_playerids: list[str] | None = None,
+        exclude_providers: list[str] | None = None,
     ) -> None:
         """Initialize."""
         self.suffix_version = suffix_version
         self.mass_userids = mass_userids or []
         self.mass_playerids = mass_playerids or []
+        self.exclude_providers = exclude_providers or []
 
     @staticmethod
     async def get_shared_config_entries(
@@ -175,6 +214,7 @@ class ScrobblerConfig:
             # User and player filter options for scrobbling providers
             await create_scrobble_users_config_entry(mass),
             create_scrobble_players_config_entry(mass),
+            create_exclude_providers_config_entry(mass),
         ]
 
     @staticmethod
@@ -184,6 +224,7 @@ class ScrobblerConfig:
             suffix_version=bool(config.get_value(CONF_VERSION_SUFFIX, True)),
             mass_userids=cast("list[str]", config.get_value(CONF_SCROBBLE_USERS, [])),
             mass_playerids=cast("list[str]", config.get_value(CONF_SCROBBLE_PLAYERS, [])),
+            exclude_providers=cast("list[str]", config.get_value(CONF_EXCLUDE_PROVIDERS, [])),
         )
 
 
@@ -222,6 +263,25 @@ def create_scrobble_players_config_entry(mass: MusicAssistant) -> ConfigEntry:
         type=ConfigEntryType.STRING,
         required=False,
         options=player_options,
+        multi_value=True,
+        default_value=[],
+    )
+
+
+def create_exclude_providers_config_entry(mass: MusicAssistant) -> ConfigEntry:
+    """Create a reusable configentry to hand certain music sources to another scrobbler."""
+    provider_options = [
+        ConfigValueOption(prov.instance_id, title=prov.name)
+        for prov in sorted(
+            (prov for prov in mass.providers if prov.type == ProviderType.MUSIC),
+            key=lambda prov: prov.name.lower(),
+        )
+    ]
+    return ConfigEntry(
+        key=CONF_EXCLUDE_PROVIDERS,
+        type=ConfigEntryType.STRING,
+        required=False,
+        options=provider_options,
         multi_value=True,
         default_value=[],
     )

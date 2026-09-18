@@ -154,7 +154,7 @@ class LastFMScrobbleProvider(PluginProvider):
 
         # built once the provider is registered, so the handler logs under the instance's
         # own logger rather than the domain-wide one
-        self._handler = LastFMEventHandler(self._network, self.logger, self.config)
+        self._handler = LastFMEventHandler(self.mass, self._network, self.logger, self.config)
 
     async def on_media_item_played(self, report: MediaItemPlaybackProgressReport) -> None:
         """Forward a playback progress report to Last.fm once the account is authenticated."""
@@ -190,7 +190,11 @@ class LastFMEventHandler(ScrobblerHelper):
     scrobble_exceptions: ClassVar[tuple[type[Exception], ...]] = (pylast.PyLastError,)
 
     def __init__(
-        self, network: pylast._Network, logger: logging.Logger, config: ProviderConfig
+        self,
+        mass: MusicAssistant,
+        network: pylast._Network,
+        logger: logging.Logger,
+        config: ProviderConfig,
     ) -> None:
         """Initialize."""
         super().__init__(
@@ -198,6 +202,7 @@ class LastFMEventHandler(ScrobblerHelper):
             ScrobblerConfig.create_from_config(config),
             SUPPORTED_SCROBBLE_MEDIA_TYPES,
         )
+        self.mass = mass
         self._network = network
 
     async def _update_now_playing(self, report: MediaItemPlaybackProgressReport) -> None:

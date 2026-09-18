@@ -4,14 +4,18 @@ import logging
 from unittest import mock
 
 import pytest
-from music_assistant_models.enums import MediaType, PlayerType
+from music_assistant_models.enums import MediaType, PlayerType, ProviderType
+from music_assistant_models.media_items import ProviderMapping, Track
 from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
 
 from music_assistant.helpers.scrobbler import (
     ScrobblerConfig,
     ScrobblerHelper,
+    create_exclude_providers_config_entry,
     create_scrobble_players_config_entry,
 )
+
+SUBSONIC_INSTANCE = "opensubsonic--rwee2Lat"
 
 
 class DummyHandler(ScrobblerHelper):
@@ -25,9 +29,10 @@ class DummyHandler(ScrobblerHelper):
         logger: logging.Logger,
         config: ScrobblerConfig | None = None,
         supported_media_types: frozenset[MediaType] | None = None,
+        mass: mock.Mock | None = None,
     ) -> None:
         """Initialize."""
-        super().__init__(logger, config, supported_media_types)
+        super().__init__(logger, config, supported_media_types, mass)
 
     def _is_configured(self) -> bool:
         return True
@@ -257,6 +262,124 @@ def test_it_only_offers_playback_capable_scrobble_players() -> None:
 
     assert entry.options is not None
     assert [option.value for option in entry.options] == ["kitchen", "living-room"]
+
+
+async def test_it_skips_items_played_from_an_excluded_provider() -> None:
+    """An item another scrobbler already reports must not be scrobbled a second time."""
+    handler = DummyHandler(
+        logging.getLogger(),
+        ScrobblerConfig(suffix_version=False, exclude_providers=[SUBSONIC_INSTANCE]),
+    )
+
+    await handler.on_media_item_played(
+        create_report(duration=180, seconds_played=176, uri=f"{SUBSONIC_INSTANCE}://track/42")
+    )
+
+    assert handler._now_playing == 0
+    assert handler._tracked == 0
+
+
+async def test_it_scrobbles_items_played_from_a_provider_that_is_not_excluded() -> None:
+    """Excluding one provider must not stop the providers it does not cover."""
+    handler = DummyHandler(
+        logging.getLogger(),
+        ScrobblerConfig(suffix_version=False, exclude_providers=[SUBSONIC_INSTANCE]),
+    )
+
+    await handler.on_media_item_played(
+        create_report(duration=180, seconds_played=176, uri="tidal://track/9")
+    )
+
+    assert handler._now_playing == 1
+    assert handler._tracked == 1
+
+
+async def test_it_skips_library_items_that_map_to_an_excluded_provider() -> None:
+    """A library item is unwrapped, so the exclusion follows its provider mappings."""
+    handler = DummyHandler(
+        logging.getLogger(),
+        ScrobblerConfig(suffix_version=False, exclude_providers=[SUBSONIC_INSTANCE]),
+        mass=_mass_with_track_mapped_to(SUBSONIC_INSTANCE, "opensubsonic"),
+    )
+
+    await handler.on_media_item_played(
+        create_report(duration=180, seconds_played=176, uri="library://track/1")
+    )
+
+    assert handler._now_playing == 0
+    assert handler._tracked == 0
+
+
+async def test_it_scrobbles_library_items_without_a_mapping_to_an_excluded_provider() -> None:
+    """A library item only the excluded provider lacks is still ours to scrobble."""
+    handler = DummyHandler(
+        logging.getLogger(),
+        ScrobblerConfig(suffix_version=False, exclude_providers=[SUBSONIC_INSTANCE]),
+        mass=_mass_with_track_mapped_to("tidal--xyz", "tidal"),
+    )
+
+    await handler.on_media_item_played(
+        create_report(duration=180, seconds_played=176, uri="library://track/1")
+    )
+
+    assert handler._now_playing == 1
+    assert handler._tracked == 1
+
+
+async def test_it_scrobbles_everything_when_no_provider_is_excluded() -> None:
+    """Without exclusions configured, no library lookup is needed at all."""
+    mass = _mass_with_track_mapped_to(SUBSONIC_INSTANCE, "opensubsonic")
+    handler = DummyHandler(logging.getLogger(), ScrobblerConfig(suffix_version=False), mass=mass)
+
+    await handler.on_media_item_played(
+        create_report(duration=180, seconds_played=176, uri="library://track/1")
+    )
+
+    assert handler._tracked == 1
+    mass.music.get_library_item_by_prov_id.assert_not_awaited()
+
+
+def test_it_only_offers_music_providers_to_exclude() -> None:
+    """The exclude-providers picker lists music sources, not players or metadata providers."""
+    mass = mock.Mock()
+    mass.providers = [
+        _provider("tidal--abc", "Tidal", ProviderType.MUSIC),
+        _provider("chromecast", "Chromecast", ProviderType.PLAYER),
+        _provider(SUBSONIC_INSTANCE, "Navidrome", ProviderType.MUSIC),
+    ]
+
+    entry = create_exclude_providers_config_entry(mass)
+
+    assert entry.options is not None
+    assert [option.value for option in entry.options] == [SUBSONIC_INSTANCE, "tidal--abc"]
+
+
+def _provider(instance_id: str, name: str, provider_type: ProviderType) -> mock.Mock:
+    """Return a minimal provider instance for config-entry option generation."""
+    provider = mock.Mock()
+    provider.instance_id = instance_id
+    provider.name = name
+    provider.type = provider_type
+    return provider
+
+
+def _mass_with_track_mapped_to(provider_instance: str, provider_domain: str) -> mock.Mock:
+    """Return a server whose library holds one track mapped to the given provider."""
+    track = Track(
+        item_id="1",
+        provider="library",
+        name="Track",
+        provider_mappings={
+            ProviderMapping(
+                item_id="42",
+                provider_domain=provider_domain,
+                provider_instance=provider_instance,
+            )
+        },
+    )
+    mass = mock.Mock()
+    mass.music.get_library_item_by_prov_id = mock.AsyncMock(return_value=track)
+    return mass
 
 
 def _player(

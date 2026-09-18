@@ -28,6 +28,10 @@
       "label": "Scrobble for players",
       "description": "Only register scrobbles for the selected players. Leave empty to scrobble for all players."
     },
+    "exclude_providers": {
+      "label": "Never scrobble from these music sources",
+      "description": "Leave plays from the selected music sources to another scrobbler. Use this when a source already reports your plays elsewhere, to avoid scrobbling them twice. Leave empty to scrobble from all sources."
+    },
     "announce_volume": {
       "label": "Volume for Announcements",
       "description": "The percentual, relative or absolute volume level, used with the strategy for announcements."
