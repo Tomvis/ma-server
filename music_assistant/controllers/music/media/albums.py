@@ -1281,27 +1281,38 @@ class AlbumsController(MediaControllerBase[Album]):
                 continue
             # TODO: filter by artists in db for non-streaming providers
             search_query = streaming_search_query if provider.is_streaming_provider else album.name
-            result.extend(
-                prov_item
-                for prov_item in await self.search(search_query, provider_id)
-                if loose_compare_strings(album.name, prov_item.name)
-                and compare_artists(prov_item.artists, album.artists, any_match=True)
-                # make sure that the 'base' version is NOT included
-                and not album.provider_mappings.intersection(prov_item.provider_mappings)
-            )
-            if ProviderFeature.ALBUM_VERSIONS in provider.supported_features:
-                # Call the specialized function in addition to searching to
-                # handle cases where the provider hasn't merged the album
-                # variants
-                if mapped_id := next(
-                    (
-                        p.item_id
-                        for p in album.provider_mappings
-                        if p.provider_instance == provider.instance_id
-                    ),
-                    None,
-                ):
-                    result.extend(await provider.get_album_versions(mapped_id))
+            # One failing provider must not break the whole lookup: the album page calls
+            # this on every visit, so an unisolated raise here takes the page down instead
+            # of just dropping that provider's versions. Providers reach third-party APIs
+            # with an open-ended failure surface (Bandcamp's search intermittently answers
+            # HTML, which surfaces as an aiohttp ContentTypeError), so this catches broadly
+            # and logs at warning: the result is degraded but still useful.
+            try:
+                result.extend(
+                    prov_item
+                    for prov_item in await self.search(search_query, provider_id)
+                    if loose_compare_strings(album.name, prov_item.name)
+                    and compare_artists(prov_item.artists, album.artists, any_match=True)
+                    # make sure that the 'base' version is NOT included
+                    and not album.provider_mappings.intersection(prov_item.provider_mappings)
+                )
+                if ProviderFeature.ALBUM_VERSIONS in provider.supported_features:
+                    # Call the specialized function in addition to searching to
+                    # handle cases where the provider hasn't merged the album
+                    # variants
+                    if mapped_id := next(
+                        (
+                            p.item_id
+                            for p in album.provider_mappings
+                            if p.provider_instance == provider.instance_id
+                        ),
+                        None,
+                    ):
+                        result.extend(await provider.get_album_versions(mapped_id))
+            except Exception:
+                self.logger.warning(
+                    "Failed to get album versions from provider %s", provider_id, exc_info=True
+                )
         return result
 
     async def get_library_album_tracks(
