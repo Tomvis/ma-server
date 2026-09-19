@@ -1066,7 +1066,7 @@ class AudioAnalysisController:
             return provider
         return None
 
-    async def _run_background_scan(self) -> None:  # noqa: PLR0915  # one linear scan pipeline; splitting it hurts the upstream merge
+    async def _run_background_scan(self) -> None:
         """Run the scan as decode-once-fan-out streaming over candidate tracks."""
         providers = self.providers
         if not providers:
@@ -1091,87 +1091,66 @@ class AudioAnalysisController:
 
         concurrency = self._get_scan_concurrency()
         provider_by_domain = {p.domain: p for p in providers}
-        # Bounded queue so we don't materialize one coroutine per candidate up
-        # front. A few-thousand-track scan otherwise holds thousands of pending
-        # tasks (and their closures) the whole time the semaphore is throttling.
-        work_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=concurrency * 4)
+        pending = iter(candidates)
 
         processed = 0
-        deferred = 0
+
+        async def _run_one(candidate: dict[str, Any]) -> None:
+            nonlocal processed
+            item_id = candidate["item_id"]
+            provider_instance = candidate["provider_instance"]
+            missing = candidate["missing_domains"]
+
+            music_prov = self.mass.get_provider(provider_instance, provider_type=MusicProvider)
+            if music_prov is None or not music_prov.available:
+                self.logger.debug(
+                    "Skipping %s: music provider %s unavailable", item_id, provider_instance
+                )
+                return
+
+            try:
+                streamdetails = await music_prov.get_stream_details(item_id, MediaType.TRACK)
+            except Exception as err:
+                # Provider method with an open-ended failure surface; any failure
+                # just skips this scan candidate.
+                self.logger.debug("Skipping %s: stream details failed: %s", item_id, err)
+                return
+
+            if streamdetails.stream_type != StreamType.LOCAL_FILE:
+                return
+            if not isinstance(streamdetails.path, str) or not streamdetails.path:
+                return
+
+            providers_for_track = [
+                p
+                for p in (provider_by_domain.get(d) for d in missing)
+                if p is not None and p.available
+            ]
+            if not providers_for_track:
+                return
+
+            await self._run_background_streaming_for_track(
+                streamdetails,
+                providers_for_track,
+            )
+            processed += 1
 
         async def _worker() -> None:
-            nonlocal processed, deferred
-            while True:
-                candidate = await work_queue.get()
+            while time.monotonic() < run_deadline:
+                candidate = next(pending, None)
+                if candidate is None:
+                    return
                 try:
-                    if time.monotonic() >= run_deadline:
-                        deferred += 1
-                        continue
-
-                    item_id = candidate["item_id"]
-                    provider_instance = candidate["provider_instance"]
-                    missing = candidate["missing_domains"]
-
-                    music_prov = self.mass.get_provider(
-                        provider_instance, provider_type=MusicProvider
-                    )
-                    if music_prov is None or not music_prov.available:
-                        self.logger.debug(
-                            "Skipping %s: music provider %s unavailable",
-                            item_id,
-                            provider_instance,
-                        )
-                        continue
-
-                    try:
-                        streamdetails = await music_prov.get_stream_details(
-                            item_id, MediaType.TRACK
-                        )
-                    except Exception as err:
-                        self.logger.debug("Skipping %s: stream details failed: %s", item_id, err)
-                        continue
-
-                    if streamdetails.stream_type != StreamType.LOCAL_FILE:
-                        continue
-                    if not isinstance(streamdetails.path, str) or not streamdetails.path:
-                        continue
-
-                    providers_for_track = [
-                        p
-                        for p in (provider_by_domain.get(d) for d in missing)
-                        if p is not None and p.available
-                    ]
-                    if not providers_for_track:
-                        continue
-
-                    # 2.9.9 removed the min_interval/max_interval parameters; background
-                    # pacing and the hang guard are now the module-level constants.
-                    await self._run_background_streaming_for_track(
-                        streamdetails,
-                        providers_for_track,
-                    )
-                    processed += 1
+                    await _run_one(candidate)
                 except Exception as err:
-                    # A worker that dies stops draining the queue for the rest of the
-                    # run; with a bounded queue the producer's put() would then block
-                    # forever and the whole scan task hangs. Log and keep looping.
+                    # gather() would propagate the first worker error out of the scan
+                    # while its siblings keep running orphaned. Log and keep pulling.
                     self.logger.warning("Background analysis worker error: %s", err)
-                finally:
-                    work_queue.task_done()
 
-        workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
-        try:
-            for idx, candidate in enumerate(candidates):
-                if time.monotonic() >= run_deadline:
-                    # Remaining candidates are deferred — count them and stop feeding.
-                    deferred += len(candidates) - idx
-                    break
-                await work_queue.put(candidate)
-            await work_queue.join()
-        finally:
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*(_worker() for _ in range(concurrency)))
+
+        # Whatever the workers never pulled is what the run budget cut short.
+        deferred = sum(1 for _ in pending)
 
         elapsed = time.monotonic() - scan_started
         if deferred:
