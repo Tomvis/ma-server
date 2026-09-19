@@ -1196,22 +1196,9 @@ class AlbumsController(MediaControllerBase[Album]):
                 and provider_mapping.provider_instance not in allowed_providers
             ):
                 continue
-            try:
-                provider_tracks = await self._get_provider_album_tracks(
-                    provider_mapping.item_id, provider_mapping.provider_instance
-                )
-            except MusicAssistantError as err:
-                # a mapping outlives what it points at: a subsonic server reissues its
-                # ids on a rescan, a streaming release is delisted. losing that one
-                # provider's listing is the whole cost -- raising here instead fails
-                # the album outright, including the tracks held in the library.
-                self.logger.debug(
-                    "album %s: skipping album tracks from %s: %s",
-                    library_album.name,
-                    provider_mapping.provider_instance,
-                    err,
-                )
-                continue
+            provider_tracks = await self._album_tracks_from_provider(
+                library_album, provider_mapping
+            )
             for provider_track in provider_tracks:
                 # In some cases (looking at you YTM) the disc/track number is not obtained from
                 # library_tracks. Ensure to update the disc/track number when interacting with
@@ -1556,6 +1543,46 @@ class AlbumsController(MediaControllerBase[Album]):
         if prov := self.mass.get_provider(provider_instance_id_or_domain):
             prov = cast("MusicProvider", prov)
             return await prov.get_album_tracks(item_id)
+        return []
+
+    async def _album_tracks_from_provider(
+        self, library_album: Album, provider_mapping: ProviderMapping
+    ) -> list[Track]:
+        """
+        Return one provider's listing for a library album, empty if that provider failed.
+
+        :param library_album: The library album being listed, used for logging.
+        :param provider_mapping: The album's mapping on the provider to fetch from.
+        """
+        try:
+            return await self._get_provider_album_tracks(
+                provider_mapping.item_id, provider_mapping.provider_instance
+            )
+        except MusicAssistantError as err:
+            # a mapping outlives what it points at: a subsonic server reissues its
+            # ids on a rescan, a streaming release is delisted. losing that one
+            # provider's listing is the whole cost -- raising here instead fails
+            # the album outright, including the tracks held in the library.
+            self.logger.debug(
+                "album %s: skipping album tracks from %s: %s",
+                library_album.name,
+                provider_mapping.provider_instance,
+                err,
+            )
+        except Exception:
+            # same cost, but the provider did not wrap its failure. A provider talking to
+            # a third-party API can leak a raw client error -- Bandcamp answers HTML
+            # instead of JSON and aiohttp raises ContentTypeError, which is no
+            # MusicAssistantError and so sailed straight past the arm above, emptying the
+            # whole album for someone whose copy is sitting right there in the library.
+            # Louder than the expected case: an unwrapped error is a bug in that provider
+            # (or here), not ordinary staleness.
+            self.logger.warning(
+                "album %s: skipping album tracks from %s (unwrapped provider error)",
+                library_album.name,
+                provider_mapping.provider_instance,
+                exc_info=True,
+            )
         return []
 
     def _library_match_names(self, item: Album | ItemMapping) -> list[str]:
