@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
 from typing import Final
 
@@ -90,7 +91,11 @@ class PacingProfile(StrEnum):
 
 _PACING: Final[dict[PacingProfile, tuple[str, str]]] = {
     PacingProfile.DEFAULT: ("1.1", "60"),
-    PacingProfile.NEAR_REALTIME: ("1.03", "3"),
+    # EXPERIMENT: tunable through the environment while measuring Sonos boundaries
+    PacingProfile.NEAR_REALTIME: (
+        os.environ.get("MASS_REALTIME_READRATE", "1.03"),
+        os.environ.get("MASS_REALTIME_BURST", "3"),
+    ),
     PacingProfile.LOW_LATENCY: ("1.02", "0.5"),
 }
 

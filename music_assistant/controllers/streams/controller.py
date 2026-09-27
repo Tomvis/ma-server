@@ -994,6 +994,7 @@ class StreamsController(CoreController):
                     pacing = PacingProfile.NEAR_REALTIME
                 else:
                     pacing = PacingProfile.DEFAULT
+                self.logger.debug("Output pacing %s: %s", pacing.value, output_pacing_args(pacing))
                 audio_bytes = get_ffmpeg_stream(
                     audio_input=audio_input,
                     input_format=pcm_format,

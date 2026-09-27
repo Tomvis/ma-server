@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -54,6 +55,9 @@ CancelCallback = Callable[[], None]
 # Maximum seconds to wait for the first playable audio, on top of any time the producer
 # is allowed to spend waiting for a provider source-stream slot.
 BUFFER_READY_TIMEOUT: Final[int] = 15
+# EXPERIMENT: seconds of audio banked before the first item of a cold realtime
+# session is served, so a pull player starts with a lead (0 = off)
+COLD_REALTIME_BANK_S: Final[int] = int(os.environ.get("MASS_REALTIME_COLD_BANK_S", "0"))
 
 
 class AudioBufferEOF(Exception):
@@ -841,6 +845,11 @@ def _new_buffer(
         # here. Only dynamic normalization, which genuinely needs lookahead, raises
         # this.
         ready_threshold = 2 if dynamic_normalization else 1
+        if log_prefix.endswith("[prepare]") and ready_threshold < COLD_REALTIME_BANK_S:
+            # EXPERIMENT: only the session start banks a lead; a boundary preload must
+            # not, or it lengthens the hole between two items of a single-slot source
+            ready_threshold = COLD_REALTIME_BANK_S
+            LOGGER.debug("%s: EXPERIMENT cold realtime bank of %s s", log_prefix, ready_threshold)
     elif crossfade_enabled:
         ready_threshold = 8
     elif dynamic_normalization:
