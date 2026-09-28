@@ -389,3 +389,68 @@ async def test_add_album_refuses_a_user_without_a_mapping(mass_minimal: MusicAss
         pytest.raises(LidarrError, match="options page"),
     ):
         await provider.add_album("tidal://album/1")
+
+
+async def test_artist_mbid_by_name_prefers_an_artist_already_in_lidarr(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A Tidal album carries no MBIDs; an artist already in Lidarr resolves by name."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._client.list_artists = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            {"artistName": "Steven Wilson", "foreignArtistId": "sw-mbid"},
+            {"artistName": "Opeth", "foreignArtistId": "opeth-mbid"},
+        ]
+    )
+    provider._client.lookup_artist = AsyncMock(side_effect=AssertionError)  # type: ignore[method-assign]
+
+    assert await provider._artist_mbid_by_name("steven wilson") == "sw-mbid"
+
+
+async def test_artist_mbid_by_name_falls_back_to_a_unique_musicbrainz_match(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """Not in Lidarr: a single exact-name MusicBrainz artist is accepted."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._client.list_artists = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    provider._client.lookup_artist = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    mb = MagicMock()
+    mb._api_client.get_data = AsyncMock(
+        return_value={
+            "artists": [
+                {"id": "parius-mbid", "name": "Parius"},
+                {"id": "other", "name": "Parius Tribute Band"},
+            ]
+        }
+    )
+    with patch.object(mass_minimal, "get_provider", return_value=mb):
+        assert await provider._artist_mbid_by_name("Parius") == "parius-mbid"
+
+
+async def test_artist_mbid_by_name_refuses_an_ambiguous_name(mass_minimal: MusicAssistant) -> None:
+    """Two different artists sharing the exact name must not be guessed between."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._client.list_artists = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    provider._client.lookup_artist = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            {"artistName": "Nirvana", "foreignArtistId": "us"},
+            {"artistName": "Nirvana", "foreignArtistId": "uk"},
+        ]
+    )
+    mb = MagicMock()
+    mb._api_client.get_data = AsyncMock(
+        return_value={"artists": [{"id": "us", "name": "Nirvana"}, {"id": "uk", "name": "Nirvana"}]}
+    )
+    with patch.object(mass_minimal, "get_provider", return_value=mb):
+        assert await provider._artist_mbid_by_name("Nirvana") is None
+
+
+async def test_artist_mbid_by_name_survives_a_broken_lidarr_lookup(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """Lidarr's name lookup can 500 (a metadata-proxy plugin); that is a miss, not a crash."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._client.list_artists = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    provider._client.lookup_artist = AsyncMock(side_effect=LidarrError("500"))  # type: ignore[method-assign]
+    with patch.object(mass_minimal, "get_provider", return_value=None):
+        assert await provider._artist_mbid_by_name("Steven Wilson") is None

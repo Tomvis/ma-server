@@ -10,6 +10,7 @@ per user on the options page; the artist gets that root folder's default profile
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
@@ -21,6 +22,7 @@ from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.constants import CONF_PROVIDERS
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
+from music_assistant.helpers.compare import compare_strings
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lidarr.client import LidarrClient, LidarrError
 from music_assistant.providers.lidarr.constants import (
@@ -240,7 +242,7 @@ class LidarrProvider(PluginProvider):
 
         artist_mbid, release_group_mbid = await self._resolve_mbids(album)
         if not artist_mbid:
-            artist_mbid = await self._lookup_artist_via_lidarr(artist_name)
+            artist_mbid = await self._artist_mbid_by_name(artist_name)
         if not artist_mbid:
             raise LidarrError(
                 f"Couldn't determine a MusicBrainz artist ID for {artist_name!r}, which "
@@ -356,19 +358,56 @@ class LidarrProvider(PluginProvider):
                 )
         return None, release_group
 
-    async def _lookup_artist_via_lidarr(self, artist_name: str) -> str | None:
-        """Last-resort MBID via Lidarr's own lookup: an exact (casefolded) name match only."""
+    async def _artist_mbid_by_name(self, artist_name: str) -> str | None:
+        """
+        Resolve an artist MBID from the name alone, accepting only an unambiguous match.
+
+        Tried in order: artists already in Lidarr (the likely intent, and no lookup
+        needed), a MusicBrainz artist search, then Lidarr's own lookup -- which a
+        metadata-proxy plugin can break (Tubifarry's Discogs search 500s it here).
+        """
+        in_lidarr = {
+            str(a["foreignArtistId"])
+            for a in await self._client.list_artists()
+            if a.get("foreignArtistId")
+            and compare_strings(str(a.get("artistName", "")), artist_name, strict=True)
+        }
+        if len(in_lidarr) == 1:
+            return in_lidarr.pop()
+        if in_lidarr:
+            return None
+        if (mbid := await self._musicbrainz_artist_by_name(artist_name)) is not None:
+            return mbid
         try:
             candidates = await self._client.lookup_artist(artist_name)
         except Exception as err:
             self.logger.warning("Lidarr lookup-by-name failed for %r: %s", artist_name, err)
             return None
-        target = artist_name.casefold().strip()
-        for candidate in candidates:
-            mbid = candidate.get("foreignArtistId")
-            if mbid and str(candidate.get("artistName", "")).casefold().strip() == target:
-                return cast("str", mbid)
-        return None
+        found = {
+            str(c["foreignArtistId"])
+            for c in candidates
+            if c.get("foreignArtistId")
+            and compare_strings(str(c.get("artistName", "")), artist_name, strict=True)
+        }
+        return found.pop() if len(found) == 1 else None
+
+    async def _musicbrainz_artist_by_name(self, artist_name: str) -> str | None:
+        """Return the MBID of the single MusicBrainz artist named exactly ``artist_name``."""
+        mb_provider: Any = self.mass.get_provider("musicbrainz")
+        if mb_provider is None:
+            return None
+        escaped = re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r"\\\1", artist_name)
+        try:
+            result = await mb_provider._api_client.get_data("artist", query=f'artist:"{escaped}"')
+        except Exception as err:
+            self.logger.debug("MusicBrainz artist search failed for %r: %s", artist_name, err)
+            return None
+        found = {
+            str(a["id"])
+            for a in (result or {}).get("artists", [])
+            if a.get("id") and compare_strings(str(a.get("name", "")), artist_name, strict=True)
+        }
+        return found.pop() if len(found) == 1 else None
 
     def _host_port(self) -> str | None:
         """
