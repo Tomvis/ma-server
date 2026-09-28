@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ConfigEntryType, MediaType
 from music_assistant_models.errors import InvalidDataError
 
@@ -35,6 +36,7 @@ from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.lidarr.client import MusicRaterClient, MusicRaterError
 from music_assistant.providers.lidarr.constants import (
     CONF_ACTION_TEST,
+    CONF_API_KEY,
     CONF_URL,
     CONF_VERIFY_SSL,
 )
@@ -108,9 +110,15 @@ class LidarrProvider(PluginProvider):
         # missed setup_data entirely, so any instance added after the setup flow
         # started collecting the url there built a client from url=None and crashed
         # immediately on MusicRaterClient's `url.rstrip("/")`.
+        # CONF_API_KEY is read from setup_data ONLY: it is a SECURE_STRING, and both
+        # config.get_value (through the plain-STRING passthrough entry seeded before
+        # rehydrate) and get_setup_value's fallback to it would hand back ciphertext.
+        # update_config() mirrors an options-page edit into setup_data instead -- the
+        # same scheme as providers/digarr/__init__.py.
         self._client = MusicRaterClient(
             url=cast("str", self._config_or_setup_value(CONF_URL)),
             session=mass.http_session,
+            api_key=cast("str", self._setup_data_only(CONF_API_KEY, "") or ""),
             verify_ssl=bool(config.get_value(CONF_VERIFY_SSL, True)),
         )
 
@@ -173,6 +181,16 @@ class LidarrProvider(PluginProvider):
                 default_value=self._setup_data_only(CONF_URL),
             ),
             ConfigEntry(
+                key=CONF_API_KEY,
+                type=ConfigEntryType.SECURE_STRING,
+                # No default_value, ever: __post_serialize__ masks a SECURE_STRING's
+                # value but not its default, so a default would leak the plaintext key
+                # to every CONFIG_PROVIDERS_READ caller. Not required, for the same
+                # validate() reason as digarr's, and because an auth-less music-rater
+                # needs none.
+                required=False,
+            ),
+            ConfigEntry(
                 key=CONF_VERIFY_SSL,
                 type=ConfigEntryType.BOOLEAN,
                 required=False,
@@ -198,6 +216,26 @@ class LidarrProvider(PluginProvider):
                 description=self._test_error,
             ),
         )
+
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """
+        Mirror a genuine api_key edit into setup_data before the reload the base class schedules.
+
+        setup_data is the only place the client reads the key from (see ``__init__``).
+        A caller echoing ``SECURE_STRING_SUBSTITUTE`` back (the MCP config tool can) is
+        flagged as changed by ``Config.update`` but is not a rotation, so it is skipped.
+        Same known gap as digarr: this hook is not called when the instance is
+        unavailable at save time -- lidarr stays available even when music-rater is down
+        (``loaded_in_mass`` only logs a failed probe), so that branch is not reached here.
+
+        :param config: The freshly saved config (values not yet encrypted).
+        :param changed_keys: The dotted keys ("values/<key>") this save changed.
+        """
+        if f"values/{CONF_API_KEY}" in changed_keys:
+            new_key = config.values[CONF_API_KEY].value
+            if isinstance(new_key, str) and new_key and new_key != SECURE_STRING_SUBSTITUTE:
+                self._update_setup_data(CONF_API_KEY, new_key)
+        await super().update_config(config, changed_keys)
 
     async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...]:
         """Run the connectivity probe behind the 'Test connection' button."""

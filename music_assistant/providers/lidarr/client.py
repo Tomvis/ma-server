@@ -64,11 +64,16 @@ class MusicRaterClient:
         url: str,
         session: ClientSession,
         *,
+        api_key: str = "",
         verify_ssl: bool = True,
     ) -> None:
         """Build a client bound to one music-rater instance."""
         self._base = url.rstrip("/")
         self._headers = {"Accept": "application/json"}
+        # music-rater with OIDC on rejects anonymous calls; an mr_ key (MEMBER role or
+        # above, for POST .../lidarr/queue) authenticates without a browser session.
+        if api_key:
+            self._headers["Authorization"] = f"Bearer {api_key}"
         self._session = session
         self._verify_ssl = verify_ssl
 

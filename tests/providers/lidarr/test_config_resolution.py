@@ -11,16 +11,18 @@ the same objects `_update_provider_config` operates on -- against `mass_minimal`
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
+from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ProviderType
 from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.constants import CONF_PROVIDERS, DEFAULT_PROVIDER_CONFIG_ENTRIES
-from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
+from music_assistant.providers.lidarr.constants import CONF_API_KEY, CONF_URL, CONF_VERIFY_SSL
 from music_assistant.providers.lidarr.provider import LidarrProvider
 
 if TYPE_CHECKING:
@@ -250,3 +252,94 @@ async def test_loaded_in_mass_does_not_warn_without_a_conflicting_reconfigure(
     await provider.loaded_in_mass()
 
     provider.logger.warning.assert_not_called()
+
+
+async def test_api_key_from_setup_data_reaches_the_client(mass_minimal: MusicAssistant) -> None:
+    """A setup-collected api_key is sent as a bearer (music-rater requires auth since OIDC)."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://music-rater", CONF_API_KEY: "mr_abc_def"}
+    )
+
+    assert provider._client._headers["Authorization"] == "Bearer mr_abc_def"
+
+
+async def test_no_api_key_sends_no_authorization_header(mass_minimal: MusicAssistant) -> None:
+    """The deployed shape (url in values, no key yet) keeps loading and sends no header."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
+
+    provider.config.validate()  # must not raise
+    assert "Authorization" not in provider._client._headers
+
+
+async def test_api_key_never_appears_in_a_serialized_config_entry(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    CONF_API_KEY's serialized entry must never carry the decrypted key.
+
+    Same hazard as digarr: ``Config.__post_serialize__`` masks a SECURE_STRING's
+    ``value`` but not its ``default_value``, so any default derived from setup_data
+    would serve the plaintext key to every CONFIG_PROVIDERS_READ caller.
+    """
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://music-rater", CONF_API_KEY: "mr_secret_key"}
+    )
+
+    entries = {entry.key: entry for entry in await provider.get_config_entries()}
+    assert entries[CONF_API_KEY].default_value is None
+    assert entries[CONF_API_KEY].required is False
+    assert "mr_secret_key" not in json.dumps(provider.config.to_dict())
+
+
+async def test_api_key_options_edit_reaches_the_client_after_a_reload(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    An options-page api_key edit must reach the client in plaintext after a reload.
+
+    The deployed instance has its url in ``values`` and nothing in setup_data, so the
+    options page is how a key gets onto it; update_config mirrors it into setup_data.
+    """
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
+    changed_keys = await _resave(mass_minimal, provider, {CONF_API_KEY: "mr_new_key"})
+    assert f"values/{CONF_API_KEY}" in changed_keys
+
+    reloaded = await _reload_provider(mass_minimal)
+
+    assert reloaded._client._headers["Authorization"] == "Bearer mr_new_key"
+    assert reloaded._client._base == "http://music-rater"
+
+
+async def test_resubmitted_placeholder_is_not_treated_as_a_rotation(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A non-frontend caller echoing the masked placeholder must not clobber the key."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://music-rater", CONF_API_KEY: "mr_old_key"}
+    )
+    posted = {CONF_API_KEY: SECURE_STRING_SUBSTITUTE, CONF_VERIFY_SSL: False}
+    changed_keys = await _resave(mass_minimal, provider, posted)
+    assert f"values/{CONF_API_KEY}" in changed_keys
+
+    reloaded = await _reload_provider(mass_minimal)
+
+    assert reloaded._client._headers["Authorization"] == "Bearer mr_old_key"
+
+
+async def test_client_never_reads_the_key_through_options_values(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    Ciphertext in `values` must never become the bearer.
+
+    A key saved to `values` without reaching setup_data (e.g. the controller's
+    unavailable-branch gap) is encrypted there, and the pre-rehydrate passthrough entry
+    is a plain STRING, so reading it would send ciphertext. The client reads setup_data
+    only, and with nothing there sends no header at all.
+    """
+    stray_ciphertext = mass_minimal.config.encrypt_string("mr_should_not_be_used")
+    provider = await _load_provider(
+        mass_minimal, values={CONF_URL: "http://music-rater", CONF_API_KEY: stray_ciphertext}
+    )
+
+    assert "Authorization" not in provider._client._headers
