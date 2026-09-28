@@ -1,11 +1,9 @@
 """
-Lidarr Plugin Provider for Music Assistant (music-rater bridge).
+Lidarr Plugin Provider for Music Assistant.
 
-Adds an "Add to Lidarr" action exposed through the WebSocket API. The action
-hands the album off to music-rater (operator-run companion service), which
-owns the Lidarr sync logic. MA just provides the album's MA URI; music-rater
-resolves its own album record, sets lidarr_manual_add=True, and runs an
-inline single-album sync against its configured Lidarr.
+Adds an "Add to Lidarr" action exposed through the WebSocket API: the album's artist
+is added to Lidarr if missing (into the acting user's root folder), then only that
+album is monitored and searched.
 """
 
 from __future__ import annotations

@@ -3,9 +3,13 @@
   "domain": "lidarr",
   "stage": "experimental",
   "name": "Lidarr",
-  "description": "Hand streaming-provider albums to music-rater, which syncs them to Lidarr.",
-  "codeowners": ["@stereotom"],
-  "credits": ["[Lidarr](https://lidarr.audio/)"],
+  "description": "Send albums from any provider to Lidarr, into the acting user's root folder.",
+  "codeowners": [
+    "@stereotom"
+  ],
+  "credits": [
+    "[Lidarr](https://lidarr.audio/)"
+  ],
   "requirements": [],
   "documentation": "https://lidarr.audio/docs/api/",
   "multi_instance": false

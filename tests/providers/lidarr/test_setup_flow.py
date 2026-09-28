@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 from music_assistant_models.enums import FlowStepType
 
 from music_assistant.models.setup_flow import SetupFlowContext, SetupSession
-from music_assistant.providers.lidarr.constants import CONF_URL
+from music_assistant.providers.lidarr.constants import CONF_API_KEY, CONF_URL
 from music_assistant.providers.lidarr.setup_flow import run_setup
 
 
@@ -72,15 +72,15 @@ async def test_reconfigure_prefills_from_the_effective_value_not_setup_data_alon
     async def finish_handler(_session: SetupSession, _values: dict[str, Any]) -> dict[str, str]:
         return {"instance_id": "lidarr"}
 
-    session = _make_session(finish_handler, setup_data={}, values={CONF_URL: "http://music-rater"})
+    session = _make_session(finish_handler, setup_data={}, values={CONF_URL: "http://lidarr"})
     task = asyncio.create_task(run_setup(session))
     await _wait_for_form(session)
 
     assert session.current_step is not None
     entries = {entry.key: entry for entry in session.current_step.entries}
-    assert entries[CONF_URL].value == "http://music-rater"
+    assert entries[CONF_URL].value == "http://lidarr"
 
-    session.handle_submit({CONF_URL: "http://music-rater"})
+    session.handle_submit({CONF_URL: "http://lidarr", CONF_API_KEY: "k"})
     await _wait_for(lambda: session.finished)
     await task
 
@@ -103,6 +103,6 @@ async def test_reconfigure_prefers_the_options_value_over_a_conflicting_setup_va
     entries = {entry.key: entry for entry in session.current_step.entries}
     assert entries[CONF_URL].value == "http://fixed-with-port:4533"
 
-    session.handle_submit({CONF_URL: "http://fixed-with-port:4533"})
+    session.handle_submit({CONF_URL: "http://fixed-with-port:4533", CONF_API_KEY: "k"})
     await _wait_for(lambda: session.finished)
     await task

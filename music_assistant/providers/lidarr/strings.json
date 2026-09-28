@@ -1,11 +1,19 @@
 {
   "config_entries": {
     "intro": {
-      "label": "Connect Music Assistant to your music-rater instance. The 'Add to Lidarr' context-menu action will POST the album to music-rater, which owns the Lidarr sync."
+      "label": "Connect Music Assistant to Lidarr. 'Add to Lidarr' adds the album's artist (if missing) to the acting user's root folder with that folder's default profiles, then monitors and searches only that album."
     },
     "url": {
-      "label": "music-rater URL",
-      "description": "e.g. http://192.168.1.10:8000 or https://music-rater.example.com"
+      "label": "Lidarr URL",
+      "description": "e.g. http://192.168.1.10:8686 or https://lidarr.example.com"
+    },
+    "api_key": {
+      "label": "API key",
+      "description": "Lidarr > Settings > General > Security."
+    },
+    "root_folder_user": {
+      "label": "Root folder for {0}",
+      "description": "Where artists {0} adds to Lidarr are stored. Artists already in Lidarr stay where they are."
     },
     "verify_ssl": {
       "label": "Verify SSL"
@@ -15,10 +23,10 @@
       "action_label": "Test connection"
     },
     "test_ok_label": {
-      "label": "Connected to music-rater."
+      "label": "Connected to Lidarr."
     },
     "test_error_label": {
-      "label": "Couldn't reach music-rater."
+      "label": "Couldn't reach Lidarr."
     }
   }
 }

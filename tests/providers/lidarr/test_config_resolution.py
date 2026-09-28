@@ -11,16 +11,24 @@ the same objects `_update_provider_config` operates on -- against `mass_minimal`
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
+from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ProviderType
 from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.constants import CONF_PROVIDERS, DEFAULT_PROVIDER_CONFIG_ENTRIES
-from music_assistant.providers.lidarr.constants import CONF_URL, CONF_VERIFY_SSL
+from music_assistant.providers.lidarr.client import LidarrError
+from music_assistant.providers.lidarr.constants import (
+    CONF_API_KEY,
+    CONF_ROOT_FOLDER_PREFIX,
+    CONF_URL,
+    CONF_VERIFY_SSL,
+)
 from music_assistant.providers.lidarr.provider import LidarrProvider
 
 if TYPE_CHECKING:
@@ -121,25 +129,25 @@ async def test_url_survives_two_consecutive_unrelated_saves(mass_minimal: MusicA
     unrelated field (verify_ssl) twice in a row here only to also confirm the
     already-broken state doesn't regress any further on a second save.
     """
-    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
-    assert provider._client._base == "http://music-rater"
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    assert provider._client._base == "http://lidarr"
 
     changed_keys = await _resave(mass_minimal, provider, {CONF_VERIFY_SSL: False})
     assert f"values/{CONF_VERIFY_SSL}" in changed_keys
     stored = mass_minimal.config.get(f"{CONF_PROVIDERS}/{INSTANCE_ID}")
-    assert stored["values"].get(CONF_URL) == "http://music-rater"
+    assert stored["values"].get(CONF_URL) == "http://lidarr"
 
     reloaded = await _reload_provider(mass_minimal)
-    assert reloaded._client._base == "http://music-rater"
+    assert reloaded._client._base == "http://lidarr"
 
     # a second consecutive save of a different value must not regress it either
     changed_keys = await _resave(mass_minimal, provider, {CONF_VERIFY_SSL: True})
     assert f"values/{CONF_VERIFY_SSL}" in changed_keys
     stored = mass_minimal.config.get(f"{CONF_PROVIDERS}/{INSTANCE_ID}")
-    assert stored["values"].get(CONF_URL) == "http://music-rater"
+    assert stored["values"].get(CONF_URL) == "http://lidarr"
 
     reloaded_again = await _reload_provider(mass_minimal)
-    assert reloaded_again._client._base == "http://music-rater"
+    assert reloaded_again._client._base == "http://lidarr"
 
 
 async def test_config_entry_default_never_shadows_the_stored_value_display(
@@ -153,12 +161,12 @@ async def test_config_entry_default_never_shadows_the_stored_value_display(
     the options page renders `.value` from. `.default_value` must stay None so it can
     never converge to equal the live value (see test above for why that matters).
     """
-    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
 
     entry = provider.config.values[CONF_URL]
 
     assert entry.default_value is None
-    assert entry.value == "http://music-rater"
+    assert entry.value == "http://lidarr"
 
 
 async def test_fresh_instance_reads_url_from_setup_data(mass_minimal: MusicAssistant) -> None:
@@ -174,11 +182,9 @@ async def test_fresh_instance_reads_url_from_setup_data(mass_minimal: MusicAssis
     file otherwise guards against, since it means the provider can never be added at
     all rather than merely losing its url later.
     """
-    provider = await _load_provider(
-        mass_minimal, values={}, setup_data={CONF_URL: "http://music-rater"}
-    )
+    provider = await _load_provider(mass_minimal, values={}, setup_data={CONF_URL: "http://lidarr"})
 
-    assert provider._client._base == "http://music-rater"
+    assert provider._client._base == "http://lidarr"
 
 
 async def test_explicit_options_edit_overrides_a_setup_value(mass_minimal: MusicAssistant) -> None:
@@ -226,10 +232,10 @@ async def test_loaded_in_mass_warns_when_reconfigure_was_silently_overridden(
     """
     provider = await _load_provider(
         mass_minimal,
-        values={CONF_URL: "http://music-rater"},
+        values={CONF_URL: "http://lidarr"},
         setup_data={CONF_URL: "http://just-reconfigured"},
     )
-    provider._client.ping = AsyncMock()  # type: ignore[method-assign]
+    provider._client.system_status = AsyncMock()  # type: ignore[method-assign]
     provider.logger = MagicMock()
 
     await provider.loaded_in_mass()
@@ -243,10 +249,143 @@ async def test_loaded_in_mass_does_not_warn_without_a_conflicting_reconfigure(
     mass_minimal: MusicAssistant,
 ) -> None:
     """No spurious warning for the ordinary deployed shape (nothing in setup_data at all)."""
-    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://music-rater"})
-    provider._client.ping = AsyncMock()  # type: ignore[method-assign]
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._client.system_status = AsyncMock()  # type: ignore[method-assign]
     provider.logger = MagicMock()
 
     await provider.loaded_in_mass()
 
     provider.logger.warning.assert_not_called()
+
+
+async def test_api_key_from_setup_data_reaches_the_client(mass_minimal: MusicAssistant) -> None:
+    """A setup-collected api_key is sent as Lidarr's X-Api-Key header."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://lidarr", CONF_API_KEY: "k3y"}
+    )
+
+    assert provider._client._headers["X-Api-Key"] == "k3y"
+
+
+async def test_client_never_reads_the_key_through_options_values(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """
+    Ciphertext in `values` must never become the key.
+
+    A key saved to `values` without reaching setup_data is encrypted there, and the
+    pre-rehydrate passthrough entry is a plain STRING, so reading it would send ciphertext.
+    """
+    stray_ciphertext = mass_minimal.config.encrypt_string("should-not-be-used")
+    provider = await _load_provider(
+        mass_minimal, values={CONF_URL: "http://lidarr", CONF_API_KEY: stray_ciphertext}
+    )
+
+    assert provider._client._headers["X-Api-Key"] == ""
+
+
+async def test_api_key_never_appears_in_a_serialized_config_entry(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """__post_serialize__ masks a SECURE_STRING value but not its default: never set one."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://lidarr", CONF_API_KEY: "secret-key"}
+    )
+
+    provider.config.validate()  # must not raise
+    entries = {entry.key: entry for entry in await provider.get_config_entries()}
+    assert entries[CONF_API_KEY].default_value is None
+    assert entries[CONF_API_KEY].required is False
+    assert "secret-key" not in json.dumps(provider.config.to_dict())
+
+
+async def test_api_key_options_edit_reaches_the_client_after_a_reload(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """The deployed instance (url in values, no key) gets its key via the options page."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    changed_keys = await _resave(mass_minimal, provider, {CONF_API_KEY: "new-key"})
+    assert f"values/{CONF_API_KEY}" in changed_keys
+
+    reloaded = await _reload_provider(mass_minimal)
+
+    assert reloaded._client._headers["X-Api-Key"] == "new-key"
+    assert reloaded._client._base == "http://lidarr"
+
+
+async def test_resubmitted_placeholder_is_not_treated_as_a_rotation(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A non-frontend caller echoing the masked placeholder must not clobber the key."""
+    provider = await _load_provider(
+        mass_minimal, setup_data={CONF_URL: "http://lidarr", CONF_API_KEY: "old-key"}
+    )
+    posted = {CONF_API_KEY: SECURE_STRING_SUBSTITUTE, CONF_VERIFY_SSL: False}
+    changed_keys = await _resave(mass_minimal, provider, posted)
+    assert f"values/{CONF_API_KEY}" in changed_keys
+
+    reloaded = await _reload_provider(mass_minimal)
+
+    assert reloaded._client._headers["X-Api-Key"] == "old-key"
+
+
+def _users(*names: str) -> AsyncMock:
+    return AsyncMock(return_value=[MagicMock(username=name) for name in names])
+
+
+async def test_one_root_folder_entry_per_user_offering_lidarrs_roots(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """Each MA user gets a root-folder picker filled from Lidarr's live root folders."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    provider._usernames = AsyncMock(return_value=["lera", "tom"])  # type: ignore[method-assign]
+    provider._client.list_root_folders = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"path": "/music/tom"}, {"path": "/music/lera"}]
+    )
+
+    entries = {entry.key: entry for entry in await provider.get_config_entries()}
+
+    for user in ("lera", "tom"):
+        entry = entries[f"{CONF_ROOT_FOLDER_PREFIX}{user}"]
+        assert entry.required is False
+        assert entry.translation_params == [user]
+        assert [o.value for o in entry.options] == ["/music/tom", "/music/lera"]
+
+
+async def test_root_folder_mapping_survives_an_unrelated_save(mass_minimal: MusicAssistant) -> None:
+    """A per-user mapping persists across a save of another field and a reload."""
+    key = f"{CONF_ROOT_FOLDER_PREFIX}lera"
+    with patch.object(LidarrProvider, "_usernames", AsyncMock(return_value=["lera", "tom"])):
+        provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+        await _resave(mass_minimal, provider, {key: "/music/lera"})
+        await _resave(mass_minimal, provider, {CONF_VERIFY_SSL: False})
+
+        reloaded = await _reload_provider(mass_minimal)
+
+    assert reloaded.config.get_value(key) == "/music/lera"
+
+
+async def test_add_album_uses_the_acting_users_root_folder(mass_minimal: MusicAssistant) -> None:
+    """The root folder comes from the signed-in user's mapping."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}lera": "/music/lera"},
+    )
+    with patch(
+        "music_assistant.providers.lidarr.provider.get_current_user",
+        return_value=MagicMock(username="lera"),
+    ):
+        assert provider._root_folder_for_current_user() == "/music/lera"
+
+
+async def test_add_album_refuses_a_user_without_a_mapping(mass_minimal: MusicAssistant) -> None:
+    """No guessed folder: an unmapped user gets an error naming the fix."""
+    provider = await _load_provider(mass_minimal, values={CONF_URL: "http://lidarr"})
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="guest"),
+        ),
+        pytest.raises(LidarrError, match="options page"),
+    ):
+        await provider.add_album("tidal://album/1")
