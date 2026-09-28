@@ -14,11 +14,13 @@ from music_assistant.constants import (
     DB_TABLE_ALBUM_LISTEN_LATER,
     DB_TABLE_AUDIO_ANALYSIS,
     DB_TABLE_EXTERNAL_ID_LOOKUP,
+    DB_TABLE_FAVORITES,
     DB_TABLE_PLAYLOG,
     DB_TABLE_PROVIDER_MAPPINGS,
     DB_TABLE_SETTINGS,
 )
 from music_assistant.controllers.music import MusicController
+from music_assistant.controllers.music.favorites import PENDING_USER_ID
 from music_assistant.controllers.music.migrations import migrate_database
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.mass import MusicAssistant
@@ -914,3 +916,98 @@ async def test_listen_later_table_migration_is_idempotent(
     assert [(row["item_id"], row["userid"], row["added_at"]) for row in rows] == [
         (1, "user-a", 555)
     ]
+
+
+async def _create_pre_61_favorites(database: DatabaseConnection) -> None:
+    """Give the tracks table the favorite column (and its index) a pre-61 database has."""
+    await database.execute("ALTER TABLE tracks ADD COLUMN favorite BOOLEAN NOT NULL DEFAULT 0")
+    await database.execute(
+        "ALTER TABLE tracks ADD COLUMN timestamp_modified INTEGER NOT NULL DEFAULT 0"
+    )
+    await database.execute("CREATE INDEX tracks_favorite_idx on tracks(favorite)")
+    await database.execute(
+        "INSERT INTO tracks (item_id, favorite, timestamp_modified) VALUES "
+        "(1, 1, 111), (2, 1, 222), (3, 0, 333)"
+    )
+    await database.commit()
+
+
+async def _favorite_rows(database: DatabaseConnection) -> list[tuple[str, int, int, int]]:
+    """Return the favorites table as (user_id, item_id, favorite, timestamp) tuples."""
+    return [
+        (row["user_id"], row["item_id"], row["favorite"], row["timestamp"])
+        for row in await database.get_rows_from_query(
+            f"SELECT * FROM {DB_TABLE_FAVORITES} WHERE media_type = 'track' "
+            "ORDER BY user_id, item_id",
+            limit=0,
+        )
+    ]
+
+
+async def test_migration_parks_every_favorite_and_drops_the_column(
+    database: DatabaseConnection,
+) -> None:
+    """Favorites wait under the placeholder user; a second pass over the database changes nothing."""
+    await _create_pre_61_favorites(database)
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    for _ in range(2):
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=60,
+            create_tables=AsyncMock(),
+        )
+
+    # timestamped with the row's last change, the closest thing to the moment of the like
+    assert await _favorite_rows(database) == [
+        (PENDING_USER_ID, 1, 1, 111),
+        (PENDING_USER_ID, 2, 1, 222),
+    ]
+    assert "favorite" not in await _table_columns(database, "tracks")
+    assert not await database.get_rows_from_query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'tracks_favorite_idx'"
+    )
+
+
+async def test_migration_survives_a_favorite_without_a_modification_timestamp(
+    database: DatabaseConnection,
+) -> None:
+    """A table without timestamp_modified still keeps its favorites."""
+    await database.execute("ALTER TABLE tracks ADD COLUMN favorite BOOLEAN NOT NULL DEFAULT 0")
+    await database.execute("INSERT INTO tracks (item_id, favorite) VALUES (1, 1), (2, 0)")
+    await database.commit()
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=60, create_tables=AsyncMock())
+
+    assert await _favorite_rows(database) == [(PENDING_USER_ID, 1, 1, 0)]
+    assert "favorite" not in await _table_columns(database, "tracks")
+
+
+async def test_migration_parks_favorites_of_a_fork_database_stamped_62(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 62 by this branch still moves its favorites to the per-user table.
+
+    Upstream gates that step at "prev_version <= 60", but this branch was already stamped
+    62 by the time it landed, so upstream's gate can never fire for a fork database: the
+    favorite column would survive and every listing query, which now reads favorites from
+    the favorites table, would ignore it. The step is widened to "<= 62" (and
+    DB_SCHEMA_VERSION moved to 63). Revert that gate to <= 60 and this test fails.
+    """
+    await _create_pre_61_favorites(database)
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=62, create_tables=AsyncMock())
+
+    assert await _favorite_rows(database) == [
+        (PENDING_USER_ID, 1, 1, 111),
+        (PENDING_USER_ID, 2, 1, 222),
+    ]
+    assert "favorite" not in await _table_columns(database, "tracks")

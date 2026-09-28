@@ -514,13 +514,13 @@ async def test_listen_later_remove_deletes_orphan_row(
 
 @pytest.mark.usefixtures("fake_provider")
 async def test_listen_later_remove_keeps_row_with_other_anchor(
-    mass: MusicAssistant,
+    mass: MusicAssistant, signed_in_user: User
 ) -> None:
     """If the row has another anchor (favorited), remove only clears the flag."""
     library_album = await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
     db_id = int(library_album.item_id)
     # Make the row anchored by something other than listen_later.
-    await mass.music.albums.set_favorite(db_id, True)
+    await mass.music.albums.set_favorite(db_id, True, [signed_in_user.user_id])
 
     await mass.music.remove_album_from_listen_later(db_id)
 
@@ -528,6 +528,30 @@ async def test_listen_later_remove_keeps_row_with_other_anchor(
     refreshed = await mass.music.albums.get_library_item(db_id)
     assert refreshed.listen_later is False
     assert refreshed.favorite is True
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_listen_later_remove_keeps_row_another_user_likes(
+    mass: MusicAssistant,
+) -> None:
+    """
+    Another account's like anchors the row too.
+
+    Favorites are per-user, so the caller's own ``favorite`` says nothing about anyone
+    else's. Without a household-wide check, one member clearing their shelf would delete
+    an album somebody else has hearted.
+    """
+    library_album = await mass.music.add_album_to_listen_later(artist="Radiohead", album="Kid A")
+    db_id = int(library_album.item_id)
+    other = await mass.webserver.auth.create_user(username="housemate", role=UserRole.USER)
+    await mass.music.albums.set_favorite(db_id, True, [other.user_id])
+
+    await mass.music.remove_album_from_listen_later(db_id)
+
+    refreshed = await mass.music.albums.get_library_item(db_id)
+    assert refreshed.listen_later is False
+    # the caller never liked it; the row survives on the housemate's like alone
+    assert refreshed.favorite is None
 
 
 @pytest.mark.usefixtures("fake_provider")

@@ -250,6 +250,7 @@ class GenreController(MediaControllerBase[Genre]):
         SELECT
             {DB_TABLE_GENRES}.*,
             {self._external_ids_query()} AS external_ids,
+            {self._favorite_query()} AS favorite,
             (SELECT JSON_GROUP_ARRAY(
                 json_object(
                     'item_id', provider_mappings.provider_item_id,
@@ -998,7 +999,6 @@ class GenreController(MediaControllerBase[Genre]):
             sort_name=alias,
             translation_key=None,
             provider_mappings=set(),
-            favorite=False,
             # the promoted genre stays in the same taxonomy as the genre it came from
             content_type=source_genre.content_type,
         )
@@ -1385,7 +1385,6 @@ class GenreController(MediaControllerBase[Genre]):
                 "sort_name": item.sort_name,
                 "translation_key": item.translation_key,
                 "description": item.metadata.description if item.metadata else None,
-                "favorite": item.favorite,
                 "metadata": serialize_to_json(item.metadata),
                 "genre_aliases": serialize_to_json(aliases),
                 "play_count": 0,
@@ -1442,7 +1441,6 @@ class GenreController(MediaControllerBase[Genre]):
                 if overwrite
                 else cur_item.translation_key,
                 "description": description,
-                "favorite": update.favorite,
                 "metadata": serialize_to_json(metadata),
                 "genre_aliases": serialize_to_json(merged_aliases),
                 "search_name": create_safe_string(name, True, True),
@@ -1943,10 +1941,10 @@ class GenreController(MediaControllerBase[Genre]):
             # Stage new genre insert without committing yet (batch all in one transaction)
             cursor = await self.mass.music.database.execute(
                 f"INSERT INTO {DB_TABLE_GENRES}"
-                "(name, sort_name, translation_key, description, favorite, metadata, "
+                "(name, sort_name, translation_key, description, metadata, "
                 "genre_aliases, play_count, last_played, "
                 "search_name, search_sort_name, is_default, content_type) "
-                "VALUES (:name, :sort_name, :translation_key, :description, :favorite, "
+                "VALUES (:name, :sort_name, :translation_key, :description, "
                 ":metadata, :genre_aliases, :play_count, :last_played, "
                 ":search_name, :search_sort_name, :is_default, :content_type)",
                 {
@@ -1954,7 +1952,6 @@ class GenreController(MediaControllerBase[Genre]):
                     "sort_name": sort_name,
                     "translation_key": translation_key,
                     "description": None,
-                    "favorite": 0,
                     "metadata": serialize_to_json(icon_metadata.to_dict() if icon_metadata else {}),
                     "genre_aliases": serialize_to_json(all_aliases),
                     "play_count": 0,
@@ -2155,7 +2152,6 @@ class GenreController(MediaControllerBase[Genre]):
                     "name": name_value,
                     "sort_name": sort_name,
                     "description": None,
-                    "favorite": 0,
                     "metadata": serialize_to_json({}),
                     "genre_aliases": serialize_to_json([name_value]),
                     "play_count": 0,

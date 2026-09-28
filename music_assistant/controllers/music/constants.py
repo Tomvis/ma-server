@@ -29,7 +29,12 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # gate can never fire for a fork database and the bogus mappings would survive
 # forever. The catch-up step in migrations.py is therefore widened to "<= 61" and the
 # version moved to 62 so every fork database is re-migrated exactly once.
-DB_SCHEMA_VERSION: Final[int] = 62
+#
+# 63: upstream took 61 for its own step (favorites move from a column on every media
+# table to the per-user favorites table) and gated it at "prev_version <= 60". This
+# branch was already stamped 62, so that gate can never fire for a fork database. The
+# step in migrations.py is widened to "<= 62" and the version moved to 63.
+DB_SCHEMA_VERSION: Final[int] = 63
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
