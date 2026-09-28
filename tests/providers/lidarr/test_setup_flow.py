@@ -7,10 +7,10 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
-from music_assistant_models.enums import ConfigEntryType, FlowStepType
+from music_assistant_models.enums import FlowStepType
 
 from music_assistant.models.setup_flow import SetupFlowContext, SetupSession
-from music_assistant.providers.lidarr.constants import CONF_API_KEY, CONF_URL
+from music_assistant.providers.lidarr.constants import CONF_URL
 from music_assistant.providers.lidarr.setup_flow import run_setup
 
 
@@ -106,26 +106,3 @@ async def test_reconfigure_prefers_the_options_value_over_a_conflicting_setup_va
     session.handle_submit({CONF_URL: "http://fixed-with-port:4533"})
     await _wait_for(lambda: session.finished)
     await task
-
-
-async def test_setup_collects_an_optional_api_key() -> None:
-    """Setup offers a SECURE_STRING api_key, optional so an auth-less music-rater still works."""
-    finished: dict[str, Any] = {}
-
-    async def finish_handler(_session: SetupSession, values: dict[str, Any]) -> dict[str, str]:
-        finished.update(values)
-        return {"instance_id": "lidarr"}
-
-    session = _make_session(finish_handler)
-    task = asyncio.create_task(run_setup(session))
-    await _wait_for_form(session)
-
-    assert session.current_step is not None
-    entries = {entry.key: entry for entry in session.current_step.entries}
-    assert entries[CONF_API_KEY].type == ConfigEntryType.SECURE_STRING
-    assert entries[CONF_API_KEY].required is False
-
-    session.handle_submit({CONF_URL: "http://music-rater", CONF_API_KEY: "mr_a_b"})
-    await _wait_for(lambda: session.finished)
-    await task
-    assert finished[CONF_API_KEY] == "mr_a_b"

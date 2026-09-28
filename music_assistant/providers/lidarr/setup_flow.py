@@ -9,18 +9,14 @@ from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.models.setup_flow import SetupFlowError
-from music_assistant.providers.lidarr.constants import CONF_API_KEY, CONF_URL
+from music_assistant.providers.lidarr.constants import CONF_URL
 
 if TYPE_CHECKING:
     from music_assistant.models.setup_flow import SetupSession
 
-# The music-rater URL and API key cannot resolve without user input, so they are
-# collected here rather than as options entries (an options entry must be answerable
-# offline). The key is optional: a music-rater without OIDC accepts anonymous calls.
-_ENTRIES = (
-    ConfigEntry(key=CONF_URL, type=ConfigEntryType.STRING, required=True),
-    ConfigEntry(key=CONF_API_KEY, type=ConfigEntryType.SECURE_STRING, required=False),
-)
+# The music-rater URL cannot resolve without user input, so it is collected here
+# rather than as an options entry (an options entry must be answerable offline).
+_ENTRIES = (ConfigEntry(key=CONF_URL, type=ConfigEntryType.STRING, required=True),)
 
 
 async def run_setup(session: SetupSession) -> None:
