@@ -26,7 +26,7 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _lidarr() -> FakeLidarr:
-    lidarr = FakeLidarr(hydrate_after=2)
+    lidarr = FakeLidarr(settle_after=2)
     lidarr.lookup_names[OPETH] = "Opeth"
     lidarr.catalog[OPETH] = [
         {"title": "Blackwater Park", "foreignAlbumId": RG, "releases": [{"foreignReleaseId": REL}]},
@@ -150,6 +150,114 @@ async def test_existing_artist_is_refreshed_when_the_album_is_not_loaded_yet() -
 
     assert any(c["name"] == "RefreshArtist" for c in lidarr.commands)
     assert [a["title"] for a in lidarr.albums[artist_id] if a["monitored"]] == ["Blackwater Park"]
+
+
+@pytest.mark.parametrize("settle_after", range(1, 16))
+async def test_nothing_is_monitored_until_lidarrs_own_new_artist_refresh_is_done(
+    settle_after: int,
+) -> None:
+    """
+    Lidarr's add-time refresh unmonitors every album when it finishes.
+
+    Monitoring before it settles is silently undone while the toast says "monitored";
+    parametrized over when that refresh lands relative to the flow's own calls.
+    """
+    lidarr = FakeLidarr(settle_after=settle_after)
+    lidarr.lookup_names[OPETH] = "Opeth"
+    lidarr.catalog[OPETH] = [{"title": "Blackwater Park", "foreignAlbumId": RG, "releases": []}]
+
+    await add_album(lidarr, _request(), root_folder=TOM, logger=LOG)  # type: ignore[arg-type]
+
+    [artist] = lidarr.artists
+    assert artist["monitored"] is True
+    assert [a["title"] for a in lidarr.albums[artist["id"]] if a["monitored"]] == [
+        "Blackwater Park"
+    ]
+
+
+async def test_a_new_artist_that_never_settles_is_a_retryable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck add-time refresh fails with "try again", never with a false success."""
+    monkeypatch.setattr(lidarr_add, "SETTLE_TIMEOUT", 0)
+    lidarr = FakeLidarr(settle_after=1000)
+    lidarr.lookup_names[OPETH] = "Opeth"
+    lidarr.catalog[OPETH] = [{"title": "Blackwater Park", "foreignAlbumId": RG, "releases": []}]
+
+    with pytest.raises(LidarrError, match="again"):
+        await add_album(lidarr, _request(), root_folder=TOM, logger=LOG)  # type: ignore[arg-type]
+
+
+async def test_known_mbid_is_not_title_matched_before_a_refresh() -> None:
+    """
+    A new album whose same-titled single is already loaded must not match the single.
+
+    With an MBID known, the stale list is searched by MBID only; the refresh loads the
+    album and the MBID then matches it.
+    """
+    lidarr = _lidarr()
+    lidarr.catalog[OPETH].append({"title": "Ghost", "foreignAlbumId": "rg-ghost-lp"})
+    artist_id = lidarr.existing(OPETH, "Opeth", TOM)
+    lidarr.albums[artist_id] = [
+        {
+            "id": 900,
+            "artistId": artist_id,
+            "title": "Ghost",
+            "foreignAlbumId": "rg-ghost-single",
+            "monitored": False,
+            "releases": [],
+        }
+    ]
+
+    await add_album(
+        lidarr,  # type: ignore[arg-type]
+        _request(release_group_mbid="rg-ghost-lp", album_name="Ghost"),
+        root_folder=TOM,
+        logger=LOG,
+    )
+
+    monitored = [a["foreignAlbumId"] for a in lidarr.albums[artist_id] if a["monitored"]]
+    assert monitored == ["rg-ghost-lp"]
+
+
+async def test_non_latin_titles_match_themselves_not_the_first_album() -> None:
+    """Titles in any script normalize to themselves, not to an empty string."""
+    lidarr = _lidarr()
+    lidarr.catalog[OPETH] = [
+        {"title": "Альбом", "foreignAlbumId": "rg-ru", "releases": []},
+        {"title": "אלבום", "foreignAlbumId": "rg-he", "releases": []},
+    ]
+    artist_id = lidarr.existing(OPETH, "Opeth", TOM)
+
+    await add_album(
+        lidarr,  # type: ignore[arg-type]
+        _request(release_group_mbid=None, album_name="אלבום"),
+        root_folder=TOM,
+        logger=LOG,
+    )
+
+    assert [a["title"] for a in lidarr.albums[artist_id] if a["monitored"]] == ["אלבום"]
+
+
+async def test_exact_title_wins_over_an_edition_stripped_match() -> None:
+    """An exact title ("Fearless (Taylor's Version)") wins over the stripped one."""
+    lidarr = _lidarr()
+    lidarr.catalog[OPETH] = [
+        {"title": "Fearless", "foreignAlbumId": "rg-2008", "releases": []},
+        {"title": "Fearless (Taylor's Version)", "foreignAlbumId": "rg-2021", "releases": []},
+    ]
+    artist_id = lidarr.existing(OPETH, "Opeth", TOM)
+
+    await add_album(
+        lidarr,  # type: ignore[arg-type]
+        _request(release_group_mbid=None, album_name="Fearless (Taylor's Version)"),
+        root_folder=TOM,
+        logger=LOG,
+    )
+
+    assert [a["title"] for a in lidarr.albums[artist_id] if a["monitored"]] == [
+        "Fearless (Taylor's Version)"
+    ]
 
 
 async def test_album_missing_from_the_catalog_names_the_metadata_profile(

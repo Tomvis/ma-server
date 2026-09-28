@@ -115,6 +115,10 @@ class LidarrClient:
             "dict[str, Any]", await self._request("POST", "command", json={"name": name, **fields})
         )
 
+    async def list_commands(self) -> list[dict[str, Any]]:
+        """List queued, running and recently finished commands."""
+        return cast("list[dict[str, Any]]", await self._request("GET", "command"))
+
     async def get_command(self, command_id: int) -> dict[str, Any]:
         """Poll a queued command's status."""
         return cast("dict[str, Any]", await self._request("GET", f"command/{int(command_id)}"))

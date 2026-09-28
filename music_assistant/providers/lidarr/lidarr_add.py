@@ -7,11 +7,15 @@ Given an artist MBID, the album's identifiers and the acting user's root folder:
    person's root (moving files between libraries is not this action's call). Otherwise
    add it to ``root_folder`` with that root folder's default profiles, monitoring no
    existing albums and no future releases.
-2. Make sure the artist is monitored: Lidarr never searches an unmonitored artist's
-   albums, and it zeroes the flag itself on an add with ``addOptions.monitor=none``.
-3. Find the album in the artist's discography, refreshing the artist first when it is
-   new or the album isn't loaded yet (a release newer than the last refresh).
-4. Monitor that one album and queue an AlbumSearch for it.
+2. Wait for Lidarr's own new-artist refresh to finish. Its scan handler applies
+   ``addOptions.monitor=none`` at the end -- unmonitoring every album and writing back
+   the artist it loaded at the start -- so anything monitored before then is undone.
+3. Make sure the artist is monitored: Lidarr never searches an unmonitored artist's
+   albums.
+4. Find the album in the artist's discography. A known MBID is matched only by MBID
+   until the artist has been refreshed (a release newer than the last refresh); the
+   title is the fallback after that, or when no MBID is known.
+5. Monitor that one album and queue an AlbumSearch for it.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ if TYPE_CHECKING:
     from music_assistant.providers.lidarr.client import LidarrClient
 
 POLL_INTERVAL = 1.5
+# Bounds the wait for a new artist's own refresh (add handler + scan) to finish; large
+# discographies (classical composers) take a while.
+SETTLE_TIMEOUT = 180.0
 # Bounds the wait for a queued RefreshArtist command to finish.
 COMMAND_TIMEOUT = 60.0
 # After the command completes Lidarr can still be committing the discography, so the
@@ -65,14 +72,12 @@ async def add_album(
     :param logger: Logger for progress and fallbacks.
     """
     artist, added = await _find_or_add_artist(client, request, root_folder)
-    if added:
-        await _refresh_artist(client, int(artist["id"]), logger)
-        artist = await client.get_artist(int(artist["id"]))
+    artist = await _wait_until_settled(client, int(artist["id"]))
     if not artist.get("monitored"):
         artist = await client.update_artist({**artist, "monitored": True})
         logger.info("Lidarr: set artist %r monitored", artist.get("artistName"))
 
-    album = await _find_album(client, artist, request, refreshed=added, logger=logger)
+    album = await _find_album(client, artist, request, logger=logger)
     album_id = int(album["id"])
     already_monitored = bool(album.get("monitored"))
     if not already_monitored:
@@ -95,15 +100,16 @@ async def add_album(
     }
 
 
-def normalize_title(value: str) -> str:
+def normalize_title(value: str, *, strip_edition: bool = False) -> str:
     """
-    Casefold a title and reduce it to alphanumerics, dropping a trailing parenthetical.
+    Casefold a title and reduce it to letters and digits (any script).
 
-    Lidarr's stored title can carry or lack an edition tag and differ in punctuation
-    from the streaming provider's title.
+    :param value: The title.
+    :param strip_edition: Also drop a trailing parenthetical (an edition tag).
     """
-    no_paren = re.sub(r"\s*\(.*?\)\s*$", "", value)
-    return re.sub(r"[^0-9a-z]+", "", no_paren.casefold())
+    if strip_edition:
+        value = re.sub(r"\s*\(.*?\)\s*$", "", value)
+    return re.sub(r"[\W_]+", "", value.casefold())
 
 
 async def _find_or_add_artist(
@@ -155,24 +161,58 @@ async def _root(client: LidarrClient, path: str) -> dict[str, Any]:
     raise LidarrError(f"Lidarr has no root folder {wanted!r}; fix the Lidarr provider's options.")
 
 
+async def _wait_until_settled(client: LidarrClient, artist_id: int) -> dict[str, Any]:
+    """
+    Return the artist once no add or refresh is pending for it.
+
+    ``addOptions`` stays set until Lidarr's post-add actions are done; a RefreshArtist
+    still queued or running for the artist would also re-apply its album monitoring.
+    """
+    deadline = asyncio.get_running_loop().time() + SETTLE_TIMEOUT
+    while True:
+        refresh_pending = await _refresh_pending(client, artist_id)
+        artist = await client.get_artist(artist_id)
+        if not artist.get("addOptions") and not refresh_pending:
+            return artist
+        if asyncio.get_running_loop().time() >= deadline:
+            raise LidarrError(
+                f"Lidarr is still loading {artist.get('artistName')!r}'s catalog; "
+                "try 'Add to Lidarr' again in a minute."
+            )
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _refresh_pending(client: LidarrClient, artist_id: int) -> bool:
+    for command in await client.list_commands():
+        if command.get("name") != "RefreshArtist" or command.get("status") not in (
+            "queued",
+            "started",
+        ):
+            continue
+        body = command.get("body") or {}
+        if artist_id in (body.get("artistIds") or [body.get("artistId")]):
+            return True
+    return False
+
+
 async def _find_album(
     client: LidarrClient,
     artist: dict[str, Any],
     request: AlbumRequest,
     *,
-    refreshed: bool,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     """Find the album in the artist's discography, refreshing the artist once if needed."""
     artist_id = int(artist["id"])
-    if not refreshed:
-        if (album := _match(await client.list_albums(artist_id), request)) is not None:
-            return album
-        await _refresh_artist(client, artist_id, logger)
+    by_mbid_only = bool(request.release_group_mbid or request.release_mbid)
+    albums = await client.list_albums(artist_id)
+    if (album := _match(albums, request, allow_title=not by_mbid_only)) is not None:
+        return album
+    await _refresh_artist(client, artist_id, logger)
     deadline = asyncio.get_running_loop().time() + DISCOGRAPHY_TIMEOUT
     while True:
         albums = await client.list_albums(artist_id)
-        if (album := _match(albums, request)) is not None:
+        if (album := _match(albums, request, allow_title=True)) is not None:
             return album
         if asyncio.get_running_loop().time() >= deadline:
             break
@@ -185,8 +225,10 @@ async def _find_album(
     )
 
 
-def _match(albums: list[dict[str, Any]], request: AlbumRequest) -> dict[str, Any] | None:
-    """Match by release group, then by one of its releases, then by normalized title."""
+def _match(
+    albums: list[dict[str, Any]], request: AlbumRequest, *, allow_title: bool
+) -> dict[str, Any] | None:
+    """Match by release group, then by one of its releases, then (if allowed) by title."""
     if request.release_group_mbid:
         for album in albums:
             if album.get("foreignAlbumId") == request.release_group_mbid:
@@ -196,8 +238,19 @@ def _match(albums: list[dict[str, Any]], request: AlbumRequest) -> dict[str, Any
             releases = album.get("releases") or []
             if any(r.get("foreignReleaseId") == request.release_mbid for r in releases):
                 return album
-    target = normalize_title(request.album_name)
-    return next((a for a in albums if normalize_title(a.get("title", "")) == target), None)
+    if not allow_title:
+        return None
+    # Exact title first, so "Fearless (Taylor's Version)" never falls to "Fearless".
+    for strip_edition in (False, True):
+        target = normalize_title(request.album_name, strip_edition=strip_edition)
+        if not target:
+            continue
+        for album in albums:
+            if normalize_title(album.get("title", ""), strip_edition=strip_edition) == target:
+                return album
+    # A title of only symbols normalizes to "": compare it as written instead.
+    target = request.album_name.casefold().strip()
+    return next((a for a in albums if str(a.get("title", "")).casefold().strip() == target), None)
 
 
 async def _refresh_artist(client: LidarrClient, artist_id: int, logger: logging.Logger) -> None:
