@@ -1706,7 +1706,9 @@
         'description_language': None,
         'dynamic_range': None,
         'explicit': None,
-        'genres': None,
+        'genres': list([
+          'Spoken Word',
+        ]),
         'grouping': None,
         'has_transcript': None,
         'images': list([
@@ -1870,7 +1872,9 @@
         'description_language': None,
         'dynamic_range': None,
         'explicit': None,
-        'genres': None,
+        'genres': list([
+          'Spoken Word',
+        ]),
         'grouping': None,
         'has_transcript': None,
         'images': list([
@@ -2034,7 +2038,9 @@
         'description_language': None,
         'dynamic_range': None,
         'explicit': None,
-        'genres': None,
+        'genres': list([
+          'Spoken Word',
+        ]),
         'grouping': None,
         'has_transcript': None,
         'images': list([
@@ -2234,7 +2240,9 @@
       'description_language': None,
       'dynamic_range': None,
       'explicit': None,
-      'genres': None,
+      'genres': list([
+        'Spoken Word',
+      ]),
       'grouping': None,
       'has_transcript': None,
       'images': list([
@@ -2317,7 +2325,9 @@
       'description_language': None,
       'dynamic_range': None,
       'explicit': None,
-      'genres': None,
+      'genres': list([
+        'Spoken Word',
+      ]),
       'grouping': None,
       'has_transcript': None,
       'images': list([

@@ -31,6 +31,7 @@ from tests.common import MockPlayer, MockProvider, use_real_create_task
 if TYPE_CHECKING:
     from collections.abc import Coroutine
 
+    from music_assistant import MusicAssistant
     from music_assistant.controllers.player_queues import PlayerQueuesController
     from music_assistant.models.player import Player
 
@@ -604,6 +605,8 @@ def _spy_on_lock_order(controller: PlayerController) -> list[str]:
 class _PlayingQueues:
     """Queue controller stand-in exposing what handle_play_action touches."""
 
+    mass: MusicAssistant
+
     def __init__(self, mass: MagicMock, queue_id: str) -> None:
         """Initialize the stand-in with one queue."""
         self.mass = mass
@@ -611,6 +614,15 @@ class _PlayingQueues:
             queue_id=queue_id, active=True, display_name=queue_id, available=True, items=0
         )
         self._queue_data = {queue_id: PlayerQueueData(queue=queue)}
+
+    def get(self, queue_id: str) -> PlayerQueue | None:
+        """Return the queue, if it is the one held."""
+        queue_data = self._queue_data.get(queue_id)
+        return queue_data.queue if queue_data else None
+
+    @handle_play_action
+    async def resume(self, queue_id: str) -> None:
+        """Resume the queue: a play action, so it runs under the group and player lock."""
 
     def signal_update(self, queue_id: str, items_changed: bool = False) -> None:
         """Ignore the queue updates."""
@@ -779,8 +791,10 @@ class TestGroupAndMemberLockOrder:
 
         assert lock_keys[:2] == ["playback_g1", "playback_extra"]
 
-    async def test_a_leader_power_off_powers_off_its_followers(self, mock_mass: MagicMock) -> None:
-        """A leader's power off powers off its followers from within its own locks."""
+    async def test_a_leader_power_off_leaves_its_followers_powered(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A leader's power off releases its followers but leaves their power alone."""
         controller = PlayerController(mock_mass)
         provider = MockProvider("test", instance_id="test", mass=mock_mass)
 
@@ -799,12 +813,13 @@ class TestGroupAndMemberLockOrder:
 
         assert follower.state.synced_to == "leader"
 
-        # a follower that waits for a lock its own power off already holds never
-        # resolves, so a timeout here is the assertion
+        # the release runs from under the locks the power off holds, so a timeout
+        # here would mean it waited on one of them
         async with asyncio.timeout(2):
             await controller.cmd_power("leader", False)
 
-        assert follower.power_commands == [False]
+        assert leader.power_commands == [False]
+        assert follower.power_commands == []
 
     async def test_an_announcement_and_a_group_command_do_not_lock_each_other_out(
         self, mock_mass: MagicMock
@@ -901,6 +916,32 @@ class TestGroupAndMemberLockOrder:
         await _play_on_queue(queues, "member")
 
         assert lock_keys[:2] == ["playback_g1", "playback_member"]
+
+    async def test_a_resume_on_a_synced_player_and_a_join_do_not_lock_each_other_out(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """Resuming a player synced to a captured leader while another player joins must not deadlock."""
+        controller, group, member, _ = self._setup(mock_mass)
+        # "extra" hears the group's queue through "member", the group's captured leader,
+        # so its resume lands on that queue and the play action takes the group's lock
+        self._add_follower(controller, member)
+        mock_mass.player_queues = _PlayingQueues(mock_mass, "g1")
+
+        await self._assert_no_lockout_with_a_join(controller, group, controller.cmd_resume("extra"))
+
+    async def test_a_resume_on_a_synced_player_locks_the_leader_group_not_the_leader(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """A resume on a player synced to a captured leader is run under that leader's group lock."""
+        controller, _, member, _ = self._setup(mock_mass)
+        self._add_follower(controller, member)
+        mock_mass.player_queues = _PlayingQueues(mock_mass, "g1")
+        lock_keys = _spy_on_lock_order(controller)
+
+        await controller.cmd_resume("extra")
+
+        assert lock_keys[0] == "playback_g1"
+        assert "playback_member" not in lock_keys
 
 
 class TestPlayerBaseIsActiveSession:
@@ -1117,9 +1158,7 @@ class TestAdHocLeadershipTransfer:
         mock_mass.players = controller
         leader.update_state(signal_event=False)
 
-        playing_queue = MagicMock()
-        playing_queue.state = PlaybackState.PLAYING
-        controller.get_active_queue = MagicMock(return_value=playing_queue)  # type: ignore[method-assign]
+        controller.get_active_queue = MagicMock(return_value=_queue_stub("leader"))  # type: ignore[method-assign]
         controller._transfer_ad_hoc_leadership = AsyncMock()  # type: ignore[method-assign]
 
         await controller._handle_set_members(leader, player_ids_to_remove=["leader"])
@@ -1155,9 +1194,7 @@ class TestAdHocLeadershipTransfer:
         for player in (leader, member_a, visualizer):
             player.update_state(signal_event=False)
 
-        playing_queue = MagicMock()
-        playing_queue.state = PlaybackState.PLAYING
-        controller.get_active_queue = MagicMock(return_value=playing_queue)  # type: ignore[method-assign]
+        controller.get_active_queue = MagicMock(return_value=_queue_stub("leader"))  # type: ignore[method-assign]
         controller._transfer_ad_hoc_leadership = AsyncMock()  # type: ignore[method-assign]
 
         await controller._handle_set_members(leader, player_ids_to_remove=["leader"])
@@ -1257,6 +1294,29 @@ class TestAdHocLeadershipTransfer:
 
         controller._transfer_ad_hoc_leadership.assert_awaited_once_with(leader, ["member"])
         device_stop.assert_not_awaited()
+        queue_stop.assert_not_awaited()
+
+    async def test_a_groups_leader_hands_over_nothing(self, mock_mass: MagicMock) -> None:
+        """
+        The member a group player elected as its leader has no queue of its own to hand over.
+
+        Its followers ride the group's queue and may still show on it for a while after
+        that group dissolved around it. Removing it from itself dissolves what is left,
+        rather than moving the group's queue onto one of the followers.
+        """
+        controller, leader, device_stop, queue_stop = _ad_hoc_leader(
+            mock_mass, member_type=PlayerType.PLAYER
+        )
+        controller.get_active_queue = MagicMock(return_value=_queue_stub("group"))  # type: ignore[method-assign]
+        controller._transfer_ad_hoc_leadership = AsyncMock()  # type: ignore[method-assign]
+
+        await controller._handle_set_members(leader, player_ids_to_remove=["leader"])
+
+        controller._transfer_ad_hoc_leadership.assert_not_awaited()
+        protocol_set_members = cast("AsyncMock", controller._handle_set_members_with_protocols)
+        protocol_set_members.assert_awaited_once_with(leader, [], ["member"])
+        # the group's queue is not the leader's to end, so only the device is stopped
+        device_stop.assert_awaited_once_with("leader")
         queue_stop.assert_not_awaited()
 
 

@@ -12,7 +12,7 @@
 # base's venv matches the layered code pin-for-pin (aiosonos 0.1.13, models 1.1.212,
 # frontend 2.17.312, aiosendspin still 9.1.1). Stopping at the tag rather than
 # origin/dev HEAD is deliberate: only a tag has a published ghcr image to layer onto.
-ARG UPSTREAM=ghcr.io/music-assistant/server:2.11.0.dev2026092803
+ARG UPSTREAM=ghcr.io/music-assistant/server:2.11.0.dev2026092903
 FROM ${UPSTREAM}
 
 # Replace upstream's installed music_assistant Python package with the
