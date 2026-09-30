@@ -2,7 +2,7 @@
 Storage controller: the storage locations the server can see.
 
 Locations come from the mount table of the server process (container volumes, network shares
-and drives), from the folders an admin registered on this server, and from the server's own
+and drives), from the network shares and folders an admin added, and from the server's own
 data and cache directories. A caller that manages every music source sees all of them; any
 other caller sees the media locations that were deliberately made available to the server.
 
@@ -11,6 +11,11 @@ left alone. A location is only probed when a caller needs its state and the last
 older than half a minute; the probe of a share wakes it when it sits behind an automount
 trigger. Every probe runs on a thread of its own, so a share whose server is gone never holds
 up the other locations, the commands of this controller or the shutdown of the server.
+
+A network share an admin adds is mounted by the Home Assistant Supervisor where the server
+may manage its mounts, else by the server itself where it is allowed to mount. The share stays
+with the backend that mounted it first, at the same path, and is mounted again on every start
+of the server.
 """
 
 from __future__ import annotations
@@ -21,21 +26,43 @@ import stat
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass, field, replace
+from functools import partial
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from music_assistant_models.auth import Scope
-from music_assistant_models.errors import ActionUnavailable, InvalidDataError
+from music_assistant_models.errors import (
+    ActionUnavailable,
+    InvalidDataError,
+    MusicAssistantError,
+    SetupFailedError,
+)
 
-from music_assistant.constants import CONF_STORAGE_FOLDERS, FILESYSTEM_PROVIDER_DOMAINS
+from music_assistant.constants import (
+    CONF_PATH,
+    CONF_PROVIDERS,
+    CONF_STORAGE_FOLDER_MOUNTS,
+    CONF_STORAGE_FOLDERS,
+    CONF_STORAGE_SHARES,
+    FILESYSTEM_PROVIDER_DOMAINS,
+)
+from music_assistant.controllers.storage.backends.base import (
+    BackendUnavailable,
+    ShareMounter,
+    ShareState,
+)
+from music_assistant.controllers.storage.backends.local_mount import create_local_mounter
 from music_assistant.controllers.storage.backends.mountinfo import (
     AUTOMOUNT_FSTYPE,
     MediaMount,
+    find_mount,
+    is_mounted,
     parse_mountinfo,
     parse_mountpoints,
     read_mountinfo,
 )
+from music_assistant.controllers.storage.backends.supervisor import create_supervisor_mounter
 from music_assistant.controllers.storage.constants import (
     CONTAINER_MARKER_FILES,
     DIR_SIZE_MAX_AGE,
@@ -43,11 +70,21 @@ from music_assistant.controllers.storage.constants import (
     MAX_LISTED_FOLDERS,
     PROBE_MAX_AGE,
     PROBE_TIMEOUT,
+    RECONCILE_TASK_ID,
     REFRESH_INTERVAL,
     REFRESH_TASK_ID,
+    REMOUNT_INTERVAL,
+    REMOUNT_TASK_ID,
+    SHARE_STATES_TIMEOUT,
+    SHARES_DOCS_URL,
+    SHARES_SETUP_TASK_ID,
+    SIZE_DECIMALS,
 )
-from music_assistant.controllers.storage.helpers import is_within
+from music_assistant.controllers.storage.helpers import is_within, share_key
 from music_assistant.controllers.storage.models import (
+    MountBackend,
+    NetworkShareSpec,
+    ShareType,
     StorageInfo,
     StorageKind,
     StorageLocation,
@@ -59,16 +96,16 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 )
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.security import is_safe_path
-from music_assistant.helpers.util import get_folder_size
+from music_assistant.helpers.util import get_folder_size, get_ip_from_host
 from music_assistant.models.core_controller import CoreController
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from music_assistant_models.config_entries import CoreConfig
 
+    from music_assistant.helpers.json import SerializableType
     from music_assistant.mass import MusicAssistant
-    from music_assistant.models import ProviderInstanceType
 
 READ_SCOPES = (Scope.CONFIG_PROVIDERS_OWN, Scope.CONFIG_PROVIDERS_READ)
 BYTES_PER_GB = float(1 << 30)
@@ -96,10 +133,25 @@ class StorageController(CoreController):
         # every mountpoint the mount table showed since the start: an unmounted drive or share
         # leaves an empty folder behind, which must not pass for the storage itself
         self._seen_mountpoints: set[str] = set()
+        # the registered folders whose drive or share is not mounted, as of the last refresh
+        self._unmounted_folders: set[str] = set()
         # paths whose probe is being waited for; an answer that comes later rebuilds the list
         self._awaited_probes: set[str] = set()
         self._dir_sizes: dict[StorageUsage, float] = {}
         self._dir_sizes_requested: float | None = None
+        # the mount backends this server can use, in the order of priority
+        self._mounters: dict[MountBackend, ShareMounter] = {}
+        # why a mount backend can not be used
+        self._backend_problems: dict[MountBackend, str] = {}
+        self._backends_lock = asyncio.Lock()
+        # held while a network share is added, changed, mounted or removed
+        self._shares_lock = asyncio.Lock()
+        # why a network share could not be mounted the last time it was tried
+        self._share_errors: dict[str, MusicAssistantError] = {}
+        # shares whose mount was changed into another share outside Music Assistant
+        self._changed_shares: set[str] = set()
+        # when each share was last tried to be mounted again because someone needed it
+        self._remount_attempts: dict[str, float] = {}
 
     @property
     def can_add_local_folder(self) -> bool:
@@ -117,12 +169,19 @@ class StorageController(CoreController):
         # the mount table only: a location is probed once a caller needs its state
         await self._periodic_refresh()
         self._request_dir_sizes()
+        self.mass.create_task(self._setup_network_shares(), task_id=SHARES_SETUP_TASK_ID)
 
     async def close(self) -> None:
         """Handle logic on server stop."""
         self.mass.cancel_timer(REFRESH_TASK_ID)
         self.mass.cancel_task(REFRESH_TASK_ID)
         self.mass.cancel_task(DIR_SIZES_TASK_ID)
+        # the network shares stay mounted: the Supervisor keeps its mounts anyway, and a share
+        # this server mounted is mounted again on the next start
+        self.mass.cancel_task(SHARES_SETUP_TASK_ID)
+        self.mass.cancel_task(RECONCILE_TASK_ID)
+        for name in self._remount_attempts:
+            self.mass.cancel_task(f"{REMOUNT_TASK_ID}_{name}")
 
     @api_command("storage/info", required_scope=READ_SCOPES)
     async def get_info(self) -> StorageInfo:
@@ -135,15 +194,26 @@ class StorageController(CoreController):
         if manages_all_sources:
             # the used space is only shown on the data and cache rows these callers see
             self._request_dir_sizes()
+            # a share may have been changed in Home Assistant since it was last looked at
+            await self._refresh_share_states()
         # a drive or share mounted since the last refresh shows up right away
         await self.refresh()
         await self._probe_outdated(loc.path for loc in self.get_locations(manages_all_sources))
+        # only a caller that can add a share makes the server look for a mount backend again
+        mounter = await self._get_mounter() if manages_all_sources else self._find_mounter()
+        share_versions = mounter.supported_versions if mounter is not None else {}
+        locations = self.get_locations(manages_all_sources)
+        if not manages_all_sources:
+            # a folder picker needs no connection details, nor the sources that use a location
+            locations = [_without_private_details(location) for location in locations]
         return StorageInfo(
-            locations=self.get_locations(manages_all_sources),
-            can_mount_shares=False,
-            mount_backend=None,
-            supported_share_types=[],
-            supported_share_versions={},
+            locations=locations,
+            can_mount_shares=mounter is not None,
+            mount_backend=mounter.backend if mounter is not None else None,
+            supported_share_types=list(share_versions),
+            supported_share_versions={
+                share_type: list(versions) for share_type, versions in share_versions.items()
+            },
             can_add_local_folder=self.can_add_local_folder,
         )
 
@@ -161,10 +231,13 @@ class StorageController(CoreController):
         """
         Register a folder on this server as a media location.
 
-        Only possible when the server does not run in a container.
+        Only possible when the server does not run in a container. A folder that is the
+        mountpoint of a drive or share replaces any location found for that mount, and is not
+        available while nothing is mounted on it.
 
-        :param path: Absolute path of an existing folder that is no storage location yet, also
-            once its symlinks are resolved. It is stored as given.
+        :param path: Absolute path of an existing folder that is neither a registered folder
+            nor a network share Music Assistant mounted, also once its symlinks are resolved.
+            It is stored, and returned, with its symlinks resolved.
         """
         if not self.can_add_local_folder:
             msg = "A folder can not be added when the server runs in a container"
@@ -180,7 +253,19 @@ class StorageController(CoreController):
             raise self._folder_unreadable(path)
         if not result.is_dir:
             raise self._folder_not_found(path)
-        self._check_new_folder(result.real_path or path)
+        # the resolved path, which is what a folder picked in the location is checked against
+        if result.real_path is not None and result.real_path != path:
+            path = result.real_path
+            self._check_new_folder(path)
+            # the location is listed with the answer for its own path
+            await self._wait_for_probes([path])
+        table = await asyncio.to_thread(read_mountinfo)
+        mounts = self._get_folder_mounts()
+        if find_mount(table, path, StorageKind.MANUAL) is not None:
+            mounts.append(path)
+        # recorded before the folder is registered: a record only counts for a registered
+        # folder, and one left behind for this path is dropped here
+        self.mass.config.set(CONF_STORAGE_FOLDER_MOUNTS, mounts, immediate=True)
         self.mass.config.set(
             CONF_STORAGE_FOLDERS, [*self._get_registered_folders(), path], immediate=True
         )
@@ -192,7 +277,8 @@ class StorageController(CoreController):
         """
         Remove a registered folder from the media locations.
 
-        Refused while a music source uses the folder.
+        Refused while a music source uses the folder, not while one only reads it as part of
+        its own folder.
 
         :param path: Path of the registered folder.
         """
@@ -201,13 +287,203 @@ class StorageController(CoreController):
         if path not in folders:
             msg = f"Not a registered folder: {path}"
             raise self._error(InvalidDataError, msg, "folder_not_registered")
-        if (source := self._get_source_using(path)) is not None:
-            msg = f"{source.name} uses {path}"
-            raise self._error(ActionUnavailable, msg, "location_in_use", source.name)
+        self._check_not_in_use(path)
         self.mass.config.set(
             CONF_STORAGE_FOLDERS, [folder for folder in folders if folder != path], immediate=True
         )
+        # dropped after the folder, so a registered folder never goes without its record
+        self.mass.config.set(CONF_STORAGE_FOLDER_MOUNTS, self._get_folder_mounts(), immediate=True)
         await self.refresh()
+
+    @api_command("storage/network_shares/add", required_scope=Scope.CONFIG_PROVIDERS_WRITE)
+    async def add_network_share(
+        self,
+        share_type: ShareType,
+        server: str,
+        share: str,
+        username: str | None = None,
+        password: str | None = None,
+        version: str | None = None,
+        read_only: bool = False,
+    ) -> StorageLocation:
+        """
+        Mount a network share as a media location.
+
+        Refused when the share is a storage location already, also when it was added in Home
+        Assistant. Nothing is kept when the share does not mount.
+
+        Under a Supervisor only the Supervisor mounts a share.
+
+        :param share_type: The protocol of the share.
+        :param server: The hostname or IP address of the server.
+        :param share: The share name of a cifs share, the absolute export path of an nfs share.
+        :param username: The user to log in as (cifs only), None for guest access.
+        :param password: The password of the user, required with a user.
+        :param version: One of the supported protocol versions, None to negotiate it.
+        :param read_only: Whether to mount the share read-only.
+        """
+        if (mounter := await self._get_mounter()) is None:
+            if self.mass.running_as_hass_addon:
+                msg = "The Supervisor does not mount network shares right now"
+                raise self._error(ActionUnavailable, msg, "supervisor_mounts_unavailable")
+            raise self._error(
+                ActionUnavailable,
+                "This server can not mount network shares",
+                "no_mount_backend",
+                SHARES_DOCS_URL,
+            )
+        spec = await self._check_share(
+            mounter,
+            NetworkShareSpec(
+                name="",
+                share_type=share_type,
+                server=server,
+                share=share,
+                backend=mounter.backend,
+                path="",
+                username=username,
+                version=version,
+                read_only=read_only,
+            ),
+        )
+        self._check_credentials(spec, bool(password))
+        if spec.username is not None and password:
+            spec.password = self.mass.config.encrypt_string(password)
+        async with self._shares_lock:
+            shares = self._get_shares()
+            await self._check_not_added(mounter, spec, shares)
+            spec = await mounter.assign_name(spec, shares.keys())
+            await mounter.add(spec, self._get_password(spec))
+            if not await self._is_share_mounted(spec):
+                await self._undo_mount(mounter, spec)
+                raise self._share_not_mounted(spec)
+            self._share_errors.pop(spec.name, None)
+            self.mass.config.set(
+                f"{CONF_STORAGE_SHARES}/{spec.name}", spec.to_dict(), immediate=True
+            )
+        await self.refresh()
+        return self._get_share_location(spec)
+
+    @api_command("storage/network_shares/update", required_scope=Scope.CONFIG_PROVIDERS_WRITE)
+    async def update_network_share(
+        self,
+        name: str,
+        server: str,
+        share: str,
+        username: str | None = None,
+        password: str | None = None,
+        version: str | None = None,
+        read_only: bool = False,
+    ) -> StorageLocation:
+        """
+        Replace the settings of a network share and mount it with them.
+
+        The share keeps its previous settings when it does not mount with the new ones.
+
+        :param name: The name of the share.
+        :param server: The hostname or IP address of the server.
+        :param share: The share name of a cifs share, the absolute export path of an nfs share.
+        :param username: The user to log in as (cifs only), None for guest access.
+        :param password: The password of the user, None to keep the stored one. Required with a
+            user when none is stored, dropped when there is no user.
+        :param version: One of the supported protocol versions, None to negotiate it.
+        :param read_only: Whether to mount the share read-only.
+        """
+        async with self._shares_lock:
+            previous = self._get_share(name)
+            mounter = await self._get_backend_mounter(previous)
+            spec = await self._check_share(
+                mounter,
+                replace(
+                    previous,
+                    server=server,
+                    share=share,
+                    username=username,
+                    version=version,
+                    read_only=read_only,
+                ),
+            )
+            self._check_credentials(spec, bool(password or previous.password))
+            if spec.username is None:
+                spec.password = None
+            elif password:
+                spec.password = self.mass.config.encrypt_string(password)
+            await self._check_not_added(mounter, spec, self._get_shares())
+            await self._check_not_changed(mounter, previous)
+            try:
+                await mounter.update(spec, self._get_password(spec))
+            except Exception:
+                # the backend still has the previous settings, it only has to mount them again
+                await self._restore_share(mounter.reload, previous)
+                await self.refresh()
+                raise
+            if not await self._is_share_mounted(spec):
+                await self._restore_share(mounter.update, previous)
+                await self.refresh()
+                raise self._share_not_mounted(spec)
+            self._share_errors.pop(name, None)
+            self.mass.config.set(f"{CONF_STORAGE_SHARES}/{name}", spec.to_dict(), immediate=True)
+        await self.refresh()
+        return self._get_share_location(spec)
+
+    @api_command("storage/network_shares/remove", required_scope=Scope.CONFIG_PROVIDERS_WRITE)
+    async def remove_network_share(self, name: str) -> None:
+        """
+        Unmount a network share and remove it from the media locations.
+
+        Refused while a music source uses the share, not while one only reads it as part of its
+        own folder, and when its mount can not be removed. A mount that was changed into another
+        share in Home Assistant is the user's: it stays, and only the share is forgotten here.
+
+        :param name: The name of the share.
+        """
+        async with self._shares_lock:
+            spec = self._get_share(name)
+            self._check_not_in_use(spec.path)
+            if (mounter := await self._get_mounter(spec.backend)) is None:
+                if spec.backend == MountBackend.SUPERVISOR and self.mass.running_as_hass_addon:
+                    # the Supervisor may only be busy: its mount stays until it can be removed
+                    raise self._backend_unavailable(spec)
+                self.logger.warning(
+                    "Forgetting network share %s: %s has no mount of it on this installation",
+                    name,
+                    spec.backend,
+                )
+            elif (await mounter.get_states([spec]))[spec.name] == ShareState.CHANGED:
+                # the mount is another share now, the user's: it stays
+                self.logger.info(
+                    "Forgetting network share %s, its mount was changed into another share", name
+                )
+            else:
+                await mounter.remove(spec)
+            self._share_errors.pop(name, None)
+            self._changed_shares.discard(name)
+            self.mass.config.remove(f"{CONF_STORAGE_SHARES}/{name}")
+            self.mass.config.save(immediate=True)
+        await self.refresh()
+
+    @api_command("storage/network_shares/reload", required_scope=Scope.CONFIG_PROVIDERS_WRITE)
+    async def reload_network_share(self, name: str) -> StorageLocation:
+        """
+        Mount a network share again, for example after its server was offline.
+
+        :param name: The name of the share.
+        """
+        async with self._shares_lock:
+            spec = self._get_share(name)
+            mounter = await self._get_backend_mounter(spec)
+            await self._check_not_changed(mounter, spec)
+            try:
+                await mounter.reload(spec, self._get_password(spec))
+                if not await self._is_share_mounted(spec):
+                    raise self._share_not_mounted(spec)
+            except Exception as err:
+                self._share_errors[name] = _as_share_error(err)
+                await self.refresh()
+                raise
+            self._share_errors.pop(name, None)
+        await self.refresh()
+        return self._get_share_location(spec)
 
     def get_locations(self, manages_all_sources: bool = True) -> list[StorageLocation]:
         """
@@ -217,13 +493,7 @@ class StorageController(CoreController):
             caller only sees the media locations that were deliberately made available: all of
             them inside a container or under a Supervisor, the managed ones on a host.
         """
-        if manages_all_sources:
-            return list(self._locations)
-        return [
-            loc
-            for loc in self._locations
-            if loc.usage == StorageUsage.MEDIA and (self._in_container or loc.managed)
-        ]
+        return [loc for loc in self._locations if self._is_visible(loc, manages_all_sources)]
 
     def get_location_for_path(self, path: str) -> StorageLocation | None:
         """
@@ -241,16 +511,19 @@ class StorageController(CoreController):
         """
         Return whether a music source may read its files from a path.
 
-        That is a path inside a media location the caller may see, and not inside the data or
-        cache folder of the server, even when that folder lies inside such a location. The path
-        is taken as given: its symlinks are not resolved.
+        The most specific location that contains the path decides: it must be a media location
+        the caller may see. So a path is refused inside the data or cache folder of the server,
+        and inside a location the caller may not see, also when those lie inside a location the
+        caller may see. The path is taken as given: its symlinks are not resolved.
 
         :param path: An absolute path.
         :param manages_all_sources: Whether the caller manages every music source.
         """
-        path = os.path.normpath(path)
-        return bool(self._visible_roots(path, manages_all_sources)) and not self._is_server_path(
-            path
+        location = self.get_location_for_path(os.path.normpath(path))
+        return (
+            location is not None
+            and location.usage == StorageUsage.MEDIA
+            and self._is_visible(location, manages_all_sources)
         )
 
     async def is_available(self, path: str) -> bool:
@@ -262,6 +535,10 @@ class StorageController(CoreController):
         longer listed. Probes the location first when its state is outdated, which takes at
         most about 10 seconds.
 
+        A network share Music Assistant manages that is not mounted is mounted again in the
+        background, at most once a minute; the answer does not wait for it, a later call finds
+        the share mounted.
+
         :param path: An absolute path.
         """
         if (location := self.get_location_for_path(path)) is not None:
@@ -269,13 +546,27 @@ class StorageController(CoreController):
             location = self.get_location_for_path(path)
         if location is not None and not location.available:
             # nothing more to look at: it may be a share whose server is gone
+            self._request_remount(location)
             return False
+        mountpoints = set(self._seen_mountpoints)
+        if location is not None and location.mountpoint is not None:
+            # a managed network share needs its mount also when it did not mount since the start
+            mountpoints.add(location.mountpoint)
         mountpoint = max(
-            (mountpoint for mountpoint in self._seen_mountpoints if is_within(path, mountpoint)),
+            (mountpoint for mountpoint in mountpoints if is_within(path, mountpoint)),
             key=len,
             default=None,
         )
-        return await asyncio.to_thread(_is_available, path, mountpoint)
+        if await asyncio.to_thread(_is_available, path, mountpoint):
+            return True
+        # the mount of a share may have gone since the list was built
+        if (
+            location is not None
+            and location.share_name is not None
+            and not await asyncio.to_thread(_is_mountpoint, location.path)
+        ):
+            self._request_remount(location)
+        return False
 
     async def list_folders(self, path: str, manages_all_sources: bool = True) -> list[str]:
         """
@@ -302,23 +593,35 @@ class StorageController(CoreController):
             raise self._path_not_allowed(path)
         if not location.available:
             raise self._folder_unreadable(path)
-        # the path must also stay inside a location once its symlinks are resolved, and out of
-        # the server's own folders
+        # the path must also stay inside a location once its symlinks are resolved, and follow
+        # the same rule there
         real_path = await asyncio.to_thread(
             _resolve_within, path, self._visible_roots(path, manages_all_sources)
         )
-        if real_path is None or self._is_server_path(real_path):
+        if real_path is None or not self.can_hold_music_source(real_path, manages_all_sources):
             raise self._path_not_allowed(path)
         try:
-            return await asyncio.to_thread(_list_subfolders, real_path)
+            names = await asyncio.to_thread(_list_subfolders, real_path)
         except FileNotFoundError, NotADirectoryError:
             raise self._folder_not_found(path) from None
         except OSError as err:
             # e.g. a folder without read permission
             raise self._folder_unreadable(path) from err
+        hidden = {
+            loc.path
+            for loc in self._locations
+            if loc.usage == StorageUsage.MEDIA and not self._is_visible(loc, manages_all_sources)
+        }
+        # a media location the caller may not see is not shown by its name either; the server's
+        # own folders are, they only can not be browsed into
+        return [name for name in names if os.path.join(real_path, name) not in hidden]
 
     async def refresh(self) -> None:
-        """Rebuild the list of storage locations from the mount table, touching no location."""
+        """
+        Rebuild the list of storage locations from the mount table, touching no location.
+
+        Also records which music sources use each location.
+        """
         table = await asyncio.to_thread(read_mountinfo)
         self._seen_mountpoints.update(parse_mountpoints(table))
         data_path, cache_path = self._server_folders
@@ -332,11 +635,27 @@ class StorageController(CoreController):
                 continue
             name = "Media folder" if mount.kind == StorageKind.BUILTIN_MEDIA else None
             media[mount.mountpoint] = _build_location(
-                mount.mountpoint, name, StorageUsage.MEDIA, mount.kind, answer, mount=mount
+                mount.mountpoint,
+                name,
+                StorageUsage.MEDIA,
+                mount.kind,
+                answer,
+                mount=mount,
+                probed=self._has_answer(mount.mountpoint),
             )
         # a registered folder replaces a discovered location on the same path, mount included
+        folder_mounts = set(self._get_folder_mounts())
+        unmounted_folders: set[str] = set()
         for folder in self._get_registered_folders():
             folder_mount = mounts.get(folder)
+            if folder in folder_mounts:
+                # also a mount discovery leaves out: below a system path, or of another type
+                folder_mount = find_mount(table, folder, StorageKind.MANUAL)
+                if folder_mount is None:
+                    # the folder left on the path is not the drive or share, and is never probed
+                    unmounted_folders.add(folder)
+                    media[folder] = _build_unmounted_location(folder)
+                    continue
             media[folder] = _build_location(
                 folder,
                 None,
@@ -346,7 +665,12 @@ class StorageController(CoreController):
                 self._get_answer(folder, _UNPROBED_FOLDER if folder_mount is not None else None),
                 mount=folder_mount,
                 managed=True,
+                probed=self._has_answer(folder),
             )
+        self._unmounted_folders = unmounted_folders
+        # a managed network share replaces the location discovered on its path the same way
+        for spec in self._get_shares().values():
+            media[spec.path] = self._build_share_location(spec, table)
         server_kind = StorageKind.CONTAINER_VOLUME if self._in_container else StorageKind.LOCAL_DISK
         self._locations = [
             *sorted(media.values(), key=lambda loc: loc.path.casefold()),
@@ -359,6 +683,7 @@ class StorageController(CoreController):
                     # the server runs from these
                     self._get_answer(path, _UNPROBED_FOLDER),
                     used_space_gb=self._dir_sizes.get(usage),
+                    probed=self._has_answer(path),
                 )
                 for path, name, usage in (
                     (data_path, "Data", StorageUsage.DATA),
@@ -366,6 +691,58 @@ class StorageController(CoreController):
                 )
             ),
         ]
+        sources = self._get_source_folders()
+        for location in self._locations:
+            location.used_by = _sources_using(location.path, sources)
+            if location.usage == StorageUsage.MEDIA:
+                location.read_by = _sources_around(location.path, sources)
+
+    async def reconcile(self) -> None:
+        """
+        Mount the managed network shares that are not mounted, each through its own backend.
+
+        That includes a mount the backend has but reports as not working. The backends are
+        looked for again first when the backend of a share is not known. A share that can not
+        be mounted stays a location that is not available and says why, until a reload, the
+        next start of the server or a need for it (see is_available) mounts it. Never raises.
+        """
+        try:
+            if any(spec.backend not in self._mounters for spec in self._get_shares().values()):
+                await self._probe_backends()
+            async with self._shares_lock:
+                shares = list(self._get_shares().values())
+                for backend in MountBackend:
+                    if specs := [spec for spec in shares if spec.backend == backend]:
+                        await self._reconcile_backend(backend, specs)
+            await self.refresh()
+        except Exception:
+            self.logger.exception("Failed to mount the network shares")
+
+    async def get_diagnostics(self) -> dict[str, SerializableType]:
+        """Return how this server mounts network shares and the state of each location."""
+        mounter = self._find_mounter()
+        # kinds and states only: a name, server or path of a location may identify the user
+        return {
+            "mount_backend": mounter.backend.value if mounter is not None else None,
+            "mount_backends": {
+                backend.value: "available"
+                if backend in self._mounters
+                else self._backend_problems.get(backend, "not probed")
+                for backend in MountBackend
+            },
+            "locations": [
+                {
+                    "kind": location.kind.value,
+                    "usage": location.usage.value,
+                    "fstype": location.fstype,
+                    "available": location.available,
+                    "managed": location.managed,
+                    "backend": location.backend.value if location.backend is not None else None,
+                    "error": location.error_key,
+                }
+                for location in self._locations
+            ],
+        }
 
     async def _periodic_refresh(self) -> None:
         """Refresh the storage locations and schedule the next refresh."""
@@ -396,9 +773,20 @@ class StorageController(CoreController):
         if path in self._server_folders:
             msg = f"{path} is a folder of the server itself"
             raise self._error(InvalidDataError, msg, "folder_is_server_folder")
-        if any(loc.path == path for loc in self._locations):
+        # a location found in the mount table becomes the registered folder
+        if any(loc.path == path and loc.managed for loc in self._locations):
             msg = f"{path} already is a storage location"
             raise self._error(InvalidDataError, msg, "folder_already_location")
+
+    def _check_not_in_use(self, path: str) -> None:
+        """
+        Raise when the folder of a music source is the location or lies inside it.
+
+        :param path: The path of the location.
+        """
+        if used_by := _sources_using(path, self._get_source_folders()):
+            msg = f"{used_by[0]} uses {path}"
+            raise self._error(ActionUnavailable, msg, "location_in_use", used_by[0])
 
     def _visible_roots(self, path: str, manages_all_sources: bool) -> list[str]:
         """
@@ -413,14 +801,16 @@ class StorageController(CoreController):
             if loc.usage == StorageUsage.MEDIA and is_within(path, loc.path)
         ]
 
-    def _is_server_path(self, path: str) -> bool:
+    def _is_visible(self, location: StorageLocation, manages_all_sources: bool) -> bool:
         """
-        Return whether a path lies in the data or cache folder of the server.
+        Return whether a caller may see a storage location.
 
-        :param path: A normalized absolute path.
+        :param location: The location.
+        :param manages_all_sources: Whether the caller manages every music source.
         """
-        location = self.get_location_for_path(path)
-        return location is not None and location.usage != StorageUsage.MEDIA
+        return manages_all_sources or (
+            location.usage == StorageUsage.MEDIA and (self._in_container or location.managed)
+        )
 
     def _parse_mounts(self, table: str) -> list[MediaMount]:
         """Return the media mounts in a mount table of the server process."""
@@ -436,7 +826,8 @@ class StorageController(CoreController):
         Probe the paths whose last answer is missing or outdated, and rebuild the list.
 
         A path whose probe already did not answer in time is not waited for again: it counts as
-        not answering until that probe answers.
+        not answering until that probe answers. A registered folder whose drive or share is not
+        mounted is not probed at all: the mount table tells its state.
 
         :param paths: The paths whose state a caller needs.
         """
@@ -444,23 +835,29 @@ class StorageController(CoreController):
         outdated = [
             path
             for path in paths
-            if (state := self._probes.get(path)) is None
-            or (not state.overdue and not state.is_fresh(now))
+            if path not in self._unmounted_folders
+            and (
+                (state := self._probes.get(path)) is None
+                or (not state.overdue and not state.is_fresh(now))
+            )
         ]
         if outdated:
             await self._wait_for_probes(outdated)
             # read the mount table again: a probe wakes an automount trigger
             await self.refresh()
 
-    async def _wait_for_probes(self, paths: Iterable[str]) -> dict[str, _ProbeResult | None]:
+    async def _wait_for_probes(
+        self, paths: Iterable[str], fresh: bool = False
+    ) -> dict[str, _ProbeResult | None]:
         """
         Probe paths and wait for their answers, at most PROBE_TIMEOUT seconds.
 
         Returns the answer for each path, None for a path whose probe did not answer in time.
 
         :param paths: The paths to probe.
+        :param fresh: Whether to start new probes even where one is in flight.
         """
-        probes = {path: self._probe(path) for path in paths}
+        probes = {path: self._probe(path, fresh) for path in paths}
         self._awaited_probes.update(probes)
         try:
             await asyncio.wait(probes.values(), timeout=PROBE_TIMEOUT)
@@ -470,20 +867,26 @@ class StorageController(CoreController):
         for path, probe in probes.items():
             if probe.done():
                 answers[path] = probe.result()
-            else:
+                continue
+            answers[path] = None
+            # a probe that a fresh one replaced says nothing about the path any more
+            if self._probes[path].probe is probe:
                 self._probes[path].overdue = True
-                answers[path] = None
         return answers
 
-    def _probe(self, path: str) -> asyncio.Future[_ProbeResult | None]:
+    def _probe(self, path: str, fresh: bool = False) -> asyncio.Future[_ProbeResult | None]:
         """
         Return the probe of a path, starting a new one unless one is still in flight.
 
         :param path: The path to probe.
+        :param fresh: Whether to start a new probe even when one is in flight, for a path that
+            was just mounted again: the probe in flight may hang on what was mounted before, and
+            its answer is dropped.
         """
         state = self._probes.setdefault(path, _ProbeState())
-        if state.probe is not None:
+        if state.probe is not None and not fresh:
             return state.probe
+        state.overdue = False
         loop = self.mass.loop
         probe = state.probe = loop.create_future()
         probe.add_done_callback(lambda _probe: self._on_probe_answered(path, _probe))
@@ -507,6 +910,9 @@ class StorageController(CoreController):
         :param probe: The probe that answered.
         """
         state = self._probes[path]
+        if state.probe is not probe:
+            # replaced by a fresh probe: this answer is about what was mounted before
+            return
         state.answer = probe.result()
         state.answered_at = time.monotonic()
         state.probe = None
@@ -529,6 +935,16 @@ class StorageController(CoreController):
             return None
         return state.answer if state.answered_at is not None else unprobed
 
+    def _has_answer(self, path: str) -> bool:
+        """
+        Return whether a probe of a path answered, or did not answer in time.
+
+        :param path: The probed path.
+        """
+        return (state := self._probes.get(path)) is not None and (
+            state.answered_at is not None or state.overdue
+        )
+
     def _request_dir_sizes(self) -> None:
         """Measure the data and cache directories when the last measurement is outdated."""
         now = time.monotonic()
@@ -545,8 +961,8 @@ class StorageController(CoreController):
         # the default cache directory lies inside the data directory, and has a row of its own
         exclude = (cache_path,) if is_within(cache_path, data_path) else ()
         self._dir_sizes = {
-            StorageUsage.DATA: round(await get_folder_size(data_path, exclude), 2),
-            StorageUsage.CACHE: round(await get_folder_size(cache_path), 2),
+            StorageUsage.DATA: round(await get_folder_size(data_path, exclude), SIZE_DECIMALS),
+            StorageUsage.CACHE: round(await get_folder_size(cache_path), SIZE_DECIMALS),
         }
         for location in self._locations:
             if location.usage != StorageUsage.MEDIA:
@@ -556,19 +972,482 @@ class StorageController(CoreController):
         """Return the folders registered as a media location."""
         return list(self.mass.config.get(CONF_STORAGE_FOLDERS, []))
 
-    def _get_source_using(self, path: str) -> ProviderInstanceType | None:
-        """
-        Return a loaded music source that reads its files from a path or a folder inside it.
+    def _get_folder_mounts(self) -> list[str]:
+        """Return the registered folders that were a mountpoint when they were registered."""
+        recorded = self.mass.config.get(CONF_STORAGE_FOLDER_MOUNTS)
+        if not isinstance(recorded, list):
+            return []
+        # anything else in the record, a leftover or a value that is no path, is ignored
+        return [folder for folder in self._get_registered_folders() if folder in recorded]
 
-        :param path: An absolute path.
+    def _get_source_folders(self) -> list[tuple[str, str]]:
         """
-        for provider in self.mass.providers:
-            if provider.domain not in FILESYSTEM_PROVIDER_DOMAINS:
+        Return the name and folder of every enabled music source reading a folder of this server.
+
+        Loaded or not: a source that failed to load, e.g. because its share is down, still
+        reads from its folder.
+        """
+        folders: list[tuple[str, str]] = []
+        for instance_id, conf in self.mass.config.get(CONF_PROVIDERS, {}).items():
+            if (
+                not conf.get("enabled", True)
+                or conf.get("domain") not in FILESYSTEM_PROVIDER_DOMAINS
+            ):
                 continue
-            base_path = getattr(provider, "base_path", None)
-            if isinstance(base_path, str) and is_within(base_path, path):
-                return provider
-        return None
+            try:
+                folder = self.mass.config.get_provider_setup_value(instance_id, CONF_PATH)
+            except InvalidDataError:
+                self.logger.debug(
+                    "Skipping music source %s, its folder can not be read", instance_id
+                )
+                continue
+            # a source whose folder was never stored reads none
+            if isinstance(folder, str):
+                folders.append(
+                    (conf.get("name") or conf.get("default_name") or instance_id, folder)
+                )
+        return folders
+
+    async def _setup_network_shares(self) -> None:
+        """Find the mount backends this server can use and mount the managed network shares."""
+        await self._probe_backends()
+        await self.reconcile()
+
+    async def _probe_backends(self) -> set[MountBackend]:
+        """
+        Find the mount backends this server can use, after the probe that is running.
+
+        Returns the backends this probe found that were not available before.
+        """
+        async with self._backends_lock:
+            available = set(self._mounters)
+            mounters: dict[MountBackend, ShareMounter] = {}
+            problems: dict[MountBackend, str] = {}
+            candidates: list[tuple[MountBackend, Callable[[], Awaitable[ShareMounter]]]] = [
+                (MountBackend.SUPERVISOR, partial(create_supervisor_mounter, self.mass))
+            ]
+            if self.mass.running_as_hass_addon:
+                # the app does not keep its mount privileges: a share it mounted itself could
+                # never be mounted again
+                problems[MountBackend.LOCAL_MOUNT] = "only the Supervisor mounts under a Supervisor"
+            else:
+                candidates.append(
+                    (MountBackend.LOCAL_MOUNT, partial(create_local_mounter, self.logger))
+                )
+            for backend, create_mounter in candidates:
+                try:
+                    mounters[backend] = await create_mounter()
+                except BackendUnavailable as err:
+                    problems[backend] = str(err)
+            self._mounters, self._backend_problems = mounters, problems
+        self.logger.debug(
+            "Network shares can be mounted by: %s; not by: %s",
+            ", ".join(mounters) or "nothing",
+            ", ".join(f"{backend} ({problem})" for backend, problem in problems.items()),
+        )
+        return set(mounters) - available
+
+    async def _get_mounter(self, backend: MountBackend | None = None) -> ShareMounter | None:
+        """
+        Return the mounter of a backend, probing the backends again when it is not available.
+
+        :param backend: The backend, None for the one that mounts a new share.
+        """
+        if (mounter := self._find_mounter(backend)) is not None:
+            return mounter
+        if await self._probe_backends():
+            # the shares of a backend that became available can be mounted now
+            self.mass.create_task(self.reconcile(), task_id=RECONCILE_TASK_ID)
+        return self._find_mounter(backend)
+
+    async def _get_backend_mounter(self, spec: NetworkShareSpec) -> ShareMounter:
+        """
+        Return the mounter of the backend that mounted a network share.
+
+        :param spec: The share.
+        """
+        if (mounter := await self._get_mounter(spec.backend)) is None:
+            raise self._backend_unavailable(spec)
+        return mounter
+
+    def _find_mounter(self, backend: MountBackend | None = None) -> ShareMounter | None:
+        """
+        Return the mounter of a backend when it is available.
+
+        :param backend: The backend, None for the one that mounts a new share.
+        """
+        if backend is None:
+            return next(iter(self._mounters.values()), None)
+        return self._mounters.get(backend)
+
+    async def _reconcile_backend(
+        self, backend: MountBackend, specs: list[NetworkShareSpec]
+    ) -> None:
+        """
+        Mount the network shares of one backend that are not mounted.
+
+        :param backend: The backend.
+        :param specs: The shares of the backend.
+        """
+        if (mounter := self._mounters.get(backend)) is None:
+            for spec in specs:
+                self._share_errors[spec.name] = self._backend_unavailable(spec)
+            return
+        try:
+            states = await mounter.get_states(specs)
+        except Exception as err:
+            self.logger.warning(
+                "Unable to check the network shares mounted by %s: %s", backend, err
+            )
+            for spec in specs:
+                self._share_errors[spec.name] = _as_share_error(err)
+            return
+        for spec in specs:
+            await self._mount_by_state(mounter, spec, states.get(spec.name, ShareState.MISSING))
+
+    async def _mount_by_state(
+        self, mounter: ShareMounter, spec: NetworkShareSpec, state: ShareState
+    ) -> bool:
+        """
+        Mount a managed network share that its backend has missing or failed.
+
+        Records or clears the error of the share, and never raises. Returns whether it mounted.
+
+        :param mounter: The mounter of the backend of the share.
+        :param spec: The share.
+        :param state: What the backend has for the share.
+        """
+        if state == ShareState.CHANGED:
+            self._changed_shares.add(spec.name)
+            return False
+        self._changed_shares.discard(spec.name)
+        if state == ShareState.PRESENT:
+            self._share_errors.pop(spec.name, None)
+            return False
+        operation = mounter.reload if state == ShareState.FAILED else mounter.add
+        try:
+            await operation(spec, self._get_password(spec))
+        except Exception as err:
+            self.logger.warning("Unable to mount network share %s: %s", spec.name, err)
+            self._share_errors[spec.name] = _as_share_error(err)
+            return False
+        self._share_errors.pop(spec.name, None)
+        return True
+
+    def _request_remount(self, location: StorageLocation) -> None:
+        """
+        Start an attempt in the background to mount a managed share again, when one is due.
+
+        :param location: The location of the share, which is not available.
+        """
+        if (name := location.share_name) is None or name in self._changed_shares:
+            return
+        now = time.monotonic()
+        tried = self._remount_attempts.get(name)
+        if tried is not None and now - tried < REMOUNT_INTERVAL:
+            return
+        self._remount_attempts[name] = now
+        self.mass.create_task(
+            self._remount(name), task_id=f"{REMOUNT_TASK_ID}_{name}", eager_start=False
+        )
+
+    async def _remount(self, name: str) -> None:
+        """
+        Mount a managed share again when its backend has it missing or failed; never raises.
+
+        The backends are looked for again first when the backend of the share is not known.
+
+        :param name: The name of the share.
+        """
+        try:
+            async with self._shares_lock:
+                if (spec := self._get_shares().get(name)) is None or (
+                    mounter := await self._get_mounter(spec.backend)
+                ) is None:
+                    return
+                state = (await mounter.get_states([spec]))[name]
+                if await self._mount_by_state(mounter, spec, state) and not (
+                    await self._is_share_mounted(spec)
+                ):
+                    self._share_errors[name] = self._share_not_mounted(spec)
+            await self.refresh()
+        except Exception:
+            self.logger.exception("Failed to mount network share %s again", name)
+
+    async def _refresh_share_states(self) -> None:
+        """Note which managed shares had their mount changed into another share, changing nothing."""
+        if self._shares_lock.locked():
+            # a share command is at work: the states are known again when it is done
+            return
+        async with self._shares_lock:
+            shares = list(self._get_shares().values())
+            for backend, mounter in self._mounters.items():
+                if not (specs := [spec for spec in shares if spec.backend == backend]):
+                    continue
+                try:
+                    async with asyncio.timeout(SHARE_STATES_TIMEOUT):
+                        states = await mounter.get_states(specs)
+                except Exception as err:
+                    self.logger.debug(
+                        "Unable to check the network shares mounted by %s: %s", backend, err
+                    )
+                    continue
+                for spec in specs:
+                    if states.get(spec.name) == ShareState.CHANGED:
+                        self._changed_shares.add(spec.name)
+                    else:
+                        self._changed_shares.discard(spec.name)
+
+    async def _check_share(self, mounter: ShareMounter, spec: NetworkShareSpec) -> NetworkShareSpec:
+        """
+        Return the settings of a network share cleaned up, when a backend can mount them.
+
+        :param mounter: The mounter of the backend.
+        :param spec: The share with the settings as entered.
+        """
+        is_cifs = spec.share_type == ShareType.CIFS
+        share = spec.share.strip()
+        spec = replace(
+            spec,
+            server=spec.server.strip(),
+            # an export path compares the way the Supervisor stores it: /music/ is /music
+            share=share if is_cifs else str(PurePosixPath(share)),
+            username=((spec.username or "").strip() or None) if is_cifs else None,
+            version=spec.version or None,
+        )
+        if (versions := mounter.supported_versions.get(spec.share_type)) is None:
+            msg = f"Network shares of type {spec.share_type} can not be mounted"
+            raise self._error(InvalidDataError, msg, "share_type_not_supported", spec.share_type)
+        if spec.version is not None and spec.version not in versions:
+            msg = f"Version {spec.version} of {spec.share_type} is not supported"
+            raise self._error(InvalidDataError, msg, "share_version_not_supported", spec.version)
+        # a comma would end up in the options of the mount command
+        if is_cifs and (not spec.share or any(char in spec.share for char in "/\\,")):
+            raise self._error(InvalidDataError, "Invalid share name", "share_name_invalid")
+        if spec.username is not None and "," in spec.username:
+            raise self._error(InvalidDataError, "Invalid user name", "share_username_invalid")
+        if not is_cifs and not (spec.share.startswith("/") and is_safe_path(spec.share)):
+            raise self._error(InvalidDataError, "Invalid export path", "export_path_invalid")
+        if not spec.server or not await get_ip_from_host(spec.server):
+            msg = f"Unable to resolve {spec.server}, make sure the address is resolvable."
+            raise self._error(InvalidDataError, msg, "host_unresolvable", spec.server)
+        return spec
+
+    async def _check_not_added(
+        self, mounter: ShareMounter, spec: NetworkShareSpec, shares: dict[str, NetworkShareSpec]
+    ) -> None:
+        """
+        Raise when a network share is a storage location already, other than the share itself.
+
+        :param mounter: The mounter of the backend of the share.
+        :param spec: The share.
+        :param shares: The managed shares, by name.
+        """
+        key = share_key(spec.share_type, spec.server, spec.share)
+        if any(
+            share_key(other.share_type, other.server, other.share) == key
+            for name, other in shares.items()
+            if name != spec.name
+        ):
+            msg = f"{spec.share} on {spec.server} already is a storage location"
+            raise self._error(InvalidDataError, msg, "share_already_added")
+        # a share mounted without Music Assistant, e.g. in Home Assistant, is a location as it is
+        path = await mounter.find_mount(spec.share_type, spec.server, spec.share)
+        if path is not None and path != spec.path:
+            msg = f"{spec.share} on {spec.server} is mounted at {path} already"
+            raise self._error(InvalidDataError, msg, "share_mounted_already", path)
+
+    def _check_credentials(self, spec: NetworkShareSpec, has_password: bool) -> None:
+        """
+        Raise when a user comes without a password.
+
+        :param spec: The share.
+        :param has_password: Whether there is a password for the user.
+        """
+        if spec.username is not None and not has_password:
+            msg = f"No password for user {spec.username}"
+            raise self._error(InvalidDataError, msg, "share_password_missing")
+
+    async def _check_not_changed(self, mounter: ShareMounter, spec: NetworkShareSpec) -> None:
+        """
+        Raise when the mount of a share was changed into another share outside Music Assistant.
+
+        Such a mount is left alone, and its location is not available.
+
+        :param mounter: The mounter of the backend of the share.
+        :param spec: The share as stored.
+        """
+        if (await mounter.get_states([spec]))[spec.name] != ShareState.CHANGED:
+            self._changed_shares.discard(spec.name)
+            return
+        self._changed_shares.add(spec.name)
+        await self.refresh()
+        raise self._share_changed(spec)
+
+    async def _is_share_mounted(self, spec: NetworkShareSpec) -> bool:
+        """
+        Return whether a network share is mounted, probing it, which wakes an automount trigger.
+
+        :param spec: The share.
+        """
+        answer = (await self._wait_for_probes([spec.path], fresh=True))[spec.path]
+        return (
+            answer is not None
+            and answer.is_dir
+            and await asyncio.to_thread(_is_mountpoint, spec.path)
+        )
+
+    async def _undo_mount(self, mounter: ShareMounter, spec: NetworkShareSpec) -> None:
+        """
+        Remove the mount of a new network share that did not mount, as far as possible.
+
+        :param mounter: The mounter of the backend of the share.
+        :param spec: The share.
+        """
+        try:
+            await mounter.remove(spec)
+        except Exception as err:
+            self.logger.warning(
+                "Unable to remove the mount of network share %s: %s", spec.name, err
+            )
+
+    async def _restore_share(
+        self,
+        operation: Callable[[NetworkShareSpec, str | None], Awaitable[None]],
+        spec: NetworkShareSpec,
+    ) -> None:
+        """
+        Mount a network share with its previous settings again, as far as possible.
+
+        The share only counts as restored once a fresh probe finds it mounted.
+
+        :param operation: The operation of the backend that mounts the share again.
+        :param spec: The share with its previous settings.
+        """
+        try:
+            await operation(spec, self._get_password(spec))
+            # the last probe of the path went to the settings that did not mount
+            if not await self._is_share_mounted(spec):
+                raise self._share_not_mounted(spec)
+        except Exception as err:
+            self.logger.warning(
+                "Unable to mount network share %s with its previous settings: %s", spec.name, err
+            )
+            self._share_errors[spec.name] = _as_share_error(err)
+        else:
+            self._share_errors.pop(spec.name, None)
+
+    def _get_shares(self) -> dict[str, NetworkShareSpec]:
+        """Return the network shares Music Assistant manages, by name."""
+        shares: dict[str, NetworkShareSpec] = {}
+        for name, record in self.mass.config.get(CONF_STORAGE_SHARES, {}).items():
+            try:
+                shares[name] = NetworkShareSpec.from_dict(record)
+            except LookupError, ValueError:
+                self.logger.debug("Skipping the unreadable network share %s", name)
+        return shares
+
+    def _get_share(self, name: str) -> NetworkShareSpec:
+        """
+        Return a network share Music Assistant manages.
+
+        :param name: The name of the share.
+        """
+        if (spec := self._get_shares().get(name)) is None:
+            msg = f"There is no network share named {name}"
+            raise self._error(InvalidDataError, msg, "share_not_found", name)
+        return spec
+
+    def _get_share_location(self, spec: NetworkShareSpec) -> StorageLocation:
+        """
+        Return the listed location of a managed network share.
+
+        :param spec: The share.
+        """
+        return next(loc for loc in self._locations if loc.path == spec.path)
+
+    def _get_password(self, spec: NetworkShareSpec) -> str | None:
+        """
+        Return the decrypted password of a network share.
+
+        :param spec: The share.
+        """
+        return self.mass.config.decrypt_string(spec.password) if spec.password else None
+
+    def _build_share_location(self, spec: NetworkShareSpec, table: str) -> StorageLocation:
+        """
+        Build the location of a managed network share from the mount on its path.
+
+        :param spec: The share.
+        :param table: The mount table of the server process, empty on a system without one.
+        """
+        share_mount = find_mount(table, spec.path, StorageKind.NETWORK_SHARE)
+        changed = spec.name in self._changed_shares
+        # the folder an unmounted share leaves behind is not the share, and a mount changed into
+        # another share is not this one; without a mount table (macOS) the probe decides
+        by_probe = not changed and (share_mount is not None or not table)
+        location = _build_location(
+            spec.path,
+            None,
+            StorageUsage.MEDIA,
+            StorageKind.NETWORK_SHARE,
+            self._get_answer(spec.path, _UNPROBED_FOLDER) if by_probe else None,
+            mount=share_mount,
+            managed=True,
+            probed=by_probe and self._has_answer(spec.path),
+        )
+        error: MusicAssistantError | None = None
+        if changed:
+            error = self._share_changed(spec)
+        elif not location.available:
+            # what the backend said, else what the probe found, else that it is not mounted
+            error = self._share_errors.get(spec.name)
+            if error is None and location.error is None:
+                msg = f"Network share {spec.name} is not available"
+                error = self._error(ActionUnavailable, msg, "share_unavailable")
+        if error is not None:
+            location.error = str(error)
+            location.error_key = error.translation_key
+            location.error_args = [str(arg) for arg in error.translation_args]
+        return replace(
+            location,
+            read_only=spec.read_only or location.read_only,
+            backend=spec.backend,
+            mountpoint=spec.path,
+            share_name=spec.name,
+            share_type=spec.share_type,
+            server=spec.server,
+            share=spec.share,
+            username=spec.username,
+            version=spec.version,
+        )
+
+    def _share_not_mounted(self, spec: NetworkShareSpec) -> SetupFailedError:
+        """
+        Return the error for a network share that is not mounted after it was mounted.
+
+        :param spec: The share.
+        """
+        msg = f"Network share {spec.name} did not mount"
+        return self._error(SetupFailedError, msg, "share_not_mounted")
+
+    def _share_changed(self, spec: NetworkShareSpec) -> ActionUnavailable:
+        """
+        Return the error for a network share whose mount was changed into another share.
+
+        :param spec: The share.
+        """
+        msg = f"Network share {spec.name} was changed in Home Assistant"
+        return self._error(ActionUnavailable, msg, "share_changed")
+
+    def _backend_unavailable(self, spec: NetworkShareSpec) -> ActionUnavailable:
+        """
+        Return the error for a network share whose mount backend is not available.
+
+        :param spec: The share.
+        """
+        msg = f"Network share {spec.name} can not be mounted: {spec.backend} is not available"
+        return self._error(ActionUnavailable, msg, "mount_backend_unavailable")
 
     def _path_not_allowed(self, path: str) -> InvalidDataError:
         """
@@ -598,7 +1477,7 @@ class StorageController(CoreController):
         """
         return self._error(ActionUnavailable, f"Can not read {path}", "folder_unreadable", path)
 
-    def _error[ErrorT: (ActionUnavailable, InvalidDataError)](
+    def _error[ErrorT: (ActionUnavailable, InvalidDataError, SetupFailedError)](
         self, error: type[ErrorT], msg: str, translation_key: str, *args: str
     ) -> ErrorT:
         """
@@ -683,8 +1562,8 @@ def _probe_path(path: str) -> _ProbeResult | None:
         return None
     return _ProbeResult(
         is_dir=is_dir,
-        free_space_gb=round(fs_stats.f_bavail * fs_stats.f_frsize / BYTES_PER_GB, 2),
-        total_space_gb=round(fs_stats.f_blocks * fs_stats.f_frsize / BYTES_PER_GB, 2),
+        free_space_gb=round(fs_stats.f_bavail * fs_stats.f_frsize / BYTES_PER_GB, SIZE_DECIMALS),
+        total_space_gb=round(fs_stats.f_blocks * fs_stats.f_frsize / BYTES_PER_GB, SIZE_DECIMALS),
         real_path=os.path.realpath(path),
     )
 
@@ -705,12 +1584,26 @@ def _build_location(
     mount: MediaMount | None = None,
     managed: bool = False,
     used_space_gb: float | None = None,
+    probed: bool = False,
 ) -> StorageLocation:
-    """Build a storage location from the latest probe of its path and the mount on it."""
+    """
+    Build a storage location from the latest probe of its path and the mount on it.
+
+    A location that is not available says why only once a probe of its path answered or did
+    not answer in time (probed).
+    """
     # a share still behind its automount trigger did not mount
     available = (
         result is not None and result.is_dir and (mount is None or mount.fstype != AUTOMOUNT_FSTYPE)
     )
+    error: str | None = None
+    error_key: str | None = None
+    if probed and not available:
+        if result is not None and not result.is_dir:
+            error, error_key = "The folder does not exist", "folder_missing"
+        else:
+            # the probe did not answer, or did not wake the share behind an automount trigger
+            error, error_key = "The storage does not respond", "storage_not_responding"
     return StorageLocation(
         path=path,
         name=name or Path(path).name or path,
@@ -724,16 +1617,95 @@ def _build_location(
         free_space_gb=result.free_space_gb if available and result is not None else None,
         total_space_gb=result.total_space_gb if available and result is not None else None,
         used_space_gb=used_space_gb,
+        error=error,
+        error_key=error_key,
+    )
+
+
+def _build_unmounted_location(path: str) -> StorageLocation:
+    """Build the location of a registered folder whose drive or share is not mounted."""
+    # without a probe answer: the space on the path is that of the disk below the mountpoint
+    location = _build_location(
+        path, None, StorageUsage.MEDIA, StorageKind.MANUAL, None, managed=True
+    )
+    return replace(
+        location,
+        mountpoint=path,
+        error="The drive or share of this folder is not mounted",
+        error_key="folder_not_mounted",
+    )
+
+
+def _sources_using(path: str, sources: list[tuple[str, str]]) -> list[str]:
+    """
+    Return the sorted names of the music sources that read from a path or a folder inside it.
+
+    :param path: The path of a location.
+    :param sources: The name and folder of each music source.
+    """
+    return sorted((name for name, folder in sources if is_within(folder, path)), key=str.casefold)
+
+
+def _sources_around(path: str, sources: list[tuple[str, str]]) -> list[str]:
+    """
+    Return the sorted names of the music sources whose folder contains a path, not being it.
+
+    :param path: The path of a location.
+    :param sources: The name and folder of each music source.
+    """
+    return sorted(
+        (
+            name
+            for name, folder in sources
+            if is_within(path, folder) and not is_within(folder, path)
+        ),
+        key=str.casefold,
     )
 
 
 def _is_available(path: str, mountpoint: str | None) -> bool:
     """Return whether a folder is there, and its mount when it has one (blocking)."""
-    # the mount table rather than os.path.ismount, which misses a bind mount of a folder on the
-    # filesystem it is mounted on
-    if mountpoint is not None and mountpoint not in parse_mountpoints(read_mountinfo()):
+    if mountpoint is not None and not _is_mountpoint(mountpoint):
         return False
     return Path(path).is_dir()
+
+
+def _is_mountpoint(path: str) -> bool:
+    """Return whether a filesystem is mounted on a path (blocking)."""
+    return is_mounted(path, read_mountinfo())
+
+
+def _without_private_details(location: StorageLocation) -> StorageLocation:
+    """
+    Return a location as a caller that does not manage every music source may see it.
+
+    Without the music sources that use or read it, and without the connection details of a
+    managed network share.
+    """
+    location = replace(location, used_by=[], read_by=[])
+    if location.share_name is None:
+        return location
+    # the error of a mount can name the server and the export
+    has_error = location.error is not None
+    return replace(
+        location,
+        share_name=None,
+        server=None,
+        share=None,
+        username=None,
+        version=None,
+        error="The network share is not available right now" if has_error else None,
+        error_key="share_unavailable" if has_error else None,
+        error_args=[],
+    )
+
+
+def _as_share_error(err: Exception) -> MusicAssistantError:
+    """Return the error to show on a network share that could not be mounted."""
+    if isinstance(err, MusicAssistantError):
+        return err
+    msg = str(err) or type(err).__name__
+    return SetupFailedError(msg, translation_key="mount_failed", translation_args=[msg])
 
 
 def _resolve_within(path: str, roots: list[str]) -> str | None:

@@ -99,6 +99,8 @@ async def test_never_probed_locations(
         storage.mass.cache_path: True,
     }
     assert all(loc.free_space_gb is None for loc in storage.get_locations())
+    # an error says what a probe found
+    assert all(loc.error is None and loc.error_key is None for loc in storage.get_locations())
     assert probes.calls == []
 
 
@@ -262,6 +264,35 @@ async def test_overdue_probe_is_not_waited_for_again(
 
 
 @pytest.mark.usefixtures("short_probe_timeout")
+async def test_location_that_does_not_respond_says_so(
+    storage: StorageController, mount_table: MountTable, probes: FakeProbes
+) -> None:
+    """A mount or registered folder whose probe does not answer in time says so, until it does."""
+    mount_table.set(mount_line(DEAD_SHARE, "nfs4"), mount_line("/mnt/music", "ext4"))
+    storage.mass.config.set(CONF_STORAGE_FOLDERS, ["/srv/dead"])
+    probes.block(DEAD_SHARE)
+    probes.block("/srv/dead")
+
+    await storage.get_info()
+
+    for path in (DEAD_SHARE, "/srv/dead"):
+        location = _location(storage, path)
+        assert (location.available, location.error_key) == (False, "storage_not_responding")
+        assert location.error is not None
+    assert _location(storage, "/mnt/music").error is None
+
+    probes.release()
+
+    await wait_until(
+        lambda: (
+            _location(storage, DEAD_SHARE).available and _location(storage, "/srv/dead").available
+        )
+    )
+    for path in (DEAD_SHARE, "/srv/dead"):
+        assert (_location(storage, path).error, _location(storage, path).error_key) == (None, None)
+
+
+@pytest.mark.usefixtures("short_probe_timeout")
 async def test_late_answer_is_applied(
     storage: StorageController, mount_table: MountTable, probes: FakeProbes
 ) -> None:
@@ -363,6 +394,7 @@ async def test_trigger_that_does_not_mount_is_unavailable(
 
     location = _location(storage, "/media/archive")
     assert (location.fstype, location.available, location.free_space_gb) == ("autofs", False, None)
+    assert location.error_key == "storage_not_responding"
 
 
 def test_probe_of_a_folder(tmp_path: Path) -> None:
@@ -400,3 +432,63 @@ def test_probe_asks_the_filesystem_for_its_space_first(
 
     assert _probe_path(str(tmp_path)) is None
     assert asked == [str(tmp_path)]
+
+
+async def test_waiter_of_a_replaced_probe_changes_nothing(
+    storage: StorageController,
+    mount_table: MountTable,
+    probes: FakeProbes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The caller of a probe that a fresh one replaced does not mark the path as not answering.
+
+    The old probe hangs, a fresh one answers, then the old caller gives up: the location stays
+    available, is probed again once its answer is outdated, and the late answer of the old
+    probe is dropped.
+    """
+    monkeypatch.setattr(controller_module, "PROBE_TIMEOUT", 0.3)
+    mount_table.set(mount_line(NAS, "cifs"))
+    await storage.refresh()
+    probes.block(NAS)
+    old_waiter = storage.mass.create_task(storage._wait_for_probes([NAS]))
+    await wait_until(lambda: NAS in probes.calls)
+    old_probe = storage._probes[NAS].probe
+    assert old_probe is not None
+    gate = probes.blocked.pop(NAS)
+
+    try:
+        assert await storage._wait_for_probes([NAS], fresh=True) == {NAS: FOLDER}
+        assert await old_waiter == {NAS: None}
+    finally:
+        # the old probe fails in the end, about what was mounted before
+        probes.results[NAS] = None
+        gate.set()
+
+    await wait_until(old_probe.done)
+    await storage.refresh()
+    assert not storage._probes[NAS].overdue
+    assert _location(storage, NAS).available
+    assert _location(storage, NAS).free_space_gb == FOLDER.free_space_gb
+    storage._probes[NAS].answered_at = time.monotonic() - PROBE_MAX_AGE - 1
+    probes.calls.clear()
+    probes.results.pop(NAS)
+    await storage.get_info()
+    assert NAS in probes.calls
+    assert _location(storage, NAS).available
+
+
+@pytest.mark.usefixtures("short_probe_timeout")
+async def test_fresh_probe_that_hangs_is_overdue(
+    storage: StorageController, mount_table: MountTable, probes: FakeProbes
+) -> None:
+    """The caller of the current probe still marks a path that does not answer."""
+    mount_table.set(mount_line(NAS, "cifs"))
+    await storage.refresh()
+    probes.block(NAS)
+
+    assert await storage._wait_for_probes([NAS], fresh=True) == {NAS: None}
+
+    assert storage._probes[NAS].overdue
+    await storage.refresh()
+    assert not _location(storage, NAS).available

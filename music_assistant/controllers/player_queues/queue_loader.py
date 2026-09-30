@@ -25,6 +25,8 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
     PlayerUnavailableError,
+    ResourceTemporarilyUnavailable,
+    RetriesExhausted,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -339,8 +341,16 @@ class QueueLoaderMixin(_PlayerQueuesBase):
             ):
                 # Youtube Music has poor thumbs by default, so we always fetch the full item
                 # this also catches the case where they have an unavailable item in a listing
-                fetched_item = await self.mass.music.get_item_by_uri(queue_item.uri)
-                queue_item.media_item = cast("Track", fetched_item)
+                try:
+                    fetched_item = await self.mass.music.get_item_by_uri(queue_item.uri)
+                except (ResourceTemporarilyUnavailable, RetriesExhausted) as err:
+                    self.logger.warning(
+                        "Could not fetch full details of %s, playing it as listed: %s",
+                        queue_item.uri,
+                        err,
+                    )
+                else:
+                    queue_item.media_item = cast("Track", fetched_item)
 
             # ensure we got the full (original) album set
             if album and (
@@ -383,7 +393,7 @@ class QueueLoaderMixin(_PlayerQueuesBase):
         # pre-initialize the AudioBuffer so audio is ready
         # when the player requests it. For the current/first track this ensures
         # immediate playback start. For preloaded next tracks we skip this and
-        # initialize the buffer ~30s before the current track ends instead.
+        # initialize the buffer when the stream of the track before it nears its end.
         # AudioSource items are realtime/live and bypass the AudioBuffer.
         if is_start and queue_item.streamdetails.media_type != MediaType.AUDIO_SOURCE:
             await self.mass.streams.audio.get_audio_buffer(

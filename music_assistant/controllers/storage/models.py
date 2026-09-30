@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
-from mashumaro import DataClassDictMixin
+from mashumaro import DataClassDictMixin, field_options
+from music_assistant_models.translations import resolve_translation
+
+from music_assistant.controllers.storage.constants import TRANSLATION_OWNER
 
 
 class StorageUsage(StrEnum):
@@ -65,7 +69,35 @@ class StorageLocation(DataClassDictMixin):
     free_space_gb: float | None = None
     total_space_gb: float | None = None
     used_space_gb: float | None = None
+    # in English; an API result carries it in the language of the client
     error: str | None = None
+    # the translation of the error in the strings of the storage controller, never sent itself
+    error_key: str | None = field(
+        default=None, metadata=field_options(serialize="omit"), repr=False
+    )
+    error_args: list[str] = field(
+        default_factory=list, metadata=field_options(serialize="omit"), repr=False
+    )
+    # the names of the enabled music sources, loaded or not, that read their files from this
+    # location or a folder inside it, also inside a nested location; a location in use can not
+    # be removed
+    used_by: list[str] = field(default_factory=list)
+    # the names of the enabled music sources, loaded or not, whose folder contains this media
+    # location, so they read its files as part of their own folder; they do not keep the
+    # location from being removed
+    read_by: list[str] = field(default_factory=list)
+
+    def __post_serialize__(self, d: dict[str, Any]) -> dict[str, Any]:
+        """Localize the error when a resolver for the language of the client is active."""
+        if self.error_key:
+            localized = resolve_translation(
+                f"errors.{self.error_key}",
+                owner=TRANSLATION_OWNER,
+                params=self.error_args or None,
+            )
+            if localized is not None:
+                d["error"] = localized
+        return d
 
 
 @dataclass
@@ -80,3 +112,22 @@ class StorageInfo(DataClassDictMixin):
     # the version can not be chosen
     supported_share_versions: dict[ShareType, list[str]]
     can_add_local_folder: bool
+
+
+@dataclass
+class NetworkShareSpec(DataClassDictMixin):
+    """A network share Music Assistant mounts, as stored in the settings (never sent as is)."""
+
+    name: str
+    share_type: ShareType
+    server: str
+    # the share name of a cifs share, the export path of an nfs share
+    share: str
+    # what mounted the share and where, fixed when the share was added
+    backend: MountBackend
+    path: str
+    username: str | None = None
+    # encrypted with the encryption key of the settings
+    password: str | None = None
+    version: str | None = None
+    read_only: bool = False

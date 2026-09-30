@@ -65,6 +65,16 @@ def _player(
     player._send_artist_artwork = AsyncMock()
     player._clear_current_media_metadata = AsyncMock()
     player._compute_track_progress_ms = Mock(return_value=10_000)
+    # Upstream's generation guard + metadata builder: run the real builder, own the snapshot.
+    player._content_takeover_pending = False
+    player._metadata_generation = 0
+    player._metadata_publish_allowed = Mock(return_value=True)
+    player._metadata_lock = asyncio.Lock()
+    player._controller_role = None
+    player._publish_repeat_shuffle = Mock()
+    player._build_current_media_metadata = lambda *args, **kwargs: (
+        SendspinPlayer._build_current_media_metadata(player, *args, **kwargs)
+    )
     metadata_role = Mock()
     player._metadata_role = metadata_role
     return player, metadata_role

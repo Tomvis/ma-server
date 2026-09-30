@@ -56,6 +56,8 @@ LOCATION_FIELDS = [
     "total_space_gb",
     "used_space_gb",
     "error",
+    "used_by",
+    "read_by",
 ]
 
 
@@ -115,6 +117,7 @@ async def test_info_for_an_admin(storage: StorageController) -> None:
         storage.mass.cache_path,
     ]
     assert all(loc.available for loc in info.locations)
+    assert all(loc.error is None and loc.error_key is None for loc in info.locations)
     assert not info.can_mount_shares
     assert info.mount_backend is None
     assert info.supported_share_types == []
@@ -170,6 +173,8 @@ def test_info_serializes_to_the_contract() -> None:
     assert data["locations"][0]["kind"] == "network_share"
     assert data["locations"][0]["usage"] == "media"
     assert data["locations"][0]["backend"] is None
+    assert data["locations"][0]["used_by"] == []
+    assert data["locations"][0]["read_by"] == []
 
 
 def test_location_for_path_is_the_most_specific(storage: StorageController) -> None:
@@ -262,11 +267,11 @@ async def test_folder_without_a_mount_only_needs_to_exist(
     (tmp_path / "registered" / "music").mkdir(parents=True)
     set_locations(storage, make_location(tmp_path / "registered", kind=StorageKind.MANUAL))
 
-    with patch.object(controller_module, "parse_mountpoints") as parse_mountpoints:
+    with patch.object(controller_module, "is_mounted") as is_mounted:
         assert await storage.is_available(str(tmp_path / "registered" / "music"))
         assert await storage.is_available(str(tmp_path))
         assert not await storage.is_available(str(tmp_path / "gone"))
-    parse_mountpoints.assert_not_called()
+    is_mounted.assert_not_called()
 
 
 async def test_refresh_builds_the_locations(
@@ -374,7 +379,7 @@ async def test_directory_sizes_land_on_the_server_rows(storage: StorageControlle
         make_location(storage.mass.storage_path, usage=StorageUsage.DATA),
         make_location(storage.mass.cache_path, usage=StorageUsage.CACHE),
     ]
-    sizes = {storage.mass.storage_path: 12.3456, storage.mass.cache_path: 3.1}
+    sizes = {storage.mass.storage_path: 12.345678, storage.mass.cache_path: 3.1}
 
     with patch.object(
         controller_module,
@@ -383,7 +388,16 @@ async def test_directory_sizes_land_on_the_server_rows(storage: StorageControlle
     ):
         await storage._update_dir_sizes()
 
-    assert [loc.used_space_gb for loc in storage.get_locations()] == [None, 12.35, 3.1]
+    assert [loc.used_space_gb for loc in storage.get_locations()] == [None, 12.3457, 3.1]
+
+
+async def test_a_few_megabytes_do_not_read_as_zero(storage: StorageController) -> None:
+    """A data folder of a few megabytes has a used space above zero."""
+    (Path(storage.mass.storage_path) / "library.db").write_bytes(b"\0" * 3 * 1024 * 1024)
+
+    await storage._update_dir_sizes()
+
+    assert storage._dir_sizes[StorageUsage.DATA] > 0
 
 
 @pytest.mark.parametrize(("cache_inside_data", "excluded"), [(True, True), (False, False)])

@@ -11,6 +11,7 @@ trigger (``autofs``) on its mountpoint, and the real mount is listed on top of i
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -57,8 +58,8 @@ NETWORK_FSTYPES: Final[frozenset[str]] = frozenset({"cifs", "smb3", "nfs", "nfs4
 REMOVABLE_FSTYPES: Final[frozenset[str]] = frozenset(
     {"vfat", "exfat", "ntfs", "ntfs3", "hfsplus", "iso9660", "udf"}
 )
-# system paths never hold a media location; /tmp is where the SMB and NFS music sources mount
-# their share for their own use
+# system paths never hold a media location; /tmp holds the network shares the server mounts
+# itself, which are listed as managed shares
 SYSTEM_PATHS: Final[tuple[str, ...]] = (
     "/proc",
     "/sys",
@@ -148,6 +149,41 @@ def parse_mountpoints(text: str) -> set[str]:
         for mountpoint, (fstype, _read_only) in _parse_table(text).items()
         if fstype != AUTOMOUNT_FSTYPE
     }
+
+
+def find_mount(text: str, mountpoint: str, kind: StorageKind) -> MediaMount | None:
+    """
+    Return the mount on a mountpoint, None when nothing is mounted there.
+
+    Unlike discovery this also finds a mount below a system path such as /tmp, and a mount of
+    any filesystem type. A mount that is only behind its dormant automount trigger is returned
+    with fstype autofs.
+
+    :param text: Contents of a mountinfo file.
+    :param mountpoint: Where the filesystem is mounted.
+    :param kind: Where the location on the mount comes from.
+    """
+    if (mount := _parse_table(text).get(mountpoint)) is None:
+        return None
+    fstype, read_only = mount
+    return MediaMount(mountpoint, fstype, read_only, kind)
+
+
+def is_mounted(path: str, text: str) -> bool:
+    """
+    Return whether a filesystem is mounted on a path (blocking).
+
+    Goes by the mount table where the system has one. Without one (macOS) the path must be a
+    mountpoint by itself.
+
+    :param path: The path to check.
+    :param text: Contents of a mountinfo file, empty on a system without one.
+    """
+    # the mount table rather than os.path.ismount, which misses a bind mount of a folder on the
+    # filesystem it is mounted on
+    if text:
+        return path in parse_mountpoints(text)
+    return os.path.ismount(path)
 
 
 def read_mountinfo() -> str:
