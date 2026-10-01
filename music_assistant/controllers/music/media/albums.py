@@ -119,6 +119,12 @@ _ALBUM_TRACK_LOOKUP_ERRORS = (
     TimeoutError,
     aiohttp.ClientError,
 )
+# what costs one provider its album listing without failing the album itself
+_SKIPPED_ALBUM_LISTING_ERRORS: tuple[type[Exception], ...] = (
+    MusicAssistantError,
+    *PROVIDER_FETCH_ERRORS,
+    *_ALBUM_TRACK_LOOKUP_ERRORS,
+)
 
 # how many seconds the duration of one and the same track may differ between sources
 _TRACK_DURATION_TOLERANCE = 8
@@ -1724,7 +1730,7 @@ class AlbumsController(MediaControllerBase[Album]):
         except LoginFailed:
             # an account problem is the user's to fix, not a listing to skip
             raise
-        except (MusicAssistantError, *PROVIDER_FETCH_ERRORS, *_ALBUM_TRACK_LOOKUP_ERRORS) as err:
+        except _SKIPPED_ALBUM_LISTING_ERRORS as err:
             # a mapping outlives what it points at: a subsonic server reissues its
             # ids on a rescan, a streaming release is delisted. losing that one
             # provider's listing is the whole cost -- raising here instead fails
