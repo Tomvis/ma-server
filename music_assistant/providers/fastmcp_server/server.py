@@ -271,6 +271,9 @@ class MCPServerRuntime:
         register_resources(mcp, self._mass, self._config)
         register_prompts(mcp, self._config)
 
+        from .user_context import CurrentUserMiddleware  # noqa: PLC0415
+
+        mcp.add_middleware(CurrentUserMiddleware(self._mass))
         self._apply_tag_filter(mcp, enabled_tags(self._config))
         self._register_meta_discovery(mcp)
 
