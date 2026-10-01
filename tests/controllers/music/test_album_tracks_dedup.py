@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from music_assistant_models.enums import AlbumType
 from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.helpers import set_global_cache_values
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -157,6 +158,8 @@ async def test_genuine_extra_track_is_still_listed(mass: MusicAssistant) -> None
 async def test_dead_mapping_does_not_fail_the_whole_listing(mass: MusicAssistant) -> None:
     """A mapping pointing at a gone album costs its own listing, not the album."""
     db_album = await _seed_album(mass)
+    # the library copies must be playable, or the dead mapping's error is all there is
+    await set_global_cache_values({"available_providers": {"prov_a_inst", "prov_b_inst"}})
     with _patch_provider_tracks(MediaNotFoundError("Album album_b not found")):
         tracks = await mass.music.albums.tracks(db_album.item_id, "library")
     assert [track.name for track in tracks] == LIBRARY_TITLES
