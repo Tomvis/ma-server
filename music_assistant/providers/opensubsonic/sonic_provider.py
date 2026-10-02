@@ -25,6 +25,7 @@ from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType, StreamType
 from music_assistant_models.errors import (
     ActionUnavailable,
+    InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
     ProviderPermissionDenied,
@@ -106,13 +107,17 @@ CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
 CACHE_CATEGORY_CRITICAL_RECEPTION = 3
 
-# Upper bound on how many bytes to download from a track when extracting custom
-# AMG/TPS/DR tags. Tag headers (ID3v2 / Vorbis comments / MP4 'moov') live near the
-# start of the file. FLAC is trimmed earlier — as soon as its VORBIS_COMMENT block
-# is buffered (see _flac_tag_prefix) — so a large embedded cover-art PICTURE block
-# can't push the metadata past this cap; the cap only bounds the fallback path
-# (non-FLAC, or FLAC whose comment block never completes within the limit).
+# Raw prefix kept when extracting custom AMG/TPS/DR tags from a format the tag-prefix
+# reader doesn't walk (MP4 'moov' and the like sit near the start of the file).
+# ID3v2-tagged and FLAC files are walked instead (see _TagPrefixReader), so a large
+# embedded cover image can't push their tags past this cap.
 CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
+# Audio kept after a leading ID3v2 tag: ffprobe needs a few MPEG frames to accept it.
+_CR_PROBE_AUDIO_TAIL_BYTES = 128 * 1024
+# Largest leading ID3v2 tag kept in memory; bigger tags fall back to the raw prefix.
+_CR_PROBE_MAX_ID3_BYTES = 16 * 1024 * 1024
+# Total bytes read per probe, including cover art read past and not kept.
+_CR_PROBE_MAX_READ_BYTES = 32 * 1024 * 1024
 # CR/DR tags are written to the file once by the offline tagger and rarely change, so
 # the extraction result is cached for a month rather than a day: at 24h every album in
 # the library expired and re-probed itself daily (a 5000-album library paid 5000 probes
@@ -121,6 +126,10 @@ CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
 # entry because it is stored non-persistent, and the cache controller's "clear cache"
 # action drops it outright.
 CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
+# An album whose sampled files ffprobe cannot read fails the same way on every sync, and
+# the Navidrome sync plugin starts a sync after every scan; a short negative entry stops
+# it re-streaming those files all day (MUSIC-20) while still retrying after a retag.
+_CR_UNPARSEABLE_CACHE_TTL = 86400
 # How many tracks to ffprobe before giving up. A first track that's a bonus /
 # hidden track may have been written without the album's AMG/TPS/DR tags even
 # when later tracks carry them; sampling a few covers this without blowing up
@@ -146,48 +155,140 @@ Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
 
 
-def _flac_tag_prefix(data: bytes | bytearray) -> bytes | None:
+class _Unparseable:
+    """A probe whose file ffprobe rejects outright, as opposed to a stream error."""
+
+
+_PROBE_UNPARSEABLE = _Unparseable()
+
+
+class _TagPrefixReader:
     """
-    Build a minimal, valid FLAC from a (possibly truncated) FLAC byte prefix.
+    Collect the smallest prefix of a streamed audio file that still carries its tags.
 
-    A FLAC stream is the ``fLaC`` marker, a chain of metadata blocks (STREAMINFO,
-    VORBIS_COMMENT, PICTURE, ...), then audio frames. The custom DR/AMG/TPS tags
-    live in VORBIS_COMMENT, which the tag writer places right after STREAMINFO —
-    before the often multi-megabyte embedded cover-art PICTURE block. ffprobe only
-    reports tags once it has walked the whole metadata chain, so a prefix that
-    stops inside a large PICTURE block is rejected wholesale and the tags are lost
-    even though they sit near the start of the file.
-
-    This returns STREAMINFO plus the blocks up to and including VORBIS_COMMENT,
-    with the last-metadata-block flag forced on the kept VORBIS_COMMENT header, so
-    the result parses from a few kilobytes regardless of cover-art size.
-
-    :param data: A prefix of a FLAC file (need not be complete).
-    :return: The trimmed FLAC bytes, or ``None`` when ``data`` isn't FLAC or its
-        VORBIS_COMMENT block isn't yet fully present (caller keeps buffering or
-        falls back to probing the raw prefix).
+    A leading ID3v2 tag is kept whole, followed by a little audio. FLAC metadata is cut
+    down to STREAMINFO plus VORBIS_COMMENT, read past any cover art or padding without
+    keeping it, so the custom tags parse from a few kilobytes wherever the PICTURE block
+    sits. Anything else keeps a raw prefix of CRITICAL_RECEPTION_PROBE_BYTES.
     """
-    if len(data) < 4 or data[:4] != b"fLaC":
-        return None
-    pos = 4
-    size = len(data)
-    while pos + 4 <= size:
-        header = data[pos]
+
+    def __init__(self) -> None:
+        """Start an empty prefix."""
+        self._pending = bytearray()
+        self._out = bytearray()
+        self._phase = "start"
+        self._skip = 0
+        self._read = 0
+        self._id3_size = 0
+        self._tail_start = 0
+        self._last_kept_header: int | None = None
+
+    def feed(self, chunk: bytes) -> bool:
+        """
+        Add the next chunk of the stream.
+
+        :param chunk: Bytes as they arrive from the stream.
+        :return: True once the prefix is complete and reading can stop.
+        """
+        self._pending += chunk
+        self._read += len(chunk)
+        steps = {
+            "start": self._step_start,
+            "id3": self._step_id3,
+            "flac": self._step_flac,
+            "tail": self._step_tail,
+        }
+        while True:
+            if self._skip:
+                dropped = min(self._skip, len(self._pending))
+                del self._pending[:dropped]
+                self._skip -= dropped
+            if self._phase == "done":
+                return True
+            if self._phase == "raw":
+                return len(self._pending) >= CRITICAL_RECEPTION_PROBE_BYTES
+            if self._skip or not steps[self._phase]():
+                return self._read >= _CR_PROBE_MAX_READ_BYTES
+
+    def result(self) -> bytes:
+        """Return the prefix collected so far."""
+        if self._phase in ("start", "raw"):
+            return bytes(self._pending[:CRITICAL_RECEPTION_PROBE_BYTES])
+        if self._phase == "id3":
+            return bytes(self._pending)
+        return bytes(self._out)
+
+    def _step_start(self) -> bool:
+        pending = self._pending
+        if len(pending) < 10:
+            return False
+        if pending[:3] == b"ID3":
+            # synchsafe size: 7 bits per byte, plus the 10-byte header (and footer)
+            size = 10 + sum((pending[6 + i] & 0x7F) << (7 * (3 - i)) for i in range(4))
+            if pending[5] & 0x10:
+                size += 10
+            if size > _CR_PROBE_MAX_ID3_BYTES:
+                self._phase = "raw"
+            else:
+                self._id3_size = size
+                self._phase = "id3"
+        elif pending[:4] == b"fLaC":
+            self._start_flac()
+        else:
+            self._phase = "raw"
+        return True
+
+    def _step_id3(self) -> bool:
+        pending = self._pending
+        size = self._id3_size
+        if len(pending) < size + 4:
+            return False
+        if pending[size : size + 4] == b"fLaC":
+            # FLAC keeps its tags in VORBIS_COMMENT; the stray ID3 tag adds nothing
+            del pending[:size]
+            self._start_flac()
+        else:
+            self._out += pending[:size]
+            del pending[:size]
+            self._tail_start = len(self._out)
+            self._phase = "tail"
+        return True
+
+    def _step_flac(self) -> bool:
+        pending = self._pending
+        if len(pending) < 4:
+            return False
+        header = pending[0]
         block_type = header & 0x7F
-        block_end = pos + 4 + int.from_bytes(data[pos + 1 : pos + 4], "big")
-        if block_end > size:
-            # The block runs past what we have buffered. A VORBIS_COMMENT this deep
-            # isn't usable yet; any other block means the comment (if present) would
-            # already have appeared earlier, so there's nothing to salvage.
-            return None
-        if block_type == 4:  # VORBIS_COMMENT
-            trimmed = bytearray(data[:block_end])
-            trimmed[pos] = 0x80 | block_type  # force last-metadata-block flag
-            return bytes(trimmed)
-        if header & 0x80:  # last metadata block reached, no VORBIS_COMMENT present
-            return None
-        pos = block_end
-    return None
+        length = int.from_bytes(pending[1:4], "big")
+        if block_type in (0, 4):  # STREAMINFO, VORBIS_COMMENT
+            if len(pending) < 4 + length:
+                return False
+            self._last_kept_header = len(self._out)
+            self._out += pending[: 4 + length]
+            del pending[: 4 + length]
+        else:
+            del pending[:4]
+            self._skip = length
+        if block_type == 4 or header & 0x80:
+            if self._last_kept_header is not None:
+                self._out[self._last_kept_header] |= 0x80  # last-metadata-block flag
+            self._phase = "done"
+        return True
+
+    def _step_tail(self) -> bool:
+        self._out += self._pending
+        self._pending.clear()
+        if len(self._out) - self._tail_start < _CR_PROBE_AUDIO_TAIL_BYTES:
+            return False
+        del self._out[self._tail_start + _CR_PROBE_AUDIO_TAIL_BYTES :]
+        self._phase = "done"
+        return True
+
+    def _start_flac(self) -> None:
+        self._out += b"fLaC"
+        del self._pending[:4]
+        self._phase = "flac"
 
 
 class OpenSonicProvider(MusicProvider):
@@ -1328,11 +1429,15 @@ class OpenSonicProvider(MusicProvider):
         # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
         # a transient failure returns bare None and is skipped below.
         probed_clean = False
+        unparseable = False
         started_at = asyncio.get_running_loop().time()
         try:
             async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
                 for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
                     probe = await self._extract_critical_reception_from_song(sonic_song.id)
+                    if isinstance(probe, _Unparseable):
+                        unparseable = True
+                        continue
                     if probe is None:
                         continue
                     probed_clean = True
@@ -1369,6 +1474,15 @@ class OpenSonicProvider(MusicProvider):
                 )
             return cr, album_dr
         if not probed_clean:
+            if unparseable:
+                await self.mass.cache.set(
+                    key=cache_key,
+                    data={"cr": None, "dr": None},
+                    provider=self.instance_id,
+                    category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+                    expiration=_CR_UNPARSEABLE_CACHE_TTL,
+                )
+                return None, None
             # Every probe attempt errored transiently (stream/ffprobe failure) rather
             # than cleanly finding no tags. Don't pin a month-long negative cache — mirror
             # the "fetch failed" path above so the next sync re-probes once it recovers.
@@ -1400,7 +1514,7 @@ class OpenSonicProvider(MusicProvider):
 
     async def _extract_critical_reception_from_song(
         self, song_id: str
-    ) -> tuple[CriticalReception | None, float | None] | None:
+    ) -> tuple[CriticalReception | None, float | None] | _Unparseable | None:
         """
         Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
 
@@ -1427,30 +1541,13 @@ class OpenSonicProvider(MusicProvider):
             async with resp:
                 tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
                 os.close(tmp_fd)
-                # Accumulate the prefix in memory (≤ CRITICAL_RECEPTION_PROBE_BYTES
-                # resident), then persist it in a single executor hop below.
-                buf = bytearray()
-                probe_bytes: bytes | None = None
+                # Collect the tag-bearing prefix in memory, then persist it in a
+                # single executor hop below.
+                reader = _TagPrefixReader()
                 async for chunk in resp.content.iter_chunked(64 * 1024):
-                    if not chunk:
+                    if not chunk or reader.feed(chunk):
                         break
-                    remaining = CRITICAL_RECEPTION_PROBE_BYTES - len(buf)
-                    if remaining <= 0:
-                        break
-                    buf += chunk[:remaining] if len(chunk) > remaining else chunk
-                    # FLAC keeps its tags in a VORBIS_COMMENT block that the tag
-                    # writer places before the (often multi-MB) embedded cover art.
-                    # Trim to a minimal metadata-only FLAC as soon as that block is
-                    # complete: otherwise a large PICTURE block pushes the metadata
-                    # past the byte cap and ffprobe rejects the truncated file,
-                    # dropping tags that actually sit near the start.
-                    if (flac := _flac_tag_prefix(buf)) is not None:
-                        probe_bytes = flac
-                        break
-                    if len(buf) >= CRITICAL_RECEPTION_PROBE_BYTES:
-                        break
-            if probe_bytes is None:
-                probe_bytes = bytes(buf)
+            probe_bytes = reader.result()
             if not probe_bytes:
                 return None
             await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
@@ -1466,6 +1563,8 @@ class OpenSonicProvider(MusicProvider):
             # _CR_PROBE_ALBUM_BUDGET_SECONDS.
             try:
                 tags = await async_parse_tags(tmp_path)
+            except InvalidDataError:
+                return _PROBE_UNPARSEABLE
             except Exception:
                 return None
             return tags.critical_reception, tags.album_dynamic_range

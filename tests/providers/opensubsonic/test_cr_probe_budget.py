@@ -142,3 +142,27 @@ async def test_probe_raising_its_own_timeout_is_treated_as_transient(
     assert cr is partial_cr
     assert album_dr is None
     cache_set.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unparseable_album_cached_briefly(
+    provider: OpenSonicProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Files ffprobe cannot read are a short negative, not a re-probe every sync."""
+    monkeypatch.setattr(sonic_provider, "_CR_PROBE_ALBUM_BUDGET_SECONDS", 30.0)
+    _, cache_set = _stub_cache(provider)
+
+    async def _probe(_song_id: str) -> sonic_provider._Unparseable:
+        return sonic_provider._PROBE_UNPARSEABLE
+
+    provider._extract_critical_reception_from_song = AsyncMock(side_effect=_probe)  # type: ignore[method-assign]
+
+    result = await provider._get_album_critical_reception(
+        "album-1", _sonic_album("song-1", "song-2")
+    )
+
+    assert result == (None, None)
+    cache_set.assert_awaited_once()
+    stored = cache_set.await_args_list[0].kwargs
+    assert stored["data"] == {"cr": None, "dr": None}
+    assert stored["expiration"] == sonic_provider._CR_UNPARSEABLE_CACHE_TTL
