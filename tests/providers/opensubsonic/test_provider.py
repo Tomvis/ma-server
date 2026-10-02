@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 from datetime import datetime
 from typing import Any
@@ -544,3 +545,63 @@ async def test_podcast_episodes_positioned_by_publish_date(provider: OpenSonicPr
     # the fixture lists newest-first, so the positions run the other way
     positions = {ep.item_id.split(EP_CHAN_SEP)[1]: ep.position for ep in episodes}
     assert positions == {"pe-4805": 5, "pe-1857": 4, "pe-1858": 3, "pe-1859": 2, "pe-1860": 1}
+
+
+# ---------------------------------------------------------------------------
+# lyrics cache
+# ---------------------------------------------------------------------------
+
+
+def _use_dict_cache(provider: OpenSonicProvider) -> list[asyncio.Future[Any]]:
+    """Back @use_cache with a JSON round-tripping dict, so hits behave like the real cache."""
+    tasks, task_mock = _make_task_capturer()
+    store: dict[str, str] = {}
+
+    async def _get(key: str, **_kwargs: Any) -> tuple[Any, bool, bool]:
+        if key not in store:
+            return (None, False, False)
+        return (json.loads(store[key]), True, True)
+
+    async def _set(*, key: str, data: Any, **_kwargs: Any) -> None:
+        store[key] = json.dumps(data)
+
+    provider.mass.cache.get_with_freshness = _get  # type: ignore[method-assign,assignment]
+    provider.mass.cache.set = _set  # type: ignore[method-assign,assignment]
+    provider.mass.create_task = task_mock  # type: ignore[method-assign]
+    return tasks
+
+
+@pytest.mark.asyncio
+async def test_track_lyrics_cached_per_song(provider: OpenSonicProvider) -> None:
+    """A library resync must not refetch lyrics for every track (MUSIC-20)."""
+    provider._id_lyrics = True
+    tasks = _use_dict_cache(provider)
+    line = Mock(value="hello", start=1000)
+    structured = Mock(synced=True, offset=0, line=[line])
+    provider.conn = Mock()
+    provider.conn.get_lyrics_by_song_id = AsyncMock(return_value=[structured])
+    item = _make_sonic_item(item_id="tr-1")
+
+    first = await provider.get_track_lyrics(item)
+    await asyncio.gather(*tasks)
+    second = await provider.get_track_lyrics(item)
+
+    assert first == second
+    assert second is not None
+    assert second[1] is True
+    provider.conn.get_lyrics_by_song_id.assert_awaited_once_with("tr-1")
+
+
+@pytest.mark.asyncio
+async def test_track_lyrics_caches_not_found(provider: OpenSonicProvider) -> None:
+    """A track without lyrics is a negative hit, not a refetch on every sync."""
+    provider._id_lyrics = True
+    tasks = _use_dict_cache(provider)
+    provider.conn = Mock()
+    provider.conn.get_lyrics_by_song_id = AsyncMock(side_effect=DataNotFoundError("none"))
+    item = _make_sonic_item(item_id="tr-2")
+
+    assert await provider.get_track_lyrics(item) is None
+    await asyncio.gather(*tasks)
+    assert await provider.get_track_lyrics(item) is None
+    provider.conn.get_lyrics_by_song_id.assert_awaited_once_with("tr-2")

@@ -1084,19 +1084,29 @@ class OpenSonicProvider(MusicProvider):
         Fetches lyrics from Subsonic server. Returns the lyrics text in LRC format
         if the Lyrics are synced (have time stamp info) or raw text if not
         """
+        return await self._fetch_track_lyrics(track.id, track.title, track.artist)
+
+    # Library sync asks for every track's lyrics on every run, and Navidrome reads each file
+    # to answer; caching per song (misses included) keeps a resync from re-reading the
+    # whole library (MUSIC-20).
+    @use_cache(3600 * 24)
+    async def _fetch_track_lyrics(
+        self, song_id: str, title: str | None, artist: str | None
+    ) -> tuple[str, bool] | None:
+        """Fetch lyrics for one song from the Subsonic server."""
         # Server doesn't support to newer lyrics retrieval, fall back to the old one
         if not self._id_lyrics:
             try:
-                ly: SonicLyrics = await self.conn.get_lyrics(track.title, track.artist)
+                ly: SonicLyrics = await self.conn.get_lyrics(title, artist)
             except DataNotFoundError:
-                self.logger.debug("Lyrics not found for '%s' by '%s'", track.title, track.artist)
+                self.logger.debug("Lyrics not found for '%s' by '%s'", title, artist)
                 return None
             return (ly.value, False)
 
         try:
-            lyrics: list[StructuredLyrics] = await self.conn.get_lyrics_by_song_id(track.id)
+            lyrics: list[StructuredLyrics] = await self.conn.get_lyrics_by_song_id(song_id)
         except DataNotFoundError:
-            self.logger.debug("Lyrics not found for '%s'", track.id)
+            self.logger.debug("Lyrics not found for '%s'", song_id)
             return None
         if not lyrics:
             return None
