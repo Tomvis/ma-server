@@ -129,7 +129,7 @@ CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
 # An album whose sampled files ffprobe cannot read fails the same way on every sync, and
 # the Navidrome sync plugin starts a sync after every scan; a short negative entry stops
 # it re-streaming those files all day (MUSIC-20) while still retrying after a retag.
-_CR_UNPARSEABLE_CACHE_TTL = 86400
+_CR_UNPARSABLE_CACHE_TTL = 86400
 # How many tracks to ffprobe before giving up. A first track that's a bonus /
 # hidden track may have been written without the album's AMG/TPS/DR tags even
 # when later tracks carry them; sampling a few covers this without blowing up
@@ -155,11 +155,11 @@ Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
 
 
-class _Unparseable:
+class _Unparsable:
     """A probe whose file ffprobe rejects outright, as opposed to a stream error."""
 
 
-_PROBE_UNPARSEABLE = _Unparseable()
+_PROBE_UNPARSABLE = _Unparsable()
 
 
 class _TagPrefixReader:
@@ -1429,14 +1429,14 @@ class OpenSonicProvider(MusicProvider):
         # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
         # a transient failure returns bare None and is skipped below.
         probed_clean = False
-        unparseable = False
+        unparsable = False
         started_at = asyncio.get_running_loop().time()
         try:
             async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
                 for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
                     probe = await self._extract_critical_reception_from_song(sonic_song.id)
-                    if isinstance(probe, _Unparseable):
-                        unparseable = True
+                    if isinstance(probe, _Unparsable):
+                        unparsable = True
                         continue
                     if probe is None:
                         continue
@@ -1474,13 +1474,13 @@ class OpenSonicProvider(MusicProvider):
                 )
             return cr, album_dr
         if not probed_clean:
-            if unparseable:
+            if unparsable:
                 await self.mass.cache.set(
                     key=cache_key,
                     data={"cr": None, "dr": None},
                     provider=self.instance_id,
                     category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-                    expiration=_CR_UNPARSEABLE_CACHE_TTL,
+                    expiration=_CR_UNPARSABLE_CACHE_TTL,
                 )
                 return None, None
             # Every probe attempt errored transiently (stream/ffprobe failure) rather
@@ -1514,7 +1514,7 @@ class OpenSonicProvider(MusicProvider):
 
     async def _extract_critical_reception_from_song(
         self, song_id: str
-    ) -> tuple[CriticalReception | None, float | None] | _Unparseable | None:
+    ) -> tuple[CriticalReception | None, float | None] | _Unparsable | None:
         """
         Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
 
@@ -1564,7 +1564,7 @@ class OpenSonicProvider(MusicProvider):
             try:
                 tags = await async_parse_tags(tmp_path)
             except InvalidDataError:
-                return _PROBE_UNPARSEABLE
+                return _PROBE_UNPARSABLE
             except Exception:
                 return None
             return tags.critical_reception, tags.album_dynamic_range
