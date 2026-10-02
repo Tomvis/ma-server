@@ -17,6 +17,8 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
+from music_assistant.controllers.music.media.base import AUTHORITATIVE_REFRESH
+
 from .helpers import create_album, create_track
 
 if TYPE_CHECKING:
@@ -222,6 +224,44 @@ async def test_merge_update_keeps_the_stored_year_and_version(mass: MusicAssista
 
     refreshed = await mass.music.albums.get_library_item(db_album.item_id)
     assert refreshed.year == 1999
+    assert refreshed.version == "Deluxe Edition"
+
+
+async def test_authoritative_refresh_clears_the_stored_version(mass: MusicAssistant) -> None:
+    """A refresh from the album's files clears an edition its re-tagged release dropped."""
+    full = create_album("filesystem_1", "album1")
+    full.version = "Blue Marbled Vinyl"
+    db_album = await mass.music.albums.add_item_to_library(full)
+
+    update = create_album("filesystem_1", "album1")
+    token = AUTHORITATIVE_REFRESH.set(update)
+    try:
+        await mass.music.albums.update_item_in_library(db_album.item_id, update, overwrite=True)
+    finally:
+        AUTHORITATIVE_REFRESH.reset(token)
+
+    refreshed = await mass.music.albums.get_library_item(db_album.item_id)
+    assert refreshed.version == ""
+
+
+async def test_authoritative_track_refresh_keeps_album_version(mass: MusicAssistant) -> None:
+    """Only the refreshed item itself is authoritative, never the album stub a track carries."""
+    full = create_album("filesystem_1", "album1")
+    full.version = "Deluxe Edition"
+    db_album = await mass.music.albums.add_item_to_library(full)
+    track = create_track("filesystem_1", "track1")
+    track.album = create_album("filesystem_1", "album1")
+    db_track = await mass.music.tracks.add_item_to_library(track)
+
+    update = create_track("filesystem_1", "track1")
+    update.album = create_album("filesystem_1", "album1")
+    token = AUTHORITATIVE_REFRESH.set(update)
+    try:
+        await mass.music.tracks.update_item_in_library(db_track.item_id, update, overwrite=True)
+    finally:
+        AUTHORITATIVE_REFRESH.reset(token)
+
+    refreshed = await mass.music.albums.get_library_item(db_album.item_id)
     assert refreshed.version == "Deluxe Edition"
 
 

@@ -134,6 +134,11 @@ SUPPRESS_MEDIA_ITEM_UPDATES: ContextVar[bool] = ContextVar(
     "SUPPRESS_MEDIA_ITEM_UPDATES", default=False
 )
 
+# Set (task-local) to the item a refresh fetched straight from a non-streaming provider
+# (files, Navidrome). Its fields describe the files as they are now, so an empty field
+# clears the stored one instead of being read as a stub that knows less (MUSIC-28).
+AUTHORITATIVE_REFRESH: ContextVar[object | None] = ContextVar("AUTHORITATIVE_REFRESH", default=None)
+
 PROVIDER_FEATURE_BY_MEDIA_TYPE = {
     MediaType.TRACK: ProviderFeature.TRACK_BY_EXTERNAL_ID,
     MediaType.ALBUM: ProviderFeature.ALBUM_BY_EXTERNAL_ID,

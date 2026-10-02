@@ -104,7 +104,10 @@ from music_assistant.controllers.music.helpers import (
 from music_assistant.controllers.music.media.albums import AlbumsController
 from music_assistant.controllers.music.media.artists import ArtistsController
 from music_assistant.controllers.music.media.audiobooks import AudiobooksController
-from music_assistant.controllers.music.media.base import SUPPRESS_MEDIA_ITEM_UPDATES
+from music_assistant.controllers.music.media.base import (
+    AUTHORITATIVE_REFRESH,
+    SUPPRESS_MEDIA_ITEM_UPDATES,
+)
 from music_assistant.controllers.music.media.genres import GenreController
 from music_assistant.controllers.music.media.playlists import PlaylistController
 from music_assistant.controllers.music.media.podcasts import PodcastsController
@@ -1802,6 +1805,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             available_providers = cast("set[str]", available_providers)
 
         # fetch the first (available) provider item
+        authoritative = False
         for prov_mapping in sorted(
             media_item.provider_mappings, key=lambda x: x.priority, reverse=True
         ):
@@ -1816,6 +1820,9 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 )
                 provider = media_item.provider
                 item_id = media_item.item_id
+                authoritative = (
+                    isinstance(source, MusicProvider) and not source.is_streaming_provider
+                )
                 break
         else:
             # try to find a substitute using search
@@ -1856,9 +1863,13 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             if prov_mapping.in_library is None and key in in_library_cache:
                 prov_mapping.in_library = in_library_cache[key]
         # ctrl is chosen by media_type, so it matches media_item's runtime type
-        library_item = await cast(
-            "MediaControllerBase[MediaItemType]", ctrl
-        ).update_item_in_library(library_id, media_item, overwrite=True)
+        token = AUTHORITATIVE_REFRESH.set(media_item if authoritative else None)
+        try:
+            library_item = await cast(
+                "MediaControllerBase[MediaItemType]", ctrl
+            ).update_item_in_library(library_id, media_item, overwrite=True)
+        finally:
+            AUTHORITATIVE_REFRESH.reset(token)
         if library_item.media_type == MediaType.ALBUM:
             # update (local) album tracks
             for album_track in await self.albums.tracks(

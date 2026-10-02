@@ -22,6 +22,7 @@ from music_assistant_models.media_items import Album, AudioFormat, ProviderMappi
 from music_assistant.constants import CONF_ENTRY_LIBRARY_SYNC_BACK
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.music.media.base import (
+    AUTHORITATIVE_REFRESH,
     SUPPRESS_MEDIA_ITEM_UPDATES,
     MediaControllerBase,
 )
@@ -494,6 +495,40 @@ async def test_refresh_item_non_library_item_skips_update() -> None:
 
     assert result is fresh_item
     ctrl_mock.update_item_in_library.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_refresh_item_marks_only_a_file_backed_fetch_authoritative(streaming: bool) -> None:
+    """A refresh fetched from files (not a streaming catalog) may clear fields (MUSIC-28)."""
+    mapping = create_provider_mapping(provider_instance="opensubsonic_1", item_id="abc")
+    library_item = create_mock_album(item_id="1", provider="library", provider_mappings=[mapping])
+    fresh_item = create_mock_album(
+        item_id="abc", provider="opensubsonic_1", provider_mappings=[mapping]
+    )
+    returned_item = Mock()
+    returned_item.media_type = MediaType.TRACK
+    seen: list[object] = []
+
+    async def _update(*_args: object, **_kwargs: object) -> Mock:
+        seen.append(AUTHORITATIVE_REFRESH.get())
+        return returned_item
+
+    ctrl_mock = AsyncMock()
+    ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
+    ctrl_mock.update_item_in_library = AsyncMock(side_effect=_update)
+    provider_mock = Mock(spec=MusicProvider)
+    provider_mock.is_streaming_provider = streaming
+    mass = Mock()
+    _answer_lookups_with(mass, provider_mock)
+    mass.metadata = AsyncMock()
+    music_ctrl = MusicController.__new__(MusicController)
+    music_ctrl.mass = mass
+
+    with patch.object(music_ctrl, "get_controller", return_value=ctrl_mock):
+        await music_ctrl.refresh_item(library_item)
+
+    assert seen == [None if streaming else fresh_item]
+    assert AUTHORITATIVE_REFRESH.get() is None
 
 
 # --- Group 3: Sync deletions ---

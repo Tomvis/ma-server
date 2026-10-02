@@ -89,6 +89,7 @@ from music_assistant.providers.musicbrainz.provider import (
 )
 
 from .base import (
+    AUTHORITATIVE_REFRESH,
     EXTERNAL_ID_LOOKUP_ERRORS,
     MAX_EXTERNAL_ID_MATCH_LOOKUPS,
     LibraryItemSyncDetails,
@@ -1623,15 +1624,21 @@ class AlbumsController(MediaControllerBase[Album]):
         cur_item.external_ids.update(update.external_ids)
         name = update.name if overwrite else cur_item.name
         sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
+        authoritative = AUTHORITATIVE_REFRESH.get() is update
+        if overwrite and authoritative:
+            # a re-tagged release can lose its edition, which only the files can tell us
+            version = update.version
+        elif overwrite:
+            version = update.version or cur_item.version
+        else:
+            version = cur_item.version or update.version
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
             {
                 "name": name,
                 "sort_name": sort_name,
-                "version": (update.version or cur_item.version)
-                if overwrite
-                else (cur_item.version or update.version),
+                "version": version,
                 "year": (update.year or cur_item.year)
                 if overwrite
                 else (cur_item.year or update.year),
