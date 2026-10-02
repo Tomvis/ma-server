@@ -34,7 +34,13 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # table to the per-user favorites table) and gated it at "prev_version <= 60". This
 # branch was already stamped 62, so that gate can never fire for a fork database. The
 # step in migrations.py is widened to "<= 62" and the version moved to 63.
-DB_SCHEMA_VERSION: Final[int] = 63
+#
+# 64: upstream took 62 for its own step (dropping the playlist collages the metadata
+# controller drew, and the generated art on the builtin system playlists) and gated it
+# at "prev_version <= 61". This branch was already stamped 63, so that gate can never
+# fire for a fork database. The step in migrations.py is widened to "<= 63" and the
+# version moved to 64.
+DB_SCHEMA_VERSION: Final[int] = 64
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
