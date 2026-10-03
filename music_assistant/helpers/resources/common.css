@@ -351,14 +351,6 @@ input[type="text"]:disabled {
 
 /* Home theme (HW-48), fork-only. Appended so upstream's blocks above merge
  * cleanly. Tokens: Tomvis/homelab-stacks theme/dist/tokens.resolved.json. */
-@font-face {
-    font-family: 'Rubik';
-    font-style: normal;
-    font-weight: 300 900;
-    font-display: swap;
-    src: url('https://theme.leratom.cloud/fonts/Rubik-VF.woff2') format('woff2');
-}
-
 :root {
     --fg: #16222A;
     --background: #EAF0F0;
@@ -407,16 +399,6 @@ input[type="text"]:disabled {
         --info-bg: rgba(141, 176, 189, 0.12);
         --info-border: rgba(141, 176, 189, 0.4);
     }
-}
-
-body {
-    font-family: 'Rubik', system-ui, -apple-system, 'Segoe UI', sans-serif;
-    font-variant-numeric: tabular-nums;
-}
-
-input,
-button {
-    font-family: inherit;
 }
 
 .btn-primary {
