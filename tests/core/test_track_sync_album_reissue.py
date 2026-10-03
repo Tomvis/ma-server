@@ -107,7 +107,9 @@ def _track(item_id: str, number: int, album: Album) -> Track:
 
 
 @pytest.fixture
-async def provider(mass: MusicAssistant) -> AsyncGenerator[_FakeFileProvider]:
+async def provider(
+    mass: MusicAssistant, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[_FakeFileProvider]:
     """Register a fake file-backed provider with library sync deletions enabled."""
     manifest = ProviderManifest(
         type=ProviderType.MUSIC,
@@ -123,7 +125,7 @@ async def provider(mass: MusicAssistant) -> AsyncGenerator[_FakeFileProvider]:
     def _get_value(key: str, *_args: Any, **_kwargs: Any) -> Any:
         return key == CONF_ENTRY_LIBRARY_SYNC_DELETIONS.key
 
-    config.get_value = _get_value
+    monkeypatch.setattr(config, "get_value", _get_value)
     prov = _FakeFileProvider(mass, manifest, config)
     prov.available = True
     mass._providers[prov.instance_id] = prov
