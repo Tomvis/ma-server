@@ -1560,3 +1560,21 @@ async def test_audiobook_without_a_series_tag_has_none() -> None:
     _tags = await tags.async_parse_tags(FILE_M4A)
 
     assert (_tags.series, _tags.series_part) == (None, None)
+
+
+def test_critical_reception_parses_review_text() -> None:
+    """<SRC>_REVIEW is kept whole: one value, paragraphs intact, never split on ";"."""
+    text = "Riffs; more riffs.\n\nA second paragraph / with a slash."
+    cr = _make_audio_tags({"tpsrating": "8.0", "tpsreview": f"  {text}\n"}).critical_reception
+    assert cr is not None
+    assert cr.sources is not None
+    assert cr.sources[0].source == "TPS"
+    assert cr.sources[0].review == text
+
+
+def test_critical_reception_review_alone_makes_a_source() -> None:
+    """A source carrying only review text still yields an entry; blank text does not."""
+    cr = _make_audio_tags({"amgreview": "Text.", "tpsreview": "   "}).critical_reception
+    assert cr is not None
+    assert cr.sources is not None
+    assert [(s.source, s.review) for s in cr.sources] == [("AMG", "Text.")]

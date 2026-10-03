@@ -325,7 +325,7 @@ def _build_review_source_entry(
     tags: dict[str, Any], source_id: str, key_prefix: str
 ) -> ReviewSourceEntry | None:
     """
-    Build a single ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_ACCOLADES/_LINKS/_AUTHOR.
+    Build a ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_ACCOLADES/_LINKS/_AUTHOR/_REVIEW.
 
     Returns None when the source has no usable fields, so empty entries don't
     pollute the album metadata. Pre-3.2.0 files carrying the split _TYPE/_LABELS
@@ -349,7 +349,16 @@ def _build_review_source_entry(
             if review_url:
                 links = review_url_to_links(review_url)
     authors = list(split_items(tags.get(f"{key_prefix}author")))
-    if rating is None and favorite is None and not accolades and not links and not authors:
+    # full review text (3.6.0+): one value, never split — prose holds ";" and "/"
+    review = str(_first_tag_value(tags.get(f"{key_prefix}review")) or "").strip() or None
+    if (
+        rating is None
+        and favorite is None
+        and not accolades
+        and not links
+        and not authors
+        and review is None
+    ):
         return None
     return ReviewSourceEntry(
         source=source_id,
@@ -358,6 +367,7 @@ def _build_review_source_entry(
         accolades=accolades or None,
         links=links or None,
         authors=authors or None,
+        review=review,
     )
 
 
@@ -949,7 +959,9 @@ class AudioTags:
           AMG_LINKS               -> ;-separated "<Label> — <URL>" post links (one per
                                      post; label mirrors an AMG_ACCOLADES value)
           AMG_AUTHOR              -> ;-separated author names (canonical, secondary, list-pick)
-          TPS_RATING / TPS_FAVORITE / TPS_ACCOLADES / TPS_LINKS / TPS_AUTHOR  (mirror of AMG, /10)
+          AMG_REVIEW              -> full review text, plain, blank-line paragraphs (3.6.0+)
+          TPS_RATING / TPS_FAVORITE / TPS_ACCOLADES / TPS_LINKS / TPS_AUTHOR / TPS_REVIEW
+                                  (mirror of AMG, /10)
 
         Pre-3.2.0 files carrying the split AMG_TYPE / AMG_LABELS keys, or pre-3.3.0 files
         with a single AMG_REVIEW_URL (instead of AMG_LINKS), are still read via transitional

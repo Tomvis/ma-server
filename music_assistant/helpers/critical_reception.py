@@ -18,6 +18,7 @@ _REVIEW_SOURCE_FIELDS: Final[tuple[str, ...]] = (
     "accolades",
     "links",
     "authors",
+    "review",
 )
 # The subset of the above whose values are lists; these compare None and [] as equal.
 _REVIEW_SOURCE_LIST_FIELDS: Final[frozenset[str]] = frozenset({"accolades", "links", "authors"})

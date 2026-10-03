@@ -166,3 +166,28 @@ async def test_unparsable_album_cached_briefly(
     stored = cache_set.await_args_list[0].kwargs
     assert stored["data"] == {"cr": None, "dr": None}
     assert stored["expiration"] == sonic_provider._CR_UNPARSABLE_CACHE_TTL
+
+
+@pytest.mark.asyncio
+async def test_cache_entry_from_before_review_text_is_reprobed(
+    provider: OpenSonicProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-v2 entry with review data re-probes once; v2 entries and negatives are served."""
+    monkeypatch.setattr(sonic_provider, "_CR_PROBE_ALBUM_BUDGET_SECONDS", 30.0)
+    cache_get, cache_set = _stub_cache(provider)
+    fresh = CriticalReception(amg_dr=9.0)
+    provider._extract_critical_reception_from_song = AsyncMock(return_value=(fresh, 10.0))  # type: ignore[method-assign]
+
+    cache_get.return_value = {"cr": {"amg_dr": 8.0}, "dr": 10.0}
+    cr, _ = await provider._get_album_critical_reception("album-1", _sonic_album("song-1"))
+    assert cr is fresh
+    assert cache_set.await_args.kwargs["data"]["v"] == sonic_provider._CR_CACHE_VERSION
+
+    provider._extract_critical_reception_from_song.reset_mock()
+    for entry in (
+        {"cr": {"amg_dr": 8.0}, "dr": 10.0, "v": sonic_provider._CR_CACHE_VERSION},
+        {"cr": None, "dr": 10.0},
+    ):
+        cache_get.return_value = entry
+        await provider._get_album_critical_reception("album-1", _sonic_album("song-1"))
+    provider._extract_critical_reception_from_song.assert_not_called()

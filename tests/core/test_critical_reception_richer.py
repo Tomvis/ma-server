@@ -188,3 +188,13 @@ def test_dropping_all_accolades_is_not_richer() -> None:
     )
     new = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     assert critical_reception_is_richer(new, existing) is False
+
+
+def test_gaining_review_text_is_richer_and_losing_it_is_not() -> None:
+    """Review text (3.6.0+) counts like any field: gained wins, dropped keeps stored."""
+    bare = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.0)])
+    reviewed = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.0, review="Text.")])
+    edited = _cr(sources=[ReviewSourceEntry(source="AMG", rating=4.0, review="Edited.")])
+    assert critical_reception_is_richer(reviewed, bare) is True
+    assert critical_reception_is_richer(bare, reviewed) is False
+    assert critical_reception_is_richer(edited, reviewed) is True

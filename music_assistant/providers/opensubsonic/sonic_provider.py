@@ -126,6 +126,9 @@ _CR_PROBE_MAX_READ_BYTES = 32 * 1024 * 1024
 # entry because it is stored non-persistent, and the cache controller's "clear cache"
 # action drops it outright.
 CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
+# Bumped when the CR tags read from files gain a field: an entry written by an older
+# version that has review sources is re-probed once to pick it up (2 = <SRC>_REVIEW).
+_CR_CACHE_VERSION = 2
 # An album whose sampled files ffprobe cannot read fails the same way on every sync, and
 # the Navidrome sync plugin starts a sync after every scan; a short negative entry stops
 # it re-streaming those files all day (MUSIC-20) while still retrying after a retag.
@@ -1389,10 +1392,11 @@ class OpenSonicProvider(MusicProvider):
             category=CACHE_CATEGORY_CRITICAL_RECEPTION,
             default=None,
         )
-        if cached is not None:
+        if cached is not None and not (cached.get("cr") and cached.get("v", 1) < _CR_CACHE_VERSION):
             # A stored entry is itself proof that a probe ran cleanly; legacy
             # {"ok": False} entries decode to (None, None), the same cached
-            # clean negative they always meant.
+            # clean negative they always meant. Clean negatives stay valid across
+            # versions: an album without review tags gains no field to re-read.
             return (
                 CriticalReception.from_dict(cr_data) if (cr_data := cached.get("cr")) else None,
                 float(dr_data) if (dr_data := cached.get("dr")) is not None else None,
@@ -1489,7 +1493,11 @@ class OpenSonicProvider(MusicProvider):
             return None, None
         await self.mass.cache.set(
             key=cache_key,
-            data={"cr": cr.to_dict() if cr is not None else None, "dr": album_dr},
+            data={
+                "cr": cr.to_dict() if cr is not None else None,
+                "dr": album_dr,
+                "v": _CR_CACHE_VERSION,
+            },
             provider=self.instance_id,
             category=CACHE_CATEGORY_CRITICAL_RECEPTION,
             expiration=CRITICAL_RECEPTION_CACHE_TTL,
