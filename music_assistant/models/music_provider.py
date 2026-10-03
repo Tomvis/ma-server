@@ -1755,6 +1755,10 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         """Sync Library Tracks to Music Assistant library."""
         self.logger.debug("Start sync of Tracks to Music Assistant library.")
         cur_db_ids: set[int] = set()
+        # Enhanced: the provider album id's of every listed library track, and of the ones
+        # this sync linked anew because the provider moved the track to another album
+        track_albums: dict[int, set[str]] = {}
+        moved_tracks: dict[int, set[str]] = {}
         item_count = 0
         async for prov_item in self.get_library_tracks():
             item_count += 1
@@ -1777,6 +1781,12 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         prov_item.uri,
                     )
                     continue
+                album_moved = bool(
+                    sync_details
+                    and prov_item.album
+                    and sync_details.has_album
+                    and prov_item.album.item_id not in sync_details.album_prov_item_ids
+                )
                 # batch all writes for this item into a single commit
                 async with self.mass.music.database.deferred_commit():
                     if not sync_details:
@@ -1791,6 +1801,8 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         or (prov_item.album and not sync_details.has_album)
                         # or backfill missing track_artists link(s) for existing tracks
                         or (prov_item.artists and not sync_details.has_artists)
+                        # or link the album the provider moved the track to
+                        or album_moved
                     ):
                         library_item = await self.mass.music.tracks.update_item_in_library(
                             sync_details.item_id, prov_item
@@ -1799,6 +1811,10 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                     else:
                         db_id = sync_details.item_id
                     cur_db_ids.add(db_id)
+                    if prov_item.album:
+                        track_albums.setdefault(db_id, set()).add(prov_item.album.item_id)
+                        if album_moved:
+                            moved_tracks.setdefault(db_id, set()).add(prov_item.album.item_id)
                     if prov_item.favorite is not None:
                         await self.mass.music.favorites.record_from_provider(
                             self.instance_id, MediaType.TRACK, db_id, prov_item.favorite
@@ -1820,7 +1836,86 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 self._protect_failed_sync_item(
                     MediaType.TRACK, prov_item.item_id, db_id, cur_db_ids
                 )
+        if moved_tracks:
+            try:
+                await self._merge_reissued_albums(moved_tracks, track_albums)
+            except Exception as err:
+                self.logger.warning(
+                    "Could not merge reissued albums: %s",
+                    describe_sync_error(err),
+                    exc_info=err if self.logger.isEnabledFor(logging.DEBUG) else None,
+                )
         return cur_db_ids
+
+    async def _merge_reissued_albums(
+        self, moved_tracks: dict[int, set[str]], track_albums: dict[int, set[str]]
+    ) -> None:
+        """
+        Merge each library album whose tracks all moved to a single other album into it.
+
+        A file-backed provider can give an album a new id while its tracks keep their own,
+        for instance after a retag changes the album title. The library then holds the old
+        album row, which still owns the tracks and the user's play history, next to a new
+        row without any library tracks.
+
+        :param moved_tracks: Provider album id's per library track that this sync linked anew.
+        :param track_albums: Provider album id's per library track that this sync listed.
+        """
+        database = self.mass.music.database
+        # library album -> the moved tracks the provider no longer lists on it
+        left_albums: dict[int, set[int]] = {}
+        for track_id in moved_tracks:
+            linked: dict[int, set[str]] = {}
+            for row in await database.get_rows_from_query(
+                "SELECT album_tracks.album_id, provider_mappings.provider_item_id "
+                "FROM album_tracks JOIN provider_mappings "
+                "ON provider_mappings.item_id = album_tracks.album_id "
+                "AND provider_mappings.media_type = 'album' "
+                "AND provider_mappings.provider_instance = :instance "
+                "WHERE album_tracks.track_id = :track_id",
+                {"instance": self.instance_id, "track_id": track_id},
+                limit=0,
+            ):
+                linked.setdefault(row["album_id"], set()).add(row["provider_item_id"])
+            for album_id, prov_album_ids in linked.items():
+                if not prov_album_ids & track_albums[track_id]:
+                    left_albums.setdefault(album_id, set()).add(track_id)
+        for album_id, left_tracks in left_albums.items():
+            provider_tracks = {
+                row["track_id"]
+                for row in await database.get_rows_from_query(
+                    "SELECT DISTINCT album_tracks.track_id "
+                    "FROM album_tracks JOIN provider_mappings "
+                    "ON provider_mappings.item_id = album_tracks.track_id "
+                    "AND provider_mappings.media_type = 'track' "
+                    "AND provider_mappings.provider_instance = :instance "
+                    "WHERE album_tracks.album_id = :album_id",
+                    {"instance": self.instance_id, "album_id": album_id},
+                    limit=0,
+                )
+            }
+            if provider_tracks - left_tracks:
+                # the album still has tracks on the provider, so it was not reissued
+                continue
+            target_ids: set[int] = set()
+            for track_id in left_tracks:
+                for prov_album_id in moved_tracks[track_id]:
+                    if album := await self.mass.music.albums.get_library_item_by_prov_id(
+                        prov_album_id, self.instance_id
+                    ):
+                        target_ids.add(int(album.item_id))
+            if len(target_ids) != 1 or album_id in target_ids:
+                # split over several albums: the tracks are linked, the old row is left be
+                continue
+            target_id = target_ids.pop()
+            self.logger.info(
+                "Album %s was reissued as album %s, merging it into the new one",
+                album_id,
+                target_id,
+            )
+            await self.mass.music.albums.merge_library_items(
+                target_id, album_id, merge_state=False
+            )
 
     async def _sync_library_podcasts(self) -> set[int]:
         """Sync Library Podcasts to Music Assistant library."""

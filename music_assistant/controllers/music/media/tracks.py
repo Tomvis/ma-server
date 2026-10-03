@@ -1723,6 +1723,12 @@ class TracksController(MediaControllerBase[Track]):
                 JOIN artists ON artists.item_id = track_artists.artist_id
                 WHERE track_artists.track_id = tracks.item_id
             ) AS has_artists
+            , (
+                SELECT JSON_GROUP_ARRAY(provider_mappings.provider_item_id) FROM album_tracks
+                JOIN provider_mappings ON provider_mappings.item_id = album_tracks.album_id
+                    AND provider_mappings.media_type = 'album'
+                WHERE album_tracks.track_id = tracks.item_id
+            ) AS album_prov_item_ids
         """
         return extra_columns, "", {}
 
@@ -1734,6 +1740,7 @@ class TracksController(MediaControllerBase[Track]):
             provider_mappings=self._parse_sync_details_mappings(db_row),
             has_album=bool(db_row["has_album"]),
             has_artists=bool(db_row["has_artists"]),
+            album_prov_item_ids=frozenset(json_loads(db_row["album_prov_item_ids"] or "[]")),
         )
 
     def _parse_summary_row(self, db_row: Mapping[str, Any]) -> TrackSummary:

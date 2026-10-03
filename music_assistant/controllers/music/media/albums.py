@@ -2288,6 +2288,16 @@ class AlbumsController(MediaControllerBase[Album]):
         library_item = await self.get_library_item(db_id)
         self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
 
+    async def _merge_library_item_references(self, target_id: int, source_id: int) -> None:
+        """Move every user's listen-later entry for the merged album onto the target."""
+        await self.mass.music.database.execute_write(
+            f"INSERT OR IGNORE INTO {DB_TABLE_ALBUM_LISTEN_LATER}(item_id, userid, added_at) "
+            f"SELECT :target_id, userid, added_at FROM {DB_TABLE_ALBUM_LISTEN_LATER} "
+            "WHERE item_id = :source_id",
+            {"target_id": target_id, "source_id": source_id},
+        )
+        await self.mass.music.database.delete(DB_TABLE_ALBUM_LISTEN_LATER, {"item_id": source_id})
+
     async def _set_album_track(self, db_id: int, db_track_id: int, track: Track) -> None:
         """Store Album Track info."""
         # write (or update) record in album_tracks table

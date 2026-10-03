@@ -679,9 +679,9 @@ async def test_merge_interrupted_after_relation_transfer_leaves_source_reconcila
     original = MediaControllerBase._copy_library_item_relations
 
     async def _fail_after_relation_transfer(
-        self: MediaControllerBase[Track], target_id: int, source_id: int
+        self: MediaControllerBase[Track], target_id: int, source_id: int, **kwargs: bool
     ) -> None:
-        await original(self, target_id, source_id)
+        await original(self, target_id, source_id, **kwargs)
         raise MusicAssistantError("interrupted")
 
     with (

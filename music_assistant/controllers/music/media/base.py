@@ -127,6 +127,10 @@ RELATION_TABLE_COLUMNS = {
     DB_TABLE_TRACK_ARTISTS: ("track_id", "artist_id"),
 }
 
+# The relations that credit artists to the merged item: they describe the item itself, so a
+# merge that keeps the target's own data copies them only onto a target that has none.
+CREDIT_RELATION_TABLES = {DB_TABLE_ALBUM_ARTISTS, DB_TABLE_AUDIOBOOK_ARTISTS}
+
 # When set (task-local), per-item MEDIA_ITEM_ADDED/UPDATED events and the on_item_updated
 # provider write-back are suppressed, so bulk operations (provider sync, provider cleanup)
 # don't flood subscribers with one event per touched item.
@@ -213,6 +217,9 @@ class TrackSyncDetails(LibraryItemSyncDetails):
 
     has_album: bool
     has_artists: bool
+    # Enhanced: provider item id's of the albums the track is linked to, so the sync can
+    # tell when a provider moved the track to an album the library has not linked yet
+    album_prov_item_ids: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -1379,7 +1386,11 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
     @final
     async def merge_library_items(
-        self, target_item_id: str | int, source_item_id: str | int
+        self,
+        target_item_id: str | int,
+        source_item_id: str | int,
+        *,
+        merge_state: bool = True,
     ) -> ItemCls:
         """
         Merge one library item into another and return the target item.
@@ -1390,6 +1401,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
         :param target_item_id: Library ID of the item that remains after the merge.
         :param source_item_id: Library ID of the duplicate item that is removed after transfer.
+        :param merge_state: Whether the source's own data (name, version, metadata) fills in
+            the target. Pass False when the source describes an outdated version of the target.
         :raises InvalidDataError: When the IDs are identical or do not belong to this media type.
         """
         target_id = int(target_item_id)
@@ -1398,7 +1411,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             msg = "Cannot merge a library item into itself"
             raise InvalidDataError(msg)
         async with self._db_add_lock:
-            return await self._merge_library_items_batched(target_id, source_id)
+            return await self._merge_library_items_batched(
+                target_id, source_id, merge_state=merge_state
+            )
 
     @final
     async def add_provider_mappings(
@@ -3019,7 +3034,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
         return sql_query
 
-    async def _merge_library_items(self, target_id: int, source_id: int) -> tuple[ItemCls, ItemCls]:
+    async def _merge_library_items(
+        self, target_id: int, source_id: int, *, merge_state: bool = True
+    ) -> tuple[ItemCls, ItemCls]:
         """Merge the source library item into the target while the controller lock is held."""
         target_item = await self.get_library_item(target_id)
         source_item = await self.get_library_item(source_id)
@@ -3039,12 +3056,13 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
         token = SUPPRESS_MEDIA_ITEM_UPDATES.set(True)
         try:
-            source_mappings = source_item.provider_mappings
-            source_item.provider_mappings = set()
-            try:
-                await self._update_library_item_for_merge(target_id, source_item)
-            finally:
-                source_item.provider_mappings = source_mappings
+            if merge_state:
+                source_mappings = source_item.provider_mappings
+                source_item.provider_mappings = set()
+                try:
+                    await self._update_library_item_for_merge(target_id, source_item)
+                finally:
+                    source_item.provider_mappings = source_mappings
 
             await self.mass.music.database.execute_write(
                 f"""
@@ -3081,7 +3099,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             # rather than moved, and only dropped once the target holds them and the
             # provider mappings. A source that kept its relations stays a duplicate the
             # reconciliation pass can finish; one that lost its mappings is cleaned up.
-            await self._copy_library_item_relations(target_id, source_id)
+            await self._copy_library_item_relations(
+                target_id, source_id, merge_state=merge_state
+            )
             await self.mass.music.database.execute_write(
                 f"UPDATE {DB_TABLE_PROVIDER_MAPPINGS} SET item_id = :target_id "
                 "WHERE media_type = :media_type AND item_id = :source_id",
@@ -3161,10 +3181,14 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, library_item.uri, library_item)
             return added
 
-    async def _merge_library_items_batched(self, target_id: int, source_id: int) -> ItemCls:
+    async def _merge_library_items_batched(
+        self, target_id: int, source_id: int, *, merge_state: bool = True
+    ) -> ItemCls:
         """Merge library items while batching the transfer's database writes."""
         async with self.mass.music.database.deferred_commit():
-            source_item, merged_item = await self._merge_library_items(target_id, source_id)
+            source_item, merged_item = await self._merge_library_items(
+                target_id, source_id, merge_state=merge_state
+            )
         if not SUPPRESS_MEDIA_ITEM_UPDATES.get():
             self.mass.signal_event(EventType.MEDIA_ITEM_DELETED, source_item.uri, source_item)
             self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, merged_item.uri, merged_item)
@@ -3180,16 +3204,23 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         """Merge model state into an existing library item."""
         await self._update_library_item(item_id, update)
 
-    async def _copy_library_item_relations(self, target_id: int, source_id: int) -> None:
+    async def _copy_library_item_relations(
+        self, target_id: int, source_id: int, *, merge_state: bool = True
+    ) -> None:
         """Copy the relations that reference the merged media item onto the target."""
         for table, item_column in self._library_item_relations():
             columns = RELATION_TABLE_COLUMNS[table]
             selected = ", ".join(
                 ":target_id" if column == item_column else column for column in columns
             )
+            condition = ""
+            if not merge_state and table in CREDIT_RELATION_TABLES:
+                condition = (
+                    f" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {item_column} = :target_id)"
+                )
             await self.mass.music.database.execute_write(
                 f"INSERT OR IGNORE INTO {table}({', '.join(columns)}) "
-                f"SELECT {selected} FROM {table} WHERE {item_column} = :source_id",
+                f"SELECT {selected} FROM {table} WHERE {item_column} = :source_id{condition}",
                 {"target_id": target_id, "source_id": source_id},
             )
 
