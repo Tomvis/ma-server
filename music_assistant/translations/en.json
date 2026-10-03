@@ -1518,6 +1518,7 @@
   "provider.heos.config_entries.timeout.description": "Set the timeout value to use when sending commands to the HEOS system. Some devices could reply slower to commands, if you are seeing Command timeout logs, try increasing this value.",
   "provider.heos.config_entries.timeout.label": "Command timeout value",
   "provider.heos.manifest.description": "Play to Denon & Marantz devices via HEOS.",
+  "provider.home_theme.manifest.description": "Keeps each person's home theme (from the household's authentik settings) and their own in-app theme choice.",
   "provider.hue_entertainment.config_entries.bridge_host.description": "IP address of the Philips Hue bridge.",
   "provider.hue_entertainment.config_entries.bridge_host.label": "Bridge IP Address",
   "provider.hue_entertainment.config_entries.brightness.description": "Overall light brightness (0-100).",
