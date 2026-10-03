@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
@@ -73,7 +74,10 @@ def _mapping(item_id: str) -> ProviderMapping:
 
 
 _ARTIST = Artist(
-    item_id="artist-1", provider=_INSTANCE, name="Zornheym", provider_mappings={_mapping("artist-1")}
+    item_id="artist-1",
+    provider=_INSTANCE,
+    name="Zornheym",
+    provider_mappings={_mapping("artist-1")},
 )
 
 
@@ -215,13 +219,10 @@ async def test_unchanged_library_does_not_update_tracks(
     provider.library_tracks = [_track("t1", 1, album)]
     await _sync(provider)
 
-    calls: list[Any] = []
-    original = mass.music.tracks.update_item_in_library
-
-    async def _spy(*args: Any, **kwargs: Any) -> Any:
-        calls.append(args)
-        return await original(*args, **kwargs)
-
-    mass.music.tracks.update_item_in_library = _spy  # type: ignore[method-assign]
-    await _sync(provider)
-    assert calls == []
+    with patch.object(
+        mass.music.tracks,
+        "update_item_in_library",
+        AsyncMock(wraps=mass.music.tracks.update_item_in_library),
+    ) as update:
+        await _sync(provider)
+    update.assert_not_called()
