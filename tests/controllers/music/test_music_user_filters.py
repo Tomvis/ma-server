@@ -913,3 +913,27 @@ async def test_genre_library_count_ignores_music_sources(
     with patch(GET_CURRENT_USER, return_value=_user(USER_A)):
         assert await counted_mass.music.genres.library_count() == unfiltered_count
     assert unfiltered_count > 0
+
+
+@patch("music_assistant.controllers.music.controller.get_current_user")
+async def test_start_sync_covers_music_sources_hidden_from_the_admin(
+    mock_get_user: Mock,
+) -> None:
+    """music/sync is admin-only, so it syncs every instance, not just the caller's (MUSIC-32)."""
+    mock_get_user.return_value = _user("admin", UserRole.ADMIN)
+    music_a = _make_prov("m_a", ProviderType.MUSIC)
+    music_b = _make_prov("m_b", ProviderType.MUSIC)
+
+    controller = MusicController.__new__(MusicController)
+    controller.mass = Mock()
+    controller.mass.providers = [music_a, music_b]
+    controller.mass.config.get_provider_config_value = AsyncMock(return_value=True)
+    set_music_source_access(controller.mass, {"m_a": None, "m_b": _private(USER_B)})
+    controller.library_supported = Mock(return_value=True)  # type: ignore[method-assign]
+    scheduled = AsyncMock()
+    controller._schedule_provider_mediatype_sync = scheduled  # type: ignore[method-assign]
+
+    await controller.start_sync(media_types=[MediaType.ALBUM])
+    await controller.start_sync(media_types=[MediaType.ALBUM], providers=["m_b"])
+
+    assert [c.args[0].instance_id for c in scheduled.await_args_list] == ["m_a", "m_b", "m_b"]

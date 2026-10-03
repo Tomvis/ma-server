@@ -472,11 +472,14 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         tasks: list[BackgroundTask] = []
         if media_types is None:
             media_types = MediaType.ALL
+        # library.manage is admin-only, so sync every instance like the scheduler does,
+        # not only the music sources the calling admin may see
+        music_providers = [x for x in self.mass.providers if x.type == ProviderType.MUSIC]
         if providers is None:
-            providers = [x.instance_id for x in self.providers]
+            providers = [x.instance_id for x in music_providers]
 
         for media_type in media_types:
-            for provider in self.providers:
+            for provider in cast("list[MusicProvider]", music_providers):
                 if provider.instance_id not in providers:
                     continue
                 if not self.library_supported(provider, media_type):
