@@ -123,7 +123,7 @@ async def provider(mass: MusicAssistant) -> AsyncGenerator[_FakeFileProvider]:
     def _get_value(key: str, *_args: Any, **_kwargs: Any) -> Any:
         return key == CONF_ENTRY_LIBRARY_SYNC_DELETIONS.key
 
-    config.get_value = _get_value  # type: ignore[method-assign]
+    config.get_value = _get_value
     prov = _FakeFileProvider(mass, manifest, config)
     prov.available = True
     mass._providers[prov.instance_id] = prov
