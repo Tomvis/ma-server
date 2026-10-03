@@ -184,6 +184,7 @@ async def test_reissued_album_takes_over_tracks_and_user_state(
     # the stale row's own data describes the old release and must not leak into the live one
     assert merged.name == "Descending Into Madness"
     assert merged.version == ""
+    assert {x.item_id for x in merged.provider_mappings} == {"alb-new"}
     row = await mass.music.database.get_row(DB_TABLE_ALBUMS, {"item_id": new_id})
     assert row is not None
     assert row["play_count"] == 3

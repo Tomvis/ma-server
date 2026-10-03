@@ -1913,9 +1913,22 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 album_id,
                 target_id,
             )
-            await self.mass.music.albums.merge_library_items(
+            source = await self.mass.music.albums.get_library_item(album_id)
+            dead_ids = {
+                x.item_id
+                for x in source.provider_mappings
+                if x.provider_instance == self.instance_id
+            }
+            merged = await self.mass.music.albums.merge_library_items(
                 target_id, album_id, merge_state=False
             )
+            # the old album id is gone on the provider, also for the copies of its mapping
+            # on the sibling instances, so the merge must not leave it on the new album
+            for mapping in merged.provider_mappings:
+                if mapping.provider_domain == self.domain and mapping.item_id in dead_ids:
+                    await self.mass.music.albums.remove_provider_mapping(
+                        target_id, mapping.provider_instance, mapping.item_id
+                    )
 
     async def _sync_library_podcasts(self) -> set[int]:
         """Sync Library Podcasts to Music Assistant library."""
