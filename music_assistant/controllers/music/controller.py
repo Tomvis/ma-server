@@ -160,6 +160,7 @@ from music_assistant.helpers.throttle_retry import RequestPriority, request_prio
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.helpers.util import parse_optional_bool, parse_title_and_version
 from music_assistant.models.core_controller import CoreController
+from music_assistant.models.media_capabilities import MediaCatalogMixin
 from music_assistant.models.music_provider import LIBRARY_FEATURE_BY_MEDIA_TYPE, MusicProvider
 from music_assistant.models.plugin import PluginProvider
 
@@ -939,7 +940,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             ]
             return [*prepend_items, *initiable_items]
         # limit -1 to account for the prepended items
-        prov_items = await cast("MusicProvider", browse_prov).browse(path=path)
+        prov_items = await cast("MediaCatalogMixin", browse_prov).browse(path=path)
         return [*prepend_items, *prov_items]
 
     @api_command("music/recently_played_items", required_scope=Scope.LIBRARY_READ)
@@ -3007,7 +3008,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         prov = self.mass.get_provider(
             provider_instance_id_or_domain,
             return_unavailable=strict_provider_instance,
-            provider_type=MusicProvider,
+            provider_type=MediaCatalogMixin,
         )
         if not prov or (
             strict_provider_instance
@@ -3055,7 +3056,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
 
     async def _execute_provider_search(
         self,
-        prov: MusicProvider,
+        prov: MediaCatalogMixin,
         search_query: str,
         media_types: list[MediaType],
         limit: int,

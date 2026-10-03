@@ -13,7 +13,7 @@ from aiohttp.test_utils import make_mocked_request
 from music_assistant_models.api import CommandMessage
 from music_assistant_models.auth import AuthProviderType, Scope, User, UserRole
 
-from music_assistant.constants import HOMEASSISTANT_SYSTEM_USER
+from music_assistant.constants import CONF_AUTH_ALLOW_SELF_REGISTRATION, HOMEASSISTANT_SYSTEM_USER
 from music_assistant.controllers.webserver import websocket_client
 from music_assistant.controllers.webserver.auth import AuthenticationManager
 from music_assistant.controllers.webserver.controller import WebserverController
@@ -422,6 +422,36 @@ async def test_ingress_websocket_without_user_headers_subscribes_after_token_aut
     assert client._events_unsub_callback is not None
 
 
+async def test_ingress_websocket_is_closed_when_the_sign_in_fails(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """An Ingress websocket connection whose sign-in raises is closed and cleaned up."""
+    mass = auth_manager.mass
+    # Home Assistant does not know this new user, so looking up its role fails
+    hass_provider = _ready_hass_provider(mass, "ha_someone_else", admin=False)
+    headers = {"X-Remote-User-ID": "ha_alice", "X-Remote-User-Name": "alice"}
+
+    with (
+        _ingress_request(mass, headers, hass_provider=hass_provider) as request,
+        patch.object(mass, "dashboard", MagicMock(), create=True) as dashboard,
+    ):
+        client = WebsocketClientHandler(auth_manager.webserver, request)
+        with (
+            patch.object(client.wsock, "prepare", AsyncMock()),
+            patch.object(client.wsock, "close", AsyncMock()) as close,
+            patch.object(client.wsock, "receive", AsyncMock(side_effect=RuntimeError)) as receive,
+            patch.object(client, "_send_message", AsyncMock()),
+        ):
+            await client.handle_client()
+
+    assert client._authenticated_user is None
+    assert client._writer_task is not None
+    assert client._writer_task.done()
+    receive.assert_not_awaited()
+    close.assert_awaited_once()
+    dashboard.handle_client_disconnected.assert_called_once_with(client.client_id)
+
+
 async def test_ha_login_resolves_a_disabled_linked_user_under_another_username(
     auth_manager: AuthenticationManager,
 ) -> None:
@@ -507,3 +537,21 @@ async def test_ha_login_callback_signs_in_an_enabled_linked_user(
     assert result.user is not None
     assert result.user.user_id == linked.user_id
     assert result.user.display_name == "Alice from HA"
+
+
+async def test_ha_login_callback_refuses_a_new_user_with_self_registration_off(
+    auth_manager: AuthenticationManager,
+) -> None:
+    """With self-registration off, the HA login refuses an unknown HA user and creates nothing."""
+    auth_manager.webserver.config.update({CONF_AUTH_ALLOW_SELF_REGISTRATION: False})
+    user_count = len(await auth_manager.list_users())
+
+    result = await _ha_login_callback(
+        auth_manager.mass, "ha_carol", ("carol", "Carol from HA", None)
+    )
+
+    assert result == AuthResult(
+        success=False, error="Self-registration is disabled. Please contact an administrator."
+    )
+    assert len(await auth_manager.list_users()) == user_count
+    assert await _get_ha_link(auth_manager, "ha_carol") is None

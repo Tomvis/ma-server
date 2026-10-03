@@ -27,9 +27,7 @@ if TYPE_CHECKING:
     )
 
     from music_assistant.mass import MusicAssistant
-    from music_assistant.models.metadata_provider import MetadataProvider
-    from music_assistant.models.music_provider import MusicProvider
-    from music_assistant.models.plugin import PluginProvider
+    from music_assistant.models.media_capabilities import RecommendationsMixin
 
 
 class RecommendationsController:
@@ -58,9 +56,7 @@ class RecommendationsController:
         rows_per_source: list[list[RecommendationFolder]] = [
             *await asyncio.gather(
                 *[
-                    self._provider_rows(
-                        cast("MusicProvider | MetadataProvider | PluginProvider", provider)
-                    )
+                    self._provider_rows(cast("RecommendationsMixin", provider))
                     for provider in providers
                 ]
             ),
@@ -96,9 +92,9 @@ class RecommendationsController:
                 else:
                     # external provider rows don't support provider filtering: their SPI
                     # signature is unchanged, so `providers` is silently ignored here
-                    items = await cast(
-                        "MusicProvider | MetadataProvider | PluginProvider", prov
-                    ).get_recommendation_items(item_id)
+                    items = await cast("RecommendationsMixin", prov).get_recommendation_items(
+                        item_id
+                    )
             # deliberately outside the items timeout: enrichment is a nicety, and must
             # never be able to cost us items we have already fetched
             return await self._attach_library_album_badges(items)
@@ -190,9 +186,7 @@ class RecommendationsController:
                 item.metadata.dynamic_range = match.metadata.dynamic_range
         return UniqueList(enriched)
 
-    async def _provider_rows(
-        self, provider: MusicProvider | MetadataProvider | PluginProvider
-    ) -> list[RecommendationFolder]:
+    async def _provider_rows(self, provider: RecommendationsMixin) -> list[RecommendationFolder]:
         """Return a provider's recommendation rows, or an empty list if it times out or raises."""
         try:
             async with asyncio.timeout(RECOMMENDATIONS_ROWS_TIMEOUT):
