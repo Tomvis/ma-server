@@ -1227,11 +1227,17 @@ class AlbumsController(MediaControllerBase[Album]):
         provider_slots: dict[str, int] = {}
         lookup_error: Exception | None = None
         for provider_mapping in library_album.provider_mappings:
-            if (
+            if not provider_mapping.available or (
                 allowed_providers is not None
                 and provider_mapping.provider_instance not in allowed_providers
             ):
                 continue
+            # an unavailable mapped instance hands the lookup to another account of the service
+            own_instance = self.mass.get_provider(provider_mapping.provider_instance)
+            own_lookup = (
+                own_instance is not None
+                and own_instance.instance_id == provider_mapping.provider_instance
+            )
             provider_tracks, err = await self._album_tracks_from_provider(
                 library_album, provider_mapping
             )
@@ -1239,6 +1245,10 @@ class AlbumsController(MediaControllerBase[Album]):
                 # one provider that no longer lists the album must not hide the other
                 # providers' tracks
                 lookup_error = err
+                if own_lookup and isinstance(err, MediaNotFoundError):
+                    await self.mass.music.mark_provider_mapping_unavailable(
+                        library_album, provider_mapping
+                    )
                 continue
             for provider_track in provider_tracks:
                 # In some cases (looking at you YTM) the disc/track number is not obtained from
