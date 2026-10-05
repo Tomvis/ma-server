@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 import aiofiles
 from aiofiles.os import makedirs, remove, replace
 from aiofiles.os import path as aiopath
-from aiohttp import ClientTimeout, web
+from aiohttp import ClientConnectionError, ClientResponseError, ClientTimeout, web
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -30,7 +30,7 @@ from music_assistant_models.enums import (
     ProviderFeature,
     StreamType,
 )
-from music_assistant_models.errors import AudioError
+from music_assistant_models.errors import AudioError, SetupFailedError
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.streamdetails import StreamDetails
 
@@ -78,17 +78,24 @@ async def setup(
 
 
 async def fetch_backend_voices(
-    http_session: ClientSession, base_url: str, api_key: str = ""
+    http_session: ClientSession,
+    base_url: str,
+    api_key: str = "",
+    *,
+    require_reachable: bool = False,
 ) -> list[str]:
     """
     Return the voices the backend advertises, empty when it does not advertise any.
 
     Only some of the self-hostable servers implement a voice listing; the OpenAI cloud
-    API does not. Never raises: an unreachable or silent backend yields an empty list.
+    API does not. Never raises unless require_reachable is set: an unreachable or silent
+    backend yields an empty list.
 
     :param http_session: The HTTP session to request with.
     :param base_url: The API endpoint, without trailing slash.
     :param api_key: The API key to authenticate with, empty for backends without auth.
+    :param require_reachable: Raise SetupFailedError when the backend cannot be reached
+        (connection error, timeout or server error) instead of returning no voices.
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
@@ -97,6 +104,14 @@ async def fetch_backend_voices(
         ) as response:
             response.raise_for_status()
             data = await response.json()
+    except (ClientConnectionError, ClientResponseError, TimeoutError) as err:
+        # a backend that answers without a listing (404) gets the default voices, but one
+        # that is down (e.g. still starting) would expose voices it does not serve
+        unreachable = not isinstance(err, ClientResponseError) or err.status >= 500
+        if require_reachable and unreachable:
+            msg = f"Text-to-speech backend at {base_url} is not reachable: {err}"
+            raise SetupFailedError(msg) from err
+        return []
     except Exception:
         return []
     items = data.get("voices") if isinstance(data, dict) else data
@@ -339,7 +354,9 @@ class OpenAITTSProvider(PluginProvider):
             self.logger.debug("Using %s voice(s) from the config override", len(voices))
             return voices
         api_key = str(self.get_setup_value(CONF_API_KEY) or "")
-        if voices := await fetch_backend_voices(self.mass.http_session, self._base_url, api_key):
+        if voices := await fetch_backend_voices(
+            self.mass.http_session, self._base_url, api_key, require_reachable=True
+        ):
             self.logger.debug("Discovered %s voice(s) on the backend", len(voices))
             return voices
         self.logger.debug("Falling back to the default voices")

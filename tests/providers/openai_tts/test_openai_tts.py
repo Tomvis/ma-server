@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import ClientError, web
+from aiohttp import ClientConnectionError, ClientError, ClientResponseError, web
 from music_assistant_models.enums import ContentType, MediaType, ProviderType, StreamType
+from music_assistant_models.errors import SetupFailedError
 
 from music_assistant.providers.openai_tts import (
     CONF_VOICES,
@@ -145,6 +146,48 @@ async def test_fetch_backend_voices_never_raises() -> None:
     session = MagicMock()
     session.get = MagicMock(side_effect=ClientError("no connection"))
     assert await fetch_backend_voices(session, "https://api.openai.com/v1") == []
+
+
+def create_failing_voices_session(status: int) -> MagicMock:
+    """Return an http session whose voices endpoint answers with the given error status."""
+    response = MagicMock()
+    response.raise_for_status = MagicMock(
+        side_effect=ClientResponseError(MagicMock(), (), status=status)
+    )
+    session = MagicMock()
+    session.get = MagicMock(
+        return_value=MagicMock(
+            __aenter__=AsyncMock(return_value=response), __aexit__=AsyncMock(return_value=False)
+        )
+    )
+    return session
+
+
+async def test_resolve_voices_raises_when_backend_is_down() -> None:
+    """A backend that is not up yet must fail the load (retried) instead of exposing defaults."""
+    provider = create_provider()
+    provider.mass.http_session.get = MagicMock(side_effect=ClientConnectionError("refused"))
+    with pytest.raises(SetupFailedError):
+        await provider._resolve_voices()
+    provider.mass.http_session = create_failing_voices_session(503)
+    with pytest.raises(SetupFailedError):
+        await provider._resolve_voices()
+
+
+async def test_resolve_voices_uses_defaults_when_backend_has_no_listing() -> None:
+    """A reachable backend without a voice listing (the OpenAI cloud API) gets the defaults."""
+    provider = create_provider()
+    provider.mass.http_session = create_failing_voices_session(404)
+    assert await provider._resolve_voices() == list(DEFAULT_VOICES)
+
+
+async def test_fetch_backend_voices_never_raises_unless_required() -> None:
+    """Without require_reachable, an unreachable backend still yields no voices."""
+    session = MagicMock()
+    session.get = MagicMock(side_effect=ClientConnectionError("refused"))
+    assert await fetch_backend_voices(session, "http://kokoro:8880/v1") == []
+    with pytest.raises(SetupFailedError):
+        await fetch_backend_voices(session, "http://kokoro:8880/v1", require_reachable=True)
 
 
 async def test_index_cache_adopts_only_rendered_clips(tmp_path: Path) -> None:
