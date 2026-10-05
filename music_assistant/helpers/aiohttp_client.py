@@ -26,6 +26,7 @@ from . import ssl as ssl_util
 from .json import json_dumps, json_loads
 
 if TYPE_CHECKING:
+    from aiohttp.abc import ResolveResult
     from aiohttp.typedefs import JSONDecoder
     from music_assistant_models.event import MassEvent
 
@@ -111,6 +112,28 @@ class MassAsyncDNSResolver(AsyncDualMDNSResolver):
     This is a wrapper around the AsyncDualMDNSResolver to only
     close the resolver when the Music Assistant instance is closed.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the resolver."""
+        super().__init__(*args, **kwargs)
+        self._system_resolver = aiohttp.ThreadedResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        """
+        Resolve a host name, retrying a failed lookup with the system resolver.
+
+        :param host: The host name to resolve.
+        :param port: The port to put in the results.
+        :param family: The address family to resolve for.
+        """
+        try:
+            return await super().resolve(host, port, family)
+        except OSError:
+            # c-ares caches a negative answer for up to an hour, so a (container) name
+            # looked up while its host was briefly gone would stay unresolvable that long
+            return await self._system_resolver.resolve(host, port, family)
 
     async def real_close(self) -> None:
         """Close the resolver."""

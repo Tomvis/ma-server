@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
+from aiohttp_asyncmdnsresolver.api import AsyncDualMDNSResolver
 
 from music_assistant.helpers import aiohttp_client
 
@@ -60,3 +61,32 @@ async def test_clientsession_ignores_env_without_proxy(monkeypatch: pytest.Monke
         session = aiohttp_client.create_clientsession(mass)
         assert session.trust_env is False
         await session.close()
+
+
+async def test_resolver_retries_failed_lookup_with_system_resolver() -> None:
+    """A lookup c-ares fails (possibly from its negative cache) is retried uncached."""
+    resolver = aiohttp_client.MassAsyncDNSResolver()
+    found = [{"hostname": "kokoro", "host": "172.16.1.12", "port": 8880}]
+    with (
+        patch.object(
+            AsyncDualMDNSResolver, "resolve", AsyncMock(side_effect=OSError(None, "not found"))
+        ),
+        patch.object(resolver, "_system_resolver") as system_resolver,
+    ):
+        system_resolver.resolve = AsyncMock(return_value=found)
+        assert await resolver.resolve("kokoro", 8880) == found
+        system_resolver.resolve.assert_awaited_once()
+    await resolver.real_close()
+
+
+async def test_resolver_skips_system_resolver_on_success() -> None:
+    """A successful c-ares lookup is returned as is."""
+    resolver = aiohttp_client.MassAsyncDNSResolver()
+    found = [{"hostname": "kokoro", "host": "172.16.1.12", "port": 8880}]
+    with (
+        patch.object(AsyncDualMDNSResolver, "resolve", AsyncMock(return_value=found)),
+        patch.object(resolver, "_system_resolver") as system_resolver,
+    ):
+        assert await resolver.resolve("kokoro", 8880) == found
+        system_resolver.resolve.assert_not_called()
+    await resolver.real_close()
