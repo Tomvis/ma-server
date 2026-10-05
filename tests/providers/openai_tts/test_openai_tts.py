@@ -166,19 +166,20 @@ def create_failing_voices_session(status: int) -> MagicMock:
 async def test_resolve_voices_raises_when_backend_is_down() -> None:
     """A backend that is not up yet must fail the load (retried) instead of exposing defaults."""
     provider = create_provider()
-    provider.mass.http_session.get = MagicMock(side_effect=ClientConnectionError("refused"))
-    with pytest.raises(SetupFailedError):
-        await provider._resolve_voices()
-    provider.mass.http_session = create_failing_voices_session(503)
-    with pytest.raises(SetupFailedError):
-        await provider._resolve_voices()
+    refusing = MagicMock(get=MagicMock(side_effect=ClientConnectionError("refused")))
+    for session in (refusing, create_failing_voices_session(503)):
+        with (
+            patch.object(provider.mass, "http_session", session),
+            pytest.raises(SetupFailedError),
+        ):
+            await provider._resolve_voices()
 
 
 async def test_resolve_voices_uses_defaults_when_backend_has_no_listing() -> None:
     """A reachable backend without a voice listing (the OpenAI cloud API) gets the defaults."""
     provider = create_provider()
-    provider.mass.http_session = create_failing_voices_session(404)
-    assert await provider._resolve_voices() == list(DEFAULT_VOICES)
+    with patch.object(provider.mass, "http_session", create_failing_voices_session(404)):
+        assert await provider._resolve_voices() == list(DEFAULT_VOICES)
 
 
 async def test_fetch_backend_voices_never_raises_unless_required() -> None:
