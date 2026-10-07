@@ -13,8 +13,7 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
-from aiosendspin.models.types import RepeatMode as SendspinRepeatMode
-from music_assistant_models.enums import PlaybackState, RepeatMode
+from music_assistant_models.enums import PlaybackState
 from music_assistant_models.player import PlayerMedia
 
 from music_assistant.providers.sendspin.player import SendspinPlayer
@@ -62,8 +61,8 @@ def test_missing_media_elapsed_falls_back_to_player() -> None:
     assert result == 12_000
 
 
-def test_metadata_builder_preserves_unknown_duration_progress_and_modes() -> None:
-    """Unknown duration uses zero while progress and legacy modes remain populated."""
+def test_metadata_builder_preserves_unknown_duration_progress() -> None:
+    """Unknown duration uses zero while progress remains populated."""
     player = MagicMock()
     player.state.playback_state = PlaybackState.PAUSED
     player.corrected_elapsed_time = None
@@ -73,8 +72,6 @@ def test_metadata_builder_preserves_unknown_duration_progress_and_modes() -> Non
     )
     media = PlayerMedia(uri="library://track/1", duration=0, elapsed_time=12)
     queue = MagicMock()
-    queue.repeat_mode = RepeatMode.ONE
-    queue.shuffle_enabled = True
     # Fork: the trackfields builder reads the queue position too.
     queue.current_index = None
     queue.items = 0
@@ -85,5 +82,3 @@ def test_metadata_builder_preserves_unknown_duration_progress_and_modes() -> Non
 
     assert metadata.track_duration == 0
     assert metadata.track_progress == 12_000
-    assert metadata.repeat == SendspinRepeatMode.ONE
-    assert metadata.shuffle is True

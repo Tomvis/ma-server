@@ -40,7 +40,16 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # at "prev_version <= 61". This branch was already stamped 63, so that gate can never
 # fire for a fork database. The step in migrations.py is widened to "<= 63" and the
 # version moved to 64.
-DB_SCHEMA_VERSION: Final[int] = 64
+#
+# 65: upstream took 63 for its own step (dropping images with an empty path, which
+# resolve to one shared picture per provider) and gated it at "prev_version <= 62".
+# This branch was already stamped 64, so that gate can never fire for a fork database.
+# The step in migrations.py is widened to "<= 64".
+#
+# 66: upstream took 64 for its own step (moving the audio analysis tables out of
+# library.db into audio_analysis.db) and gated it at "prev_version <= 63". Widened to
+# "<= 65" for the same reason, and the version moved to 66.
+DB_SCHEMA_VERSION: Final[int] = 66
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
@@ -102,3 +111,11 @@ TRACK_RECONCILIATION_MAX_DURATION_DELTA: Final[int] = 8
 # walk skips that title. Pairing the rows of a title is quadratic in their count, and a title
 # held by hundreds of rows is a generic one rather than a duplicate
 TRACK_RECONCILIATION_MAX_TITLE_ROWS: Final[int] = 200
+# Audio analysis rows are moved out of library.db in batches of this many rows, one
+# transaction each.
+AUDIO_ANALYSIS_MOVE_BATCH_SIZE: Final[int] = 5000
+# Legacy analysis JSON rows are packed while they move, in cursor batches of this size, one
+# transaction each; a fully analysed row is ~230 KB of JSON, so a batch is held in memory
+# twice (decoded and packed) while it converts. Progress is logged once per this many rows.
+AUDIO_ANALYSIS_PACK_BATCH_SIZE: Final[int] = 100
+AUDIO_ANALYSIS_PACK_PROGRESS_ROWS: Final[int] = 2000
