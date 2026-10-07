@@ -107,6 +107,18 @@ def _failing_provider_fetch(
         ),
         (aiohttp.ClientConnectionError("connection reset"), logging.WARNING),
         (aiohttp.ClientPayloadError("response payload is not completed"), logging.WARNING),
+        # fork (f26095dae): an HTTP status the provider did not translate costs that provider's
+        # listing only -- upstream propagates it and fails the whole album, library tracks included
+        (
+            aiohttp.ClientResponseError(MagicMock(), (), status=401, message="Unauthorized"),
+            logging.WARNING,
+        ),
+        (
+            aiohttp.ClientResponseError(
+                MagicMock(), (), status=500, message="Internal Server Error"
+            ),
+            logging.WARNING,
+        ),
     ],
 )
 async def test_album_tracks_skip_failing_provider(
@@ -135,11 +147,8 @@ async def test_album_tracks_skip_failing_provider(
 @pytest.mark.parametrize(
     "error",
     [
+        # an account problem is the user's to fix; the fork skips every other provider failure
         LoginFailed("token expired"),
-        # an HTTP status the provider did not translate: not one of the expected fetch
-        # failures, so not skipped over either, unlike the HTML error page above
-        aiohttp.ClientResponseError(MagicMock(), (), status=401, message="Unauthorized"),
-        aiohttp.ClientResponseError(MagicMock(), (), status=500, message="Internal Server Error"),
     ],
 )
 async def test_album_tracks_do_not_hide_an_unexpected_provider_error(
