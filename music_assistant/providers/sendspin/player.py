@@ -313,8 +313,11 @@ def _queue_position(queue: PlayerQueue | None) -> tuple[int | None, int | None]:
     """
     if queue is None:
         return None, None
-    queue_track = queue.current_index + 1 if queue.current_index is not None else None
-    total_tracks = queue.items if queue.items > 0 else None
+    # getattr: upstream's tests hand in queue stand-ins without these attributes.
+    current_index = getattr(queue, "current_index", None)
+    items = getattr(queue, "items", 0)
+    queue_track = current_index + 1 if current_index is not None else None
+    total_tracks = items if items > 0 else None
     return queue_track, total_tracks
 
 

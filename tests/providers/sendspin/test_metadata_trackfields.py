@@ -71,6 +71,7 @@ def _player(
     player._metadata_publish_allowed = Mock(return_value=True)
     player._metadata_lock = asyncio.Lock()
     player._controller_role = None
+    player._queue_repeat_shuffle = SendspinPlayer._queue_repeat_shuffle
     player._publish_repeat_shuffle = Mock()
     player._build_current_media_metadata = lambda *args, **kwargs: (
         SendspinPlayer._build_current_media_metadata(player, *args, **kwargs)
