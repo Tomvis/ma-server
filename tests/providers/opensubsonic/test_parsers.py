@@ -93,6 +93,21 @@ async def test_parse_albums(example: pathlib.Path, snapshot: SnapshotAssertion) 
     assert snapshot == parsed
 
 
+async def test_parse_album_skips_info_image_when_cover_art_present() -> None:
+    """AlbumInfo's small image is the server's own cover at thumbnail size, not a second image."""
+    async with aiofiles.open(FIXTURES_DIR / "albums/spec.album.json", encoding="utf-8") as fp:
+        album = AlbumID3.from_json(await fp.read())
+    async with aiofiles.open(FIXTURES_DIR / "albums/spec.info.json", encoding="utf-8") as fp:
+        album_info = AlbumInfo.from_json(await fp.read())
+
+    parsed = parse_album(_LOGGER, "xx-instance-id-xx", album, album_info)
+    assert [img.path for img in parsed.metadata.images or []] == [album.cover_art]
+
+    album.cover_art = None
+    parsed = parse_album(_LOGGER, "xx-instance-id-xx", album, album_info)
+    assert [img.path for img in parsed.metadata.images or []] == [album_info.small_image_url]
+
+
 @pytest.mark.parametrize("example", PLAYLIST_FIXTURES, ids=lambda val: str(val.stem))
 async def test_parse_playlist(example: pathlib.Path, snapshot: SnapshotAssertion) -> None:
     """Test we can parse Playlists."""

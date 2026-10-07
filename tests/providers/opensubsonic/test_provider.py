@@ -470,6 +470,22 @@ async def test_get_playlist_tracks_sets_track_image_from_cover_art(
 
 
 # ---------------------------------------------------------------------------
+# resolve_image
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_passes_urls_through(provider: OpenSonicProvider) -> None:
+    """A URL (e.g. a Navidrome /share/img/ link) is fetched directly, not looked up as an id."""
+    provider.conn = Mock()
+    provider.conn.get_cover_art = AsyncMock(side_effect=DataNotFoundError)
+    url = "https://navidrome.example/share/img/abc?size=300"
+
+    assert await provider.resolve_image(url) == url
+    provider.conn.get_cover_art.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # search / get_artist_toptracks
 # ---------------------------------------------------------------------------
 

@@ -322,7 +322,9 @@ def parse_album(
         )
 
     if sonic_info:
-        if sonic_info.small_image_url:
+        # the info image is the server's own cover at thumbnail size (Navidrome: a 300px
+        # /share/img/ link); next to the full-size cover_art it only risks being shown first
+        if sonic_info.small_image_url and not sonic_album.cover_art:
             metadata.add_image(
                 MediaItemImage(
                     type=ImageType.THUMB,
