@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 
 from music_assistant.constants import MASS_LOGGER_NAME, UNKNOWN_ARTIST
 from music_assistant.helpers.json import json_loads
-from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.process import AsyncProcess, get_subprocess_env
+from music_assistant.helpers.security import has_control_chars
 from music_assistant.helpers.util import infer_album_type, try_parse_int
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.tags")
@@ -1140,7 +1141,10 @@ def parse_tags(
         # without this timeout the thread keeps running forever, eventually
         # saturating the default thread pool. The bound has to live here.
         res = subprocess.check_output(  # noqa: S603
-            args, timeout=PARSE_TAGS_TIMEOUT_SECONDS, stderr=subprocess.PIPE
+            args,
+            timeout=PARSE_TAGS_TIMEOUT_SECONDS,
+            stderr=subprocess.PIPE,
+            env=get_subprocess_env(),
         )
         data = json.loads(res)
         if error := data.get("error"):
@@ -1210,7 +1214,9 @@ def get_file_duration(input_file: str) -> float:
         "-",
     )
     try:
-        res = subprocess.check_output(args, stderr=subprocess.STDOUT).decode()  # noqa: S603
+        res = subprocess.check_output(  # noqa: S603
+            args, stderr=subprocess.STDOUT, env=get_subprocess_env()
+        ).decode()
         # extract duration from ffmpeg output
         duration_str = res.split("time=")[-1].split(" ")[0].strip()
         duration_parts = duration_str.split(":")
@@ -2035,12 +2041,18 @@ async def get_embedded_image(input_file: str) -> bytes | None:
     """
     Return embedded image data.
 
-    Input_file may be a (local) filename or URL accessible by ffmpeg.
+    Input_file may be an existing local file or an http(s) URL; any other input
+    (such as an ffmpeg protocol locator) yields None.
     """
+    if has_control_chars(input_file):
+        return None
+    is_url = input_file.startswith(("http://", "https://"))
+    if not is_url and not await asyncio.to_thread(os.path.isfile, input_file):
+        return None
     # For APEv2-only formats, use mutagen since FFmpeg cannot extract APEv2 cover art
     # Only check files with extensions that exclusively use APEv2 tags to avoid
     # unnecessary blocking I/O for MP3/FLAC/OGG/etc files
-    if not input_file.startswith(("http://", "https://")) and Path(input_file).is_file():
+    if not is_url:
         # Check file extension to determine if it's an APEv2-only format
         ext = input_file.lower().rsplit(".", 1)[-1] if "." in input_file else ""
         if _format_uses_apev2(ext):
@@ -2053,6 +2065,10 @@ async def get_embedded_image(input_file: str) -> bytes | None:
         "-hide_banner",
         "-loglevel",
         "error",
+        # applies to the input it precedes: a local file may not reach the network and a
+        # URL may not open local files, whatever either of them references
+        "-protocol_whitelist",
+        "http,https,tcp,tls" if is_url else "file",
         "-i",
         input_file,
         "-an",

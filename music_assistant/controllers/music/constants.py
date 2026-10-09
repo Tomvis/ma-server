@@ -49,7 +49,11 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # 66: upstream took 64 for its own step (moving the audio analysis tables out of
 # library.db into audio_analysis.db) and gated it at "prev_version <= 63". Widened to
 # "<= 65" for the same reason, and the version moved to 66.
-DB_SCHEMA_VERSION: Final[int] = 66
+#
+# 67: upstream took 65 for its own step (moving misplaced aliases off the default
+# classical genre) and gated it at "prev_version <= 64". Widened to "<= 66" for the
+# same reason, and the version moved to 67.
+DB_SCHEMA_VERSION: Final[int] = 67
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
