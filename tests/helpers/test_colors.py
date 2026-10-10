@@ -132,6 +132,29 @@ def test_extract_palette_handles_invalid_bytes() -> None:
     assert palette.primary is None
 
 
+@pytest.mark.parametrize("image_format", ["JPEG", "PNG"])
+def test_extract_palette_downscales_before_quantizing(
+    image_format: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quantizer only ever sees a small copy of large artwork."""
+    seen: list[tuple[int, int]] = []
+
+    def fake_mmcq(image: Any, **_kwargs: Any) -> list[tuple[int, int, int]]:
+        with Image.open(io.BytesIO(image) if isinstance(image, bytes) else image) as img:
+            seen.append(img.size)
+        return [(60, 30, 90), (220, 200, 150)]
+
+    monkeypatch.setattr("music_assistant.helpers.colors._mmcq_palette", fake_mmcq)
+    buf = io.BytesIO()
+    Image.new("RGB", (3000, 2000), (60, 30, 90)).save(buf, image_format)
+
+    palette = extract_palette(buf.getvalue())
+
+    assert palette.primary is not None
+    assert len(seen) == 1
+    assert max(seen[0]) <= 512
+
+
 def test_extract_palette_end_to_end() -> None:
     """An image with multiple distinct colors yields a palette that meets WCAG."""
     image_bytes = _make_image_bytes([(60, 30, 90), (220, 200, 150), (250, 250, 245)])

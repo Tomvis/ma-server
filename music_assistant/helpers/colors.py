@@ -15,11 +15,13 @@ shared process-wide.
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 from typing import TYPE_CHECKING
 
 from modern_colorthief import get_palette as _mmcq_palette
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import MediaItemPalette
+from PIL import Image
 
 from music_assistant.helpers.images import (
     _extract_imageproxy_id,
@@ -33,7 +35,11 @@ if TYPE_CHECKING:
 
 
 _PALETTE_QUANTIZE_COLORS = 5
-_COLORTHIEF_QUALITY = 10
+# The quantizer costs ~240 bytes per source pixel (a 5000x5000 cover peaked at 6 GB),
+# so it only ever sees a copy this small. Every pixel of that copy is sampled, which
+# keeps the candidates of the former every-10th-pixel pass over full-size art.
+_PALETTE_SAMPLE_SIZE = 512
+_COLORTHIEF_QUALITY = 1
 # Minimum contrast ratio between colors (Sendspin color@v1 requires WCAG AA ≥ 4.5:1).
 _MIN_CONTRAST = 4.5
 # Preferred contrast (we try this first for richer, more vivid picks)
@@ -115,10 +121,24 @@ def _adjust_with_fallback(color: _RGB, mix_toward: _RGB, refs: tuple[_RGB, ...])
     ) or _adjust_until_contrast(color, mix_toward, refs, _MIN_CONTRAST)
 
 
+def _downscale(image_bytes: bytes) -> bytes:
+    """Return the image re-encoded at most _PALETTE_SAMPLE_SIZE pixels on its longest side."""
+    with Image.open(BytesIO(image_bytes)) as img:
+        target = (_PALETTE_SAMPLE_SIZE, _PALETTE_SAMPLE_SIZE)
+        # JPEG decodes straight at a reduced scale, so the full-size bitmap is never built.
+        img.draft("RGB", target)
+        img.thumbnail(target)
+        out = BytesIO()
+        img.convert("RGB").save(out, "PNG")
+    return out.getvalue()
+
+
 def _extract_candidates(image_bytes: bytes) -> list[_RGB]:
     """Extract a dominant-color palette via MMCQ (matches the colorthief JS lib)."""
     palette = _mmcq_palette(
-        image_bytes, color_count=_PALETTE_QUANTIZE_COLORS, quality=_COLORTHIEF_QUALITY
+        _downscale(image_bytes),
+        color_count=_PALETTE_QUANTIZE_COLORS,
+        quality=_COLORTHIEF_QUALITY,
     )
     return [(r, g, b) for r, g, b in palette]
 
