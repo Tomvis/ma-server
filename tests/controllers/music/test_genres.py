@@ -857,34 +857,60 @@ class TestSyncMediaItemGenres:
         )
         assert len(rows) == 0
 
-    async def test_sync_keeps_mapping_backed_by_stored_metadata(
+    async def test_sync_removal_drops_genre_from_metadata_so_scan_skips_it(
         self, mass: MusicAssistant, genre_ctrl: GenreController
     ) -> None:
-        """A genre the provider dropped but stored metadata still lists is not re-written (HW-92)."""
+        """A genre the provider dropped is not re-mapped by the post-sync scan (HW-92)."""
         track = await _add_test_track(mass, "Sync Track Stale Meta")
         track_id = int(track.item_id)
-        await _set_track_genres(mass, track_id, ["SyncKeepA", "SyncKeepB"])
+        await _set_track_genres(mass, track_id, ["SyncKeepA", "SyncDropB"])
         await genre_ctrl.sync_media_item_genres(
-            MediaType.TRACK, track.item_id, {"SyncKeepA", "SyncKeepB"}
+            MediaType.TRACK, track.item_id, {"SyncKeepA", "SyncDropB"}
         )
-        query = (
-            f"SELECT rowid, alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
-            "WHERE media_id = :mid AND media_type = 'track'"
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"SyncKeepA"})
+        await genre_ctrl._bulk_scan_unmapped_genres()
+
+        rows = await mass.music.database.get_rows_from_query(
+            f"SELECT alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+            "WHERE media_id = :mid AND media_type = 'track'",
+            {"mid": track_id},
+            limit=0,
         )
-        before = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
-
-        # the post-sync genre scan re-maps every stored metadata genre, so removing
-        # SyncKeepB here would only delete and re-insert the same row on every sync
-        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"SyncKeepA"})
-        after = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
-        assert {(r["rowid"], r["alias"]) for r in after} == {
-            (r["rowid"], r["alias"]) for r in before
-        }
-
-        await _set_track_genres(mass, track_id, ["SyncKeepA"])
-        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"SyncKeepA"})
-        rows = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
         assert [r["alias"] for r in rows] == ["SyncKeepA"]
+        stored = await mass.music.database.get_rows_from_query(
+            f"SELECT json_extract(metadata, '$.genres') AS genres FROM {DB_TABLE_TRACKS} "
+            "WHERE item_id = :id",
+            {"id": track_id},
+            limit=1,
+        )
+        assert json.loads(stored[0]["genres"]) == ["SyncKeepA"]
+
+    async def test_sync_records_new_genre_in_metadata_so_cleanup_keeps_it(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """A genre the provider adds survives the post-sync stale-alias cleanup (HW-92)."""
+        track = await _add_test_track(mass, "Sync Track New Tag")
+        track_id = int(track.item_id)
+        await _set_track_genres(mass, track_id, ["SyncOldTag"])
+        await genre_ctrl.sync_media_item_genres(
+            MediaType.TRACK, track.item_id, {"SyncOldTag", "SyncNewTag"}
+        )
+        await genre_ctrl._cleanup_stale_genre_mappings()
+
+        rows = await mass.music.database.get_rows_from_query(
+            f"SELECT alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+            "WHERE media_id = :mid AND media_type = 'track'",
+            {"mid": track_id},
+            limit=0,
+        )
+        assert {r["alias"] for r in rows} == {"SyncOldTag", "SyncNewTag"}
+        stored = await mass.music.database.get_rows_from_query(
+            f"SELECT json_extract(metadata, '$.genres') AS genres FROM {DB_TABLE_TRACKS} "
+            "WHERE item_id = :id",
+            {"id": track_id},
+            limit=1,
+        )
+        assert set(json.loads(stored[0]["genres"])) == {"SyncOldTag", "SyncNewTag"}
 
     async def test_sync_idempotent(self, mass: MusicAssistant, genre_ctrl: GenreController) -> None:
         """Second call with same set is a no-op."""

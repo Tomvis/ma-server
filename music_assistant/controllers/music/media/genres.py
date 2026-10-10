@@ -1135,10 +1135,6 @@ class GenreController(MediaControllerBase[Genre]):
             stored_ids, removable_ids = await self._get_synced_genre_ids(media_type, media_id_int)
             if removable_ids <= target_ids <= stored_ids:
                 return
-            if target_ids <= stored_ids and removable_ids - target_ids <= (
-                await self._get_metadata_genre_ids(media_type, media_id_int, content_type)
-            ):
-                return
 
         # batch the (possible) genre creations and mapping changes into a single commit
         async with self.mass.music.database.deferred_commit():
@@ -1159,14 +1155,8 @@ class GenreController(MediaControllerBase[Genre]):
                 media_type, media_id_int
             )
             to_add = set(target_mappings.keys()) - existing_genre_ids
-            # the post-sync genre scan re-maps every genre the item's stored metadata still
-            # lists (genre sets merge, so a genre the provider dropped stays there); removing
-            # those would delete and re-insert the same rows on every sync (HW-92)
-            to_remove = (
-                removable_genre_ids
-                - set(target_mappings.keys())
-                - await self._get_metadata_genre_ids(media_type, media_id_int, content_type)
-            )
+            to_remove = removable_genre_ids - set(target_mappings.keys())
+            removed_aliases = await self._get_mapping_aliases(media_type, media_id_int, to_remove)
 
             for genre_id in to_remove:
                 await self.mass.music.database.delete(
@@ -1188,6 +1178,16 @@ class GenreController(MediaControllerBase[Genre]):
                         "alias": target_mappings[genre_id],
                     },
                     allow_replace=True,
+                )
+            # library syncs don't refresh stored metadata for unchanged items, while the
+            # post-sync genre scan maps from it: mirror the changes there, or the scan deletes
+            # each added mapping and re-adds each removed one, every sync (HW-92)
+            if to_add or removed_aliases:
+                await self._update_metadata_genres(
+                    media_type,
+                    media_id_int,
+                    add={target_mappings[gid] for gid in to_add},
+                    remove=removed_aliases - set(target_mappings.values()),
                 )
 
     def register_scheduled_scan_task(self) -> BackgroundTask:
@@ -2061,13 +2061,34 @@ class GenreController(MediaControllerBase[Genre]):
         removable_ids = {int(row["genre_id"]) for row in rows if not row["is_manual"]}
         return all_ids, removable_ids
 
-    async def _get_metadata_genre_ids(
-        self, media_type: MediaType, media_id: int, content_type: MediaType | None
-    ) -> set[int]:
-        """Return the genre ids the item's stored metadata.genres resolve to, minus exclusions."""
+    async def _get_mapping_aliases(
+        self, media_type: MediaType, media_id: int, genre_ids: set[int]
+    ) -> set[str]:
+        """Return the stored aliases of an item's mappings to the given genres."""
+        if not genre_ids:
+            return set()
+        rows = await self.mass.music.database.get_rows_from_query(
+            f"SELECT genre_id, alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+            "WHERE media_type = :media_type AND media_id = :media_id",
+            {"media_type": media_type.value, "media_id": media_id},
+            limit=0,
+        )
+        return {row["alias"] for row in rows if row["alias"] and int(row["genre_id"]) in genre_ids}
+
+    async def _update_metadata_genres(
+        self, media_type: MediaType, media_id: int, add: set[str], remove: set[str]
+    ) -> None:
+        """
+        Add and remove genre names (case-insensitively) in an item's stored metadata.genres.
+
+        :param media_type: The type of the media item.
+        :param media_id: The database ID of the media item.
+        :param add: Genre names to add when missing.
+        :param remove: Genre names to drop.
+        """
         table = next((tbl for tbl, mtype in MEDIA_TABLES if mtype == media_type), None)
         if table is None:
-            return set()
+            return
         db = self.mass.music.database
         rows = await db.get_rows_from_query(
             f"SELECT json_extract(metadata, '$.genres') AS genres FROM {table} "
@@ -2075,23 +2096,21 @@ class GenreController(MediaControllerBase[Genre]):
             {"item_id": media_id},
             limit=1,
         )
-        if not rows or not rows[0]["genres"]:
-            return set()
-        names = {name for name in json_loads(rows[0]["genres"]) if isinstance(name, str)}
-        genre_ids = await self._resolve_genre_names_cached(names, content_type)
-        if genre_ids is None:
-            # the snapshot may predate genres created since; rebuild it once
-            self._sync_lookup_cache.pop(content_type.value if content_type else None, None)
-            genre_ids = await self._resolve_genre_names_cached(names, content_type)
-        if not genre_ids:
-            return set()
-        excluded = await db.get_rows_from_query(
-            f"SELECT genre_id FROM {DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION} "
-            "WHERE media_type = :media_type AND media_id = :media_id",
-            {"media_type": media_type.value, "media_id": media_id},
-            limit=0,
+        if not rows:
+            return
+        stored = rows[0]["genres"]
+        names = [n for n in (json_loads(stored) if stored else []) if isinstance(n, str)]
+        drop = {name.strip().lower() for name in remove}
+        kept = [name for name in names if name.strip().lower() not in drop]
+        present = {name.strip().lower() for name in kept}
+        new_names = kept + sorted(name for name in add if name.strip().lower() not in present)
+        if new_names == names:
+            return
+        await db.execute(
+            f"UPDATE {table} SET metadata = json_set(COALESCE(metadata, '{{}}'), "
+            "'$.genres', json(:genres)) WHERE item_id = :item_id",
+            {"genres": serialize_to_json(new_names), "item_id": media_id},
         )
-        return genre_ids - {int(row["genre_id"]) for row in excluded}
 
     async def _ensure_aliases(self, genre_id: int, aliases: list[str]) -> None:
         """
