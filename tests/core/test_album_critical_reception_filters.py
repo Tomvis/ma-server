@@ -203,12 +203,26 @@ def test_amg_rating_selector_vocabulary() -> None:
     assert params == {}
 
 
-def test_tps_rating_three_step_buckets() -> None:
-    """TPS uses 1/3/5/7/9 selectors; selector 7 covers [7, 9), selector 9 covers [9, 11)."""
+def test_tps_rating_half_point_steps() -> None:
+    """
+    TPS selectors are single half-point steps over 0.5..10, like AMG's half stars.
+
+    Album 2 is TPS 8.5 and album 4 an off-grid 9.2, which lands in the 9 step.
+    """
     con = _make_db()
-    assert _exec_with_filters(con, tps_ratings=[7]) == [2]
+    assert _exec_with_filters(con, tps_ratings=[8.5]) == [2]
     assert _exec_with_filters(con, tps_ratings=[9]) == [4]
-    assert _exec_with_filters(con, tps_ratings=[7, 9]) == [2, 4]
+    assert _exec_with_filters(con, tps_ratings=[8, 9.5]) == []
+    assert _exec_with_filters(con, tps_ratings=[8.5, 9]) == [2, 4]
+
+
+def test_tps_rating_selector_vocabulary() -> None:
+    """The whole 0.5..10 half-point scale binds; off-step values are dropped."""
+    _, params = _build(tps_ratings=[10])
+    assert params == {"tps_rb_lo_0": 10.0, "tps_rb_hi_0": 10.5}
+    parts, params = _build(tps_ratings=[8.75])
+    assert parts == []
+    assert params == {}
 
 
 def test_amg_favorite_only() -> None:
@@ -269,9 +283,9 @@ def test_amg_untagged_matches_albums_without_amg_entry() -> None:
 
 
 def test_filters_combine_as_and_across_fields() -> None:
-    """DR good AND TPS [7,9) → only album 2 (DR 11 + TPS 8.5)."""
+    """DR good AND TPS [8.5, 9) → only album 2 (DR 11 + TPS 8.5)."""
     con = _make_db()
-    assert _exec_with_filters(con, dr_buckets=["good"], tps_ratings=[7]) == [2]
+    assert _exec_with_filters(con, dr_buckets=["good"], tps_ratings=[8.5]) == [2]
 
 
 def test_unknown_accolade_kind_silently_dropped() -> None:

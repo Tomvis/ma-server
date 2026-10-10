@@ -218,13 +218,12 @@ def _current_userid() -> str:
 
 
 # Rating-bucket vocabulary per CR source: the selector values a client may send and
-# the width of the bucket each selector spans. AMG rates in half stars, the full 0.5-5.0
-# scale it publishes (Unlistenable .. Iconic), so a selector is one exact step: 4.5 covers
-# [4.5, 5.0) and 4 covers [4.0, 4.5), keeping 4-star and 4.5-star albums separable. TPS
-# selectors step in twos over its /10 scale.
+# the width of the bucket each selector spans. Both sources score in half points (AMG
+# 0.5-5.0 stars, TPS 0.5-10), so a selector is one exact step: 4.5 covers [4.5, 5.0)
+# and 4 covers [4.0, 4.5). An off-grid score (TPS 8.75, 9.2) lands in the step below it.
 _CR_RATING_SPECS: dict[str, tuple[frozenset[float], float]] = {
     "AMG": (frozenset(n / 2 for n in range(1, 11)), 0.5),
-    "TPS": (frozenset({1.0, 3.0, 5.0, 7.0, 9.0}), 2.0),
+    "TPS": (frozenset(n / 2 for n in range(1, 21)), 0.5),
 }
 
 
@@ -353,7 +352,7 @@ def _rating_bucket_clause(
 
     Selectors outside the source's vocabulary (see ``_CR_RATING_SPECS``) are dropped;
     each surviving selector N matches the half-open range [N, N + width) — one exact
-    half-star step for AMG, a two-point band for TPS.
+    half-point step.
     """
     allowed, width = _CR_RATING_SPECS[source]
     valid = sorted({v for v in _coerce_float_list(values) if v in allowed})
@@ -757,8 +756,7 @@ class AlbumsController(MediaControllerBase[Album]):
             fields needed for a list view. Set to False to get fully hydrated items.
         :param dr_buckets: Filter by DR quality bucket (excellent/good/fair/poor/untagged).
         :param amg_ratings / tps_ratings: Filter by review-source rating buckets
-            (AMG: half stars 0.5..5.0, each selector one exact step; TPS: 1/3/5/7/9,
-            each selector a two-point band on the /10 scale).
+            (half points, AMG 0.5..5.0 / TPS 0.5..10, each selector one exact step).
         :param amg_favorite / tps_favorite: Keep only entries flagged as favourite.
         :param amg_accolades / tps_accolades: Filter by accolade kind (aoty,
             record_of_the_month, honorable_mention, score_revised, tymhm, sitf,
