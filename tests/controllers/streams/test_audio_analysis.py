@@ -1016,6 +1016,7 @@ def _stub_controller(
     c.logger = MagicMock()
     db = MagicMock()
     db.get_count_from_query = AsyncMock(return_value=count_result)
+    db.get_rows_from_query = AsyncMock(return_value=[])
     db.delete = AsyncMock()
     rows_to_yield = list(iter_rows or [])
 

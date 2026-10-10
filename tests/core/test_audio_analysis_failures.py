@@ -376,3 +376,35 @@ async def test_clear_failures_by_domain(
     deleted = await controller.clear_failures(aa_domain="sonic_analysis")
     assert deleted == 2
     assert await controller.database.get_rows(AA_TABLE_FAILURES, limit=0) == []
+
+
+@pytest.mark.asyncio
+async def test_set_audio_analysis_skips_identical_rewrite(
+    real_db: DatabaseConnection, tmp_path: pathlib.Path
+) -> None:
+    """An unchanged analysis is not rewritten; a changed value or version is (HW-92)."""
+    controller = await _make_controller(real_db, _make_fs_music_provider(), tmp_path)
+
+    async def _store(loudness: float, version: int = 1) -> None:
+        await controller.set_audio_analysis(
+            item_id="t1",
+            provider_instance_id_or_domain="filesystem_local--abc",
+            aa_provider_domain="provider_loudness",
+            analysis=AudioAnalysisData(loudness_integrated=loudness),
+            analysis_version=version,
+        )
+
+    async def _row_ids() -> list[int]:
+        rows = await controller.database.get_rows(AA_TABLE_ANALYSIS, limit=0)
+        return [row["id"] for row in rows]
+
+    await _store(-9.5)
+    first = await _row_ids()
+    await _store(-9.5)
+    assert await _row_ids() == first
+
+    await _store(-8.0)
+    changed = await _row_ids()
+    assert changed != first
+    await _store(-8.0, version=2)
+    assert await _row_ids() != changed

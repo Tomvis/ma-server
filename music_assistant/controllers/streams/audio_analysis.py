@@ -524,18 +524,31 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
         else:
             prov_key = provider.domain if provider.is_streaming_provider else provider.instance_id
         header, payload = encode(analysis)
-        await self.database.insert_or_replace(
-            AA_TABLE_ANALYSIS,
-            {
-                "media_type": media_type.value,
-                "item_id": item_id,
-                "provider": prov_key,
-                "aa_provider_domain": aa_provider_domain,
-                "analysis_version": analysis_version,
-                "header": header,
-                "payload": payload,
-            },
+        key = {
+            "media_type": media_type.value,
+            "item_id": item_id,
+            "provider": prov_key,
+            "aa_provider_domain": aa_provider_domain,
+        }
+        # every library sync re-stores tag loudness for each track; skip unchanged rows,
+        # since a REPLACE rewrites row + index pages each time (HW-92: ~100 GB/day of WAL)
+        existing = await self.database.get_rows_from_query(
+            f"SELECT analysis_version, CAST(header AS BLOB) AS header, payload "
+            f"FROM {AA_TABLE_ANALYSIS} WHERE media_type = :media_type AND item_id = :item_id "
+            "AND provider = :provider AND aa_provider_domain = :aa_provider_domain",
+            key,
+            limit=1,
         )
+        if not (
+            existing
+            and existing[0]["analysis_version"] == analysis_version
+            and existing[0]["header"] == header.encode()
+            and existing[0]["payload"] == payload
+        ):
+            await self.database.insert_or_replace(
+                AA_TABLE_ANALYSIS,
+                {**key, "analysis_version": analysis_version, "header": header, "payload": payload},
+            )
         await self.clear_analysis_failure(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
