@@ -109,3 +109,6 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "era": 0.1,
     },
 }
+
+# The text encoder holds ~0.9 GB once loaded; free it after this long without a text query.
+TEXT_ENCODER_IDLE_UNLOAD_SECONDS = 600

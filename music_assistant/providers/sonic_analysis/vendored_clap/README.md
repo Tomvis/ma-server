@@ -64,6 +64,12 @@ divergence point.
   lifetime.  Replaced with a `with warnings.catch_warnings(): warnings.filterwarnings("ignore")`
   block inside `load_clap()`, which restores the original filter state when the method returns.
 
+**Memory-mapped checkpoint load:**
+- `clap_wrapper.py::load_clap` — `torch.load(..., mmap=True)`. The 2023 checkpoint
+  carries the GPT2 text weights too; reading it whole cost ~810MB of peak RSS for an
+  audio-only load. Mapped, only the tensors `load_state_dict` copies are paged in
+  (measured peak +290MB, steady +150MB).
+
 **transformers v5 compatibility:**
 - `clap_wrapper.py::preprocess_text` — `tokenizer.encode_plus(text=ttext, ...)`
   → `tokenizer(ttext, ...)`. Reason: `encode_plus()` was *removed* (not just

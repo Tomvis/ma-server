@@ -140,7 +140,12 @@ class CLAPWrapper:
             # non-tensor metadata (the original args namespace). Source is trusted
             # (microsoft/msclap on HuggingFace Hub) so the unsafe-deserialization
             # risk that motivated CVE-2026-1839 doesn't apply here.
-            model_state_dict = torch.load(self.model_fp, map_location=torch.device("cpu"))["model"]
+            # MA MOD: mmap=True maps the checkpoint instead of reading all ~690MB into RAM;
+            # only the tensors load_state_dict copies are paged in (the GPT2 text weights
+            # are skipped entirely when text_enabled=False).
+            model_state_dict = torch.load(
+                self.model_fp, map_location=torch.device("cpu"), mmap=True
+            )["model"]
 
             # We unwrap the DDP model and save. If the model is not unwrapped and saved, then the model needs to unwrapped before `load_state_dict`:
             # Reference link: https://discuss.pytorch.org/t/how-to-load-dataparallel-model-which-trained-using-multiple-gpus/146005

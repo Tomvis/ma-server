@@ -71,6 +71,7 @@ from music_assistant.providers.sonic_similarity.constants import (
     RECOMMEND_SEED_COUNT,
     SIMILAR_ENGINE_18DIM,
     SIMILAR_ENGINE_CLAP,
+    TEXT_ENCODER_IDLE_UNLOAD_SECONDS,
     USEARCH_INDEX_FILENAME_GLOB,
     USEARCH_INDEX_FILENAME_TPL,
 )
@@ -138,6 +139,9 @@ class SonicSimilarityPlugin(PluginProvider):
         # CLAP text encoder — lazy: stays None until the first text_search call.
         self._text_encoder: Any = None
         self._text_encoder_lock = asyncio.Lock()
+        self._text_encoder_unload_task_id = (
+            f"sonic_similarity_text_encoder_unload.{self.instance_id}"
+        )
         # Per-label last error from fire-and-forget rebuild tasks.
         self._last_rebuild_error: dict[str, str] = {}
         self._last_seen_row_count: int = 0
@@ -404,6 +408,7 @@ class SonicSimilarityPlugin(PluginProvider):
                 self.logger.debug("Character index close failed: %s", err)
             self._clap_index = None
         # Drop encoder ref so its (large) tensors can be GC'd.
+        self.mass.cancel_timer(self._text_encoder_unload_task_id)
         self._text_encoder = None
         if is_removed:
             self._search_index = None
@@ -1699,20 +1704,25 @@ class SonicSimilarityPlugin(PluginProvider):
         Re-entrancy is guarded by self._text_encoder_lock so that two concurrent
         first-callers can't both pay the ~30s download + load cost.
         """
-        existing = self._text_encoder
-        if existing is not None:
-            return existing
-        async with self._text_encoder_lock:
-            existing = self._text_encoder
-            if existing is not None:
-                return existing
-            try:
-                self._text_encoder = await asyncio.to_thread(self._load_text_encoder)
-                self.logger.info("CLAP text encoder loaded (lazy)")
-            except Exception as err:
-                self.logger.warning("CLAP text encoder load failed: %s", err)
-                self._text_encoder = None
-        return self._text_encoder
+        encoder = self._text_encoder
+        if encoder is None:
+            async with self._text_encoder_lock:
+                encoder = self._text_encoder
+                if encoder is None:
+                    try:
+                        encoder = await asyncio.to_thread(self._load_text_encoder)
+                    except Exception as err:
+                        self.logger.warning("CLAP text encoder load failed: %s", err)
+                        return None
+                    self._text_encoder = encoder
+                    self.logger.info("CLAP text encoder loaded (lazy)")
+        # Every use restarts the countdown, so only an idle encoder is freed.
+        self.mass.call_later(
+            TEXT_ENCODER_IDLE_UNLOAD_SECONDS,
+            self._unload_idle_text_encoder,
+            task_id=self._text_encoder_unload_task_id,
+        )
+        return encoder
 
     @staticmethod
     def _load_text_encoder() -> Any:
@@ -1728,6 +1738,13 @@ class SonicSimilarityPlugin(PluginProvider):
         )
 
         return CLAP(version="2023", use_cuda=False, text_enabled=True)
+
+    def _unload_idle_text_encoder(self) -> None:
+        """Free the text encoder after text search has been idle; the next query reloads it."""
+        if self._text_encoder is None:
+            return
+        self._text_encoder = None
+        self.logger.debug("Unloaded idle CLAP text encoder")
 
     async def _handle_text_search(
         self,

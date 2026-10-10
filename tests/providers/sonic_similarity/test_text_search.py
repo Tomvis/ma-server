@@ -77,6 +77,57 @@ class TestGetTextEncoder:
         assert plugin._text_encoder is None
 
 
+class TestTextEncoderIdleUnload:
+    """The text encoder is freed once text search has been idle, and reloads on demand."""
+
+    @pytest.mark.asyncio
+    async def test_each_use_restarts_the_idle_timer(self, make_plugin: Callable[..., Any]) -> None:
+        """Every encoder use reschedules the unload under one task_id, debouncing it."""
+        from music_assistant.providers.sonic_similarity.constants import (  # noqa: PLC0415
+            TEXT_ENCODER_IDLE_UNLOAD_SECONDS,
+        )
+
+        plugin = make_plugin()
+        plugin._load_text_encoder = MagicMock(return_value="ENCODER_SENTINEL")
+
+        await plugin._get_text_encoder()
+        await plugin._get_text_encoder()
+
+        calls = plugin.mass.call_later.call_args_list
+        assert len(calls) == 2
+        task_ids = {call.kwargs["task_id"] for call in calls}
+        assert len(task_ids) == 1
+        for call in calls:
+            assert call.args[0] == TEXT_ENCODER_IDLE_UNLOAD_SECONDS
+            assert call.args[1] == plugin._unload_idle_text_encoder
+
+    @pytest.mark.asyncio
+    async def test_idle_unload_frees_and_next_use_reloads(
+        self, make_plugin: Callable[..., Any]
+    ) -> None:
+        """After the idle unload the encoder is gone, and the next use loads it again."""
+        plugin = make_plugin()
+        loader = MagicMock(return_value="ENCODER_SENTINEL")
+        plugin._load_text_encoder = loader
+
+        await plugin._get_text_encoder()
+        plugin._unload_idle_text_encoder()
+
+        assert plugin._text_encoder is None
+        assert await plugin._get_text_encoder() == "ENCODER_SENTINEL"
+        assert loader.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_load_schedules_no_unload(self, make_plugin: Callable[..., Any]) -> None:
+        """Nothing is resident after a failed load, so no unload is scheduled."""
+        plugin = make_plugin()
+        plugin._load_text_encoder = MagicMock(side_effect=RuntimeError("boom"))
+
+        await plugin._get_text_encoder()
+
+        plugin.mass.call_later.assert_not_called()
+
+
 class TestEmbedTextQuery:
     """Tests for SonicSimilarityPlugin._embed_text_query (template + exclusion math)."""
 
