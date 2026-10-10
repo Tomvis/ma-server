@@ -857,6 +857,35 @@ class TestSyncMediaItemGenres:
         )
         assert len(rows) == 0
 
+    async def test_sync_keeps_mapping_backed_by_stored_metadata(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """A genre the provider dropped but stored metadata still lists is not re-written (HW-92)."""
+        track = await _add_test_track(mass, "Sync Track Stale Meta")
+        track_id = int(track.item_id)
+        await _set_track_genres(mass, track_id, ["SyncKeepA", "SyncKeepB"])
+        await genre_ctrl.sync_media_item_genres(
+            MediaType.TRACK, track.item_id, {"SyncKeepA", "SyncKeepB"}
+        )
+        query = (
+            f"SELECT rowid, alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+            "WHERE media_id = :mid AND media_type = 'track'"
+        )
+        before = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
+
+        # the post-sync genre scan re-maps every stored metadata genre, so removing
+        # SyncKeepB here would only delete and re-insert the same row on every sync
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"SyncKeepA"})
+        after = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
+        assert {(r["rowid"], r["alias"]) for r in after} == {
+            (r["rowid"], r["alias"]) for r in before
+        }
+
+        await _set_track_genres(mass, track_id, ["SyncKeepA"])
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"SyncKeepA"})
+        rows = await mass.music.database.get_rows_from_query(query, {"mid": track_id}, limit=0)
+        assert [r["alias"] for r in rows] == ["SyncKeepA"]
+
     async def test_sync_idempotent(self, mass: MusicAssistant, genre_ctrl: GenreController) -> None:
         """Second call with same set is a no-op."""
         track = await _add_test_track(mass, "Sync Track 6")
