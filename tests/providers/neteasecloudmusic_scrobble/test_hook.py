@@ -284,14 +284,17 @@ async def test_plugin_has_no_source_selection_entry() -> None:
     mass = Mock()
     mass.webserver.auth.list_users = AsyncMock(return_value=[])
     mass.players.all_players.return_value = []
+    mass.providers = []
     provider = NeteaseScrobbleProvider(
         mass, Mock(domain="neteasecloudmusic_scrobble"), _config(), SUPPORTED_FEATURES
     )
 
     entries = await provider.get_config_entries()
 
+    # fork: every scrobbler also gets the shared music-source exclusion
     assert {entry.key for entry in entries} == {
         "suffix_version",
         "scrobble_users",
         "scrobble_players",
+        "exclude_providers",
     }
