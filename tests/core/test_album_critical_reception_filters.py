@@ -10,11 +10,11 @@ import json
 import sqlite3
 from typing import get_type_hints
 
+from music_assistant.controllers.music.constants import LEGACY_SORT_KEYS
 from music_assistant.controllers.music.media.albums import (
     AlbumsController,
     _apply_critical_reception_filters,
 )
-from music_assistant.controllers.music.media.base import SORT_KEYS
 from music_assistant.helpers.api import parse_arguments
 
 
@@ -357,7 +357,7 @@ def test_sort_keys_are_registered_for_albums() -> None:
     The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
 
     They reference albums.metadata JSON paths that only exist on this table, so
-    they must not leak into the shared SORT_KEYS table.
+    they must not leak into the shared LEGACY_SORT_KEYS table.
     """
     album_keys = (
         "dr",
@@ -369,4 +369,6 @@ def test_sort_keys_are_registered_for_albums() -> None:
     )
     for key in album_keys:
         assert key in AlbumsController.extra_sort_keys, f"sort key {key!r} missing"
-        assert key not in SORT_KEYS, f"album-scoped sort key {key!r} leaked into base SORT_KEYS"
+        assert key not in LEGACY_SORT_KEYS, (
+            f"album-scoped sort key {key!r} leaked into LEGACY_SORT_KEYS"
+        )

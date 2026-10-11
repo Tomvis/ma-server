@@ -76,7 +76,7 @@ async def test_resolver_retries_failed_lookup_with_system_resolver() -> None:
         system_resolver.resolve = AsyncMock(return_value=found)
         assert await resolver.resolve("kokoro", 8880) == found
         system_resolver.resolve.assert_awaited_once()
-    await resolver.real_close()
+    await resolver.close()
 
 
 async def test_resolver_skips_system_resolver_on_success() -> None:
@@ -89,4 +89,4 @@ async def test_resolver_skips_system_resolver_on_success() -> None:
     ):
         assert await resolver.resolve("kokoro", 8880) == found
         system_resolver.resolve.assert_not_called()
-    await resolver.real_close()
+    await resolver.close()

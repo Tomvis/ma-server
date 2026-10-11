@@ -79,7 +79,7 @@ Use the `mass` fixture (full instance with temp storage) for integration tests, 
 - `pytest tests/specific_test.py` - Run a specific test file
 - `pre-commit run --all-files` - Run all pre-commit hooks
 - `python -m music_assistant --log-level debug` - Run server locally (localhost:8095)
-- Requires ffmpeg v7.1+ and Python 3.14+ (see `.python-version` for the pinned runtime)
+- Requires ffmpeg v7.0+ and Python 3.14+ (see `.python-version` for the pinned runtime)
 
 Always run the hooks after a code change to ensure the new code adheres to the project standards.
 

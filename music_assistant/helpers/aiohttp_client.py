@@ -17,7 +17,6 @@ from aiohttp import web
 from aiohttp.hdrs import USER_AGENT
 from aiohttp_asyncmdnsresolver.api import AsyncDualMDNSResolver
 from aiohttp_socks import ProxyConnector
-from music_assistant_models.enums import EventType
 from yarl import URL
 
 from music_assistant.constants import APPLICATION_NAME
@@ -28,7 +27,6 @@ from .json import json_dumps, json_loads
 if TYPE_CHECKING:
     from aiohttp.abc import ResolveResult
     from aiohttp.typedefs import JSONDecoder
-    from music_assistant_models.event import MassEvent
 
     from music_assistant.mass import MusicAssistant
 
@@ -106,12 +104,7 @@ async def async_aiohttp_proxy_stream(
 
 
 class MassAsyncDNSResolver(AsyncDualMDNSResolver):
-    """
-    Music Assistant AsyncDNSResolver.
-
-    This is a wrapper around the AsyncDualMDNSResolver to only
-    close the resolver when the Music Assistant instance is closed.
-    """
+    """AsyncDualMDNSResolver that retries a failed lookup with the system resolver."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the resolver."""
@@ -134,13 +127,6 @@ class MassAsyncDNSResolver(AsyncDualMDNSResolver):
             # c-ares caches a negative answer for up to an hour, so a (container) name
             # looked up while its host was briefly gone would stay unresolvable that long
             return await self._system_resolver.resolve(host, port, family)
-
-    async def real_close(self) -> None:
-        """Close the resolver."""
-        await super().close()
-
-    async def close(self) -> None:
-        """Close the resolver."""
 
 
 class MassClientResponse(aiohttp.ClientResponse):
@@ -238,14 +224,9 @@ def _get_connector(
 
 @cache
 def _get_resolver(mass: MusicAssistant) -> MassAsyncDNSResolver:
-    """Return the MassAsyncDNSResolver."""
-    resolver = MassAsyncDNSResolver(async_zeroconf=mass.discovery.aiozc)
-
-    async def _close_resolver(event: MassEvent) -> None:  # noqa: ARG001
-        await resolver.real_close()
-
-    mass.subscribe(_close_resolver, EventType.SHUTDOWN)
-    return resolver
+    """Return the shared resolver, which looks up .local names over both mDNS and DNS."""
+    # lives as long as the process: aiohttp never closes a resolver it was handed
+    return MassAsyncDNSResolver(async_zeroconf=mass.discovery.aiozc)
 
 
 def get_socks5_url(url_string: str) -> str:
