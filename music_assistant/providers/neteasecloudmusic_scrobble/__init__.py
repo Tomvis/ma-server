@@ -66,6 +66,9 @@ class NeteaseScrobbleProvider(PluginProvider):
 class NeteaseScrobbleHandler(ScrobblerHelper):
     """Submit listening check-ins for NetEase Cloud Music plays."""
 
+    # fork: ScrobblerHelper.mass is optional; this handler always has one
+    mass: MusicAssistant
+
     # the NCM api client converts network/timeout errors to these
     scrobble_exceptions: ClassVar[tuple[type[Exception], ...]] = (
         InvalidDataError,
@@ -80,8 +83,8 @@ class NeteaseScrobbleHandler(ScrobblerHelper):
             logger,
             ScrobblerConfig.create_from_config(config),
             SUPPORTED_SCROBBLE_MEDIA_TYPES,
+            mass,
         )
-        self.mass = mass
 
     async def _get_ncm_provider_and_track_id(
         self,

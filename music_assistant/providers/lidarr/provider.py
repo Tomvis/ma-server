@@ -273,7 +273,7 @@ class LidarrProvider(PluginProvider):
         result = await add_track(
             self._client,
             TrackRequest(
-                album=await self._album_request(album, album.uri),
+                album=await self._album_request(album, album.uri or item),
                 track_name=track.name,
                 recording_mbid=track.get_external_id(ExternalID.MB_RECORDING),
                 disc_number=track.disc_number or None,
