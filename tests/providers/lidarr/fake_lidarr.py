@@ -28,7 +28,8 @@ class FakeLidarr:
     """
     Fake Lidarr.
 
-    - ``catalog`` maps an artist MBID to the albums Lidarr would load for it on refresh.
+    - ``catalog`` maps an artist MBID to the albums Lidarr would load for it on refresh;
+      an album's ``tracks`` are those of its monitored release, all wanted when loaded.
     - A newly added artist comes back ``monitored=False`` with ``addOptions`` set and
       Lidarr's own new-artist RefreshArtist running. That refresh finishes after
       ``settle_after`` command listings: it loads the albums, then applies
@@ -73,10 +74,16 @@ class FakeLidarr:
         return self._next_id
 
     def _load(self, mbid: str, artist_id: int) -> list[dict[str, Any]]:
-        return [
+        albums = [
             {**copy.deepcopy(a), "id": self._new_id(), "artistId": artist_id, "monitored": False}
             for a in self.catalog.get(mbid, [])
         ]
+        for album in albums:
+            album["tracks"] = [
+                {"hasFile": False, **t, "id": self._new_id(), "monitored": True}
+                for t in album.get("tracks", [])
+            ]
+        return albums
 
     def album(self, album_id: int) -> dict[str, Any]:
         """Return the stored album record by id."""
@@ -204,6 +211,42 @@ class FakeLidarr:
         self._tick()
         self.album(body["id"]).update(copy.deepcopy(body))
         return copy.deepcopy(body)
+
+    async def list_tracks(self, album_id: int) -> list[dict[str, Any]]:
+        """Return the tracks of the album's monitored release."""
+        self._tick()
+        return copy.deepcopy(self.album(album_id).get("tracks", []))
+
+    async def set_tracks_monitored(
+        self, track_ids: list[int], monitored: bool = True
+    ) -> list[dict[str, Any]]:
+        """
+        Want tracks the way the Lidarr fork does (MUSIC-64).
+
+        Wanting a track of an unmonitored album monitors the album for those tracks only.
+        """
+        self._tick()
+        assert monitored, "the fake models wanting only"
+        for albums in self.albums.values():
+            for album in albums:
+                tracks = album.get("tracks", [])
+                if not any(t["id"] in track_ids for t in tracks):
+                    continue
+                if not album["monitored"]:
+                    album["monitored"] = True
+                    for t in tracks:
+                        t["monitored"] = t["id"] in track_ids
+                else:
+                    for t in tracks:
+                        if t["id"] in track_ids:
+                            t["monitored"] = True
+        return [
+            copy.deepcopy(t)
+            for albums in self.albums.values()
+            for album in albums
+            for t in album.get("tracks", [])
+            if t["id"] in track_ids
+        ]
 
     async def queue_command(self, name: str, **fields: Any) -> dict[str, Any]:
         """Record a command; RefreshArtist (re)loads the catalog immediately."""

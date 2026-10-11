@@ -18,8 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
-from music_assistant_models.enums import ProviderType
+from music_assistant_models.enums import ExternalID, MediaType, ProviderType
+from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.media_items import Album, ItemMapping, Track
 from music_assistant_models.provider import ProviderManifest
+from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import CONF_PROVIDERS, DEFAULT_PROVIDER_CONFIG_ENTRIES
 from music_assistant.providers.lidarr.client import LidarrError
@@ -29,6 +32,7 @@ from music_assistant.providers.lidarr.constants import (
     CONF_URL,
     CONF_VERIFY_SSL,
 )
+from music_assistant.providers.lidarr.lidarr_add import AlbumRequest, TrackRequest
 from music_assistant.providers.lidarr.provider import LidarrProvider
 
 if TYPE_CHECKING:
@@ -454,3 +458,101 @@ async def test_artist_mbid_by_name_survives_a_broken_lidarr_lookup(
     provider._client.lookup_artist = AsyncMock(side_effect=LidarrError("500"))  # type: ignore[method-assign]
     with patch.object(mass_minimal, "get_provider", return_value=None):
         assert await provider._artist_mbid_by_name("Steven Wilson") is None
+
+
+def _track_and_album() -> tuple[Track, Album]:
+    album = Album(
+        item_id="77",
+        provider="tidal--x",
+        name="Blackwater Park",
+        provider_mappings=set(),
+        artists=UniqueList(
+            [
+                ItemMapping(
+                    item_id="9",
+                    provider="tidal--x",
+                    name="Opeth",
+                    media_type=MediaType.ARTIST,
+                    external_ids={(ExternalID.MB_ARTIST, "opeth-mbid")},
+                )
+            ]
+        ),
+        external_ids={(ExternalID.MB_RELEASEGROUP, "rg-mbid")},
+    )
+    track = Track(
+        item_id="5",
+        provider="tidal--x",
+        name="Bleak",
+        provider_mappings=set(),
+        album=ItemMapping(
+            item_id="77", provider="tidal--x", name="Blackwater Park", media_type=MediaType.ALBUM
+        ),
+        disc_number=1,
+        track_number=2,
+        external_ids={(ExternalID.MB_RECORDING, "rec-mbid")},
+    )
+    return track, album
+
+
+async def test_add_track_wants_the_track_on_its_full_album(mass_minimal: MusicAssistant) -> None:
+    """The track's album is fetched in full and sent with the track's identifiers."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
+    )
+    track, album = _track_and_album()
+    music = MagicMock()
+    music.get_item_by_uri = AsyncMock(return_value=track)
+    music.albums.get = AsyncMock(return_value=album)
+    flow = AsyncMock(return_value={"track_name": "Bleak"})
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="tom"),
+        ),
+        patch.object(mass_minimal, "music", music, create=True),
+        patch("music_assistant.providers.lidarr.provider.add_track", flow),
+    ):
+        result = await provider.add_track("tidal--x://track/5")
+
+    music.albums.get.assert_awaited_once_with("77", "tidal--x")
+    assert flow.await_args is not None
+    request = flow.await_args.args[1]
+    assert request == TrackRequest(
+        album=AlbumRequest(
+            artist_mbid="opeth-mbid",
+            artist_name="Opeth",
+            album_name="Blackwater Park",
+            release_group_mbid="rg-mbid",
+            release_mbid=None,
+        ),
+        track_name="Bleak",
+        recording_mbid="rec-mbid",
+        disc_number=1,
+        track_number=2,
+    )
+    assert flow.await_args.kwargs["root_folder"] == "/music/tom"
+    assert result == {"track_name": "Bleak", "lidarr_instance": "lidarr"}
+
+
+async def test_add_track_refuses_an_album(mass_minimal: MusicAssistant) -> None:
+    """The track command must not silently want a whole album."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
+    )
+    _, album = _track_and_album()
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="tom"),
+        ),
+        patch.object(
+            mass_minimal,
+            "music",
+            MagicMock(get_item_by_uri=AsyncMock(return_value=album)),
+            create=True,
+        ),
+        pytest.raises(InvalidDataError, match="only accepts tracks"),
+    ):
+        await provider.add_track("tidal--x://album/77")

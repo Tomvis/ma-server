@@ -109,6 +109,24 @@ class LidarrClient:
             "dict[str, Any]", await self._request("PUT", f"album/{int(body['id'])}", json=body)
         )
 
+    async def list_tracks(self, album_id: int) -> list[dict[str, Any]]:
+        """List the tracks of an album's monitored release."""
+        return cast(
+            "list[dict[str, Any]]",
+            await self._request("GET", "track", params={"albumId": str(int(album_id))}),
+        )
+
+    async def set_tracks_monitored(
+        self, track_ids: list[int], monitored: bool = True
+    ) -> list[dict[str, Any]]:
+        """Want or unwant single tracks (Tomvis Lidarr fork, MUSIC-64); returns the tracks."""
+        return cast(
+            "list[dict[str, Any]]",
+            await self._request(
+                "PUT", "track/monitor", json={"trackIds": track_ids, "monitored": monitored}
+            ),
+        )
+
     async def queue_command(self, name: str, **fields: Any) -> dict[str, Any]:
         """Queue a Lidarr command (RefreshArtist, AlbumSearch, ...)."""
         return cast(

@@ -16,6 +16,10 @@ Given an artist MBID, the album's identifiers and the acting user's root folder:
    until the artist has been refreshed (a release newer than the last refresh); the
    title is the fallback after that, or when no MBID is known.
 5. Monitor that one album and queue an AlbumSearch for it.
+
+``add_track`` runs steps 1-4, then wants one track of the album's monitored release
+instead (the Tomvis Lidarr fork, MUSIC-64): wanting a track of an unmonitored album
+monitors that album for the track alone, and the search fetches only wanted tracks.
 """
 
 from __future__ import annotations
@@ -54,6 +58,17 @@ class AlbumRequest:
     release_mbid: str | None
 
 
+@dataclass(frozen=True)
+class TrackRequest:
+    """What MA knows about the track being wanted, and its album."""
+
+    album: AlbumRequest
+    track_name: str
+    recording_mbid: str | None
+    disc_number: int | None
+    track_number: int | None
+
+
 async def add_album(
     client: LidarrClient,
     request: AlbumRequest,
@@ -71,13 +86,7 @@ async def add_album(
     :param root_folder: Root folder path for a newly added artist (the acting user's).
     :param logger: Logger for progress and fallbacks.
     """
-    artist, added = await _find_or_add_artist(client, request, root_folder)
-    artist = await _wait_until_settled(client, int(artist["id"]))
-    if not artist.get("monitored"):
-        artist = await client.update_artist({**artist, "monitored": True})
-        logger.info("Lidarr: set artist %r monitored", artist.get("artistName"))
-
-    album = await _find_album(client, artist, request, logger=logger)
+    artist, album, added = await _artist_and_album(client, request, root_folder, logger)
     album_id = int(album["id"])
     already_monitored = bool(album.get("monitored"))
     if not already_monitored:
@@ -100,6 +109,52 @@ async def add_album(
     }
 
 
+async def add_track(
+    client: LidarrClient,
+    request: TrackRequest,
+    *,
+    root_folder: str,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    """
+    Get ``request``'s track wanted and searched in Lidarr, leaving the album's other tracks be.
+
+    Returns the frontend's LidarrAddTrackResult fields, minus ``lidarr_instance``.
+
+    :param client: The Lidarr client.
+    :param request: The track to want.
+    :param root_folder: Root folder path for a newly added artist (the acting user's).
+    :param logger: Logger for progress and fallbacks.
+    """
+    artist, album, added = await _artist_and_album(client, request.album, root_folder, logger)
+    album_id = int(album["id"])
+    tracks = await client.list_tracks(album_id)
+    track = _match_track(tracks, request, album_title=str(album.get("title")))
+    already_wanted = bool(album.get("monitored")) and bool(track.get("monitored"))
+    if not already_wanted:
+        [wanted] = await client.set_tracks_monitored([int(track["id"])], monitored=True)
+        if not wanted.get("monitored"):
+            raise LidarrError(f"Lidarr refused to want track id={track['id']}")
+        if not track.get("hasFile"):
+            await client.queue_command("AlbumSearch", albumIds=[album_id])
+    logger.info(
+        "Lidarr: %r - %r - %r (track id=%s) wanted (was already: %s, artist added: %s)",
+        artist.get("artistName"),
+        album.get("title"),
+        track.get("title"),
+        track["id"],
+        already_wanted,
+        added,
+    )
+    return {
+        "artist_name": artist.get("artistName") or request.album.artist_name,
+        "album_name": album.get("title") or request.album.album_name,
+        "track_name": track.get("title") or request.track_name,
+        "artist_added": added,
+        "already_wanted": already_wanted,
+    }
+
+
 def normalize_title(value: str, *, strip_edition: bool = False) -> str:
     """
     Casefold a title and reduce it to letters and digits (any script).
@@ -110,6 +165,19 @@ def normalize_title(value: str, *, strip_edition: bool = False) -> str:
     if strip_edition:
         value = re.sub(r"\s*\(.*?\)\s*$", "", value)
     return re.sub(r"[\W_]+", "", value.casefold())
+
+
+async def _artist_and_album(
+    client: LidarrClient, request: AlbumRequest, root_folder: str, logger: logging.Logger
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Return (settled and monitored artist, its album for ``request``, whether just added)."""
+    artist, added = await _find_or_add_artist(client, request, root_folder)
+    artist = await _wait_until_settled(client, int(artist["id"]))
+    if not artist.get("monitored"):
+        artist = await client.update_artist({**artist, "monitored": True})
+        logger.info("Lidarr: set artist %r monitored", artist.get("artistName"))
+    album = await _find_album(client, artist, request, logger=logger)
+    return artist, album, added
 
 
 async def _find_or_add_artist(
@@ -251,6 +319,54 @@ def _match(
     # A title of only symbols normalizes to "": compare it as written instead.
     target = request.album_name.casefold().strip()
     return next((a for a in albums if str(a.get("title", "")).casefold().strip() == target), None)
+
+
+def _match_track(
+    tracks: list[dict[str, Any]], request: TrackRequest, *, album_title: str
+) -> dict[str, Any]:
+    """
+    Pick the requested track on the monitored release, or raise.
+
+    The recording MBID decides when known. Otherwise the title must match (exactly,
+    then without an edition tag); disc and number only tell apart tracks sharing a
+    title, since MA's copy of the album may be another edition, ordered differently.
+    """
+    if request.recording_mbid:
+        for track in tracks:
+            if track.get("foreignRecordingId") == request.recording_mbid:
+                return track
+    for strip_edition in (False, True):
+        target = normalize_title(request.track_name, strip_edition=strip_edition)
+        if not target:
+            continue
+        same_title = [
+            t
+            for t in tracks
+            if normalize_title(str(t.get("title", "")), strip_edition=strip_edition) == target
+        ]
+        if len(same_title) == 1:
+            return same_title[0]
+        if same_title:
+            at_position = [t for t in same_title if _at_position(t, request)]
+            if len(at_position) == 1:
+                return at_position[0]
+            raise LidarrError(
+                f"{len(same_title)} tracks on Lidarr's release of {album_title!r} are titled "
+                f"{request.track_name!r}; want the right one on Lidarr's album page."
+            )
+    raise LidarrError(
+        f"{request.track_name!r} isn't on the release Lidarr monitors for {album_title!r} "
+        f"({len(tracks)} tracks). Switch the album to a release that has it in Lidarr."
+    )
+
+
+def _at_position(track: dict[str, Any], request: TrackRequest) -> bool:
+    if request.track_number is None:
+        return False
+    if request.disc_number is not None and track.get("mediumNumber") != request.disc_number:
+        return False
+    number = str(track.get("trackNumber", "")).strip()
+    return number.isdigit() and int(number) == request.track_number
 
 
 async def _refresh_artist(client: LidarrClient, artist_id: int, logger: logging.Logger) -> None:

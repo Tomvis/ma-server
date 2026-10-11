@@ -2,7 +2,8 @@
 Lidarr Plugin Provider implementation.
 
 "Add to Lidarr" sends an album straight to Lidarr's API (see ``lidarr_add``). It used
-to hand albums to music-rater, which retired its Lidarr subsystem (MEDIA-1).
+to hand albums to music-rater, which retired its Lidarr subsystem (MEDIA-1). On a track
+it wants just that track of its album (MUSIC-76).
 
 Each add goes into the acting Music Assistant user's own Lidarr root folder, mapped
 per user on the options page; the artist gets that root folder's default profiles.
@@ -32,13 +33,18 @@ from music_assistant.providers.lidarr.constants import (
     CONF_URL,
     CONF_VERIFY_SSL,
 )
-from music_assistant.providers.lidarr.lidarr_add import AlbumRequest, add_album
+from music_assistant.providers.lidarr.lidarr_add import (
+    AlbumRequest,
+    TrackRequest,
+    add_album,
+    add_track,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.media_items import Album
+    from music_assistant_models.media_items import Album, Track
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -188,6 +194,11 @@ class LidarrProvider(PluginProvider):
                 "lidarr/add_album", self.add_album, required_scope=Scope.LIBRARY_MANAGE
             )
         )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "lidarr/add_track", self.add_track, required_scope=Scope.LIBRARY_MANAGE
+            )
+        )
         try:
             await self._client.system_status()
         except Exception as err:
@@ -233,29 +244,40 @@ class LidarrProvider(PluginProvider):
             raise InvalidDataError(
                 f"lidarr/add_album only accepts albums, got {media_item.media_type.value}"
             )
-        album = cast("Album", media_item)
-        if not album.name or not album.name.strip():
-            raise InvalidDataError(f"Album {item!r} has no usable title")
-        if not album.artists or not album.artists[0].name:
-            raise InvalidDataError(f"Album {album.name!r} has no usable artist")
-        artist_name = album.artists[0].name
-
-        artist_mbid, release_group_mbid = await self._resolve_mbids(album)
-        if not artist_mbid:
-            artist_mbid = await self._artist_mbid_by_name(artist_name)
-        if not artist_mbid:
-            raise LidarrError(
-                f"Couldn't determine a MusicBrainz artist ID for {artist_name!r}, which "
-                "Lidarr needs to add the artist. Try refreshing the album's metadata first."
-            )
         result = await add_album(
             self._client,
-            AlbumRequest(
-                artist_mbid=artist_mbid,
-                artist_name=artist_name,
-                album_name=album.name,
-                release_group_mbid=release_group_mbid,
-                release_mbid=album.get_external_id(ExternalID.MB_ALBUM),
+            await self._album_request(cast("Album", media_item), item),
+            root_folder=root_folder,
+            logger=self.logger,
+        )
+        return {**result, "lidarr_instance": self._host_port() or self.name}
+
+    async def add_track(self, item: str) -> dict[str, Any]:
+        """
+        Want one track (an MA URI) in Lidarr, adding its artist and album as needed.
+
+        Returns the frontend's LidarrAddTrackResult shape.
+        """
+        root_folder = self._root_folder_for_current_user()
+        media_item = await self.mass.music.get_item_by_uri(item)
+        if media_item.media_type != MediaType.TRACK:
+            raise InvalidDataError(
+                f"lidarr/add_track only accepts tracks, got {media_item.media_type.value}"
+            )
+        track = cast("Track", media_item)
+        if not track.name or not track.name.strip():
+            raise InvalidDataError(f"Track {item!r} has no usable title")
+        if track.album is None:
+            raise InvalidDataError(f"Track {track.name!r} isn't on an album Lidarr could fetch")
+        album = await self.mass.music.albums.get(track.album.item_id, track.album.provider)
+        result = await add_track(
+            self._client,
+            TrackRequest(
+                album=await self._album_request(album, album.uri),
+                track_name=track.name,
+                recording_mbid=track.get_external_id(ExternalID.MB_RECORDING),
+                disc_number=track.disc_number or None,
+                track_number=track.track_number or None,
             ),
             root_folder=root_folder,
             logger=self.logger,
@@ -280,6 +302,35 @@ class LidarrProvider(PluginProvider):
                 "Lidarr provider's options page."
             )
         return str(root)
+
+    async def _album_request(self, album: Album, item: str) -> AlbumRequest:
+        """
+        Describe ``album`` for Lidarr, resolving its artist's MusicBrainz ID.
+
+        :param album: The album to describe.
+        :param item: The URI the caller passed, for error messages.
+        """
+        if not album.name or not album.name.strip():
+            raise InvalidDataError(f"Album {item!r} has no usable title")
+        if not album.artists or not album.artists[0].name:
+            raise InvalidDataError(f"Album {album.name!r} has no usable artist")
+        artist_name = album.artists[0].name
+
+        artist_mbid, release_group_mbid = await self._resolve_mbids(album)
+        if not artist_mbid:
+            artist_mbid = await self._artist_mbid_by_name(artist_name)
+        if not artist_mbid:
+            raise LidarrError(
+                f"Couldn't determine a MusicBrainz artist ID for {artist_name!r}, which "
+                "Lidarr needs to add the artist. Try refreshing the album's metadata first."
+            )
+        return AlbumRequest(
+            artist_mbid=artist_mbid,
+            artist_name=artist_name,
+            album_name=album.name,
+            release_group_mbid=release_group_mbid,
+            release_mbid=album.get_external_id(ExternalID.MB_ALBUM),
+        )
 
     async def _usernames(self) -> list[str]:
         """List MA usernames; empty (no per-user entries) if the lookup is refused."""
