@@ -361,6 +361,7 @@ async def test_refresh_item_preserves_in_library_state() -> None:
     # use TRACK media_type for the returned library_item to skip album-tracks branch
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -370,6 +371,7 @@ async def test_refresh_item_preserves_in_library_state() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -404,6 +406,7 @@ async def test_refresh_item_preserves_in_library_false() -> None:
 
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -413,6 +416,7 @@ async def test_refresh_item_preserves_in_library_false() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -447,6 +451,7 @@ async def test_refresh_item_respects_provider_set_in_library() -> None:
 
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -456,6 +461,7 @@ async def test_refresh_item_respects_provider_set_in_library() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -487,6 +493,7 @@ async def test_refresh_item_non_library_item_skips_update() -> None:
 
     mass = Mock()
     mass.get_provider.return_value = Mock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass

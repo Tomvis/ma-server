@@ -55,7 +55,11 @@ CONF_DELETED_PROVIDERS = "deleted_providers"
 # 67: upstream took 65 for its own step (moving misplaced aliases off the default
 # classical genre) and gated it at "prev_version <= 64". Widened to "<= 66" for the
 # same reason, and the version moved to 67.
-DB_SCHEMA_VERSION: Final[int] = 67
+#
+# 68: upstream took 66 (playlog split into media_progress + play_history) and 67
+# (radios.is_endless), gated at "prev_version <= 65" and "<= 66". This branch was
+# already stamped 67, so both are widened to "<= 67" and the version moved to 68.
+DB_SCHEMA_VERSION: Final[int] = 68
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
@@ -63,6 +67,10 @@ DYNAMIC_RADIO_BASE_SAMPLE_SIZE: Final[int] = 5
 DYNAMIC_RADIO_DYNAMIC_TARGET: Final[int] = 50
 
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
+# the listings assembled from the providers (the tracks of an album, ...), kept as a whole
+CACHE_CATEGORY_LISTINGS: Final[int] = 11
+# how long an assembled listing is served without asking the providers again
+LISTING_CACHE_EXPIRATION: Final[int] = 15 * 60
 
 # max time to wait for a single provider's search results before
 # contributing empty results for it, so one slow provider can never block

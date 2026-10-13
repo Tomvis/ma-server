@@ -48,7 +48,7 @@ PLAYLIST_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
 
 # API_SCHEMA_VERSION: bump this when adding new features to the API commands (and models)
 # or small non-breaking changes to existing commands
-API_SCHEMA_VERSION: Final[int] = 87
+API_SCHEMA_VERSION: Final[int] = 89
 
 # MIN_SCHEMA_VERSION is the minimum API schema version that the current server
 # version can work with. Only bump when there are breaking changes to existing
@@ -231,7 +231,9 @@ DEFAULT_BACKGROUND_SCAN_CONCURRENCY: Final[int] = _default_background_scan_concu
 
 
 # common db tables
-DB_TABLE_PLAYLOG: Final[str] = "playlog"
+DB_TABLE_MEDIA_PROGRESS: Final[str] = "media_progress"
+DB_TABLE_PLAY_HISTORY: Final[str] = "play_history"
+DB_TABLE_LEGACY_PLAYLOG: Final[str] = "playlog"
 DB_TABLE_ARTISTS: Final[str] = "artists"
 DB_TABLE_ALBUMS: Final[str] = "albums"
 DB_TABLE_TRACKS: Final[str] = "tracks"

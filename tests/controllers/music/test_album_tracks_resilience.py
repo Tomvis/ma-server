@@ -100,6 +100,8 @@ async def test_album_tracks_survive_a_failing_provider(error: Exception, label: 
 
     controller._get_provider_album_tracks = AsyncMock(side_effect=_provider_tracks)  # type: ignore[method-assign]
 
-    result = await controller.tracks("1", "library")
+    # the assembly behind tracks(); tracks() itself only adds the listing cache
+    listing = await controller._assemble_album_tracks(album, None)
 
-    assert [t.name for t in result] == ["Track One", "Track Two"], label
+    assert [t.name for t in listing.items] == ["Track One", "Track Two"], label
+    assert not listing.complete, label

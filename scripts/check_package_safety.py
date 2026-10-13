@@ -303,7 +303,8 @@ def get_pypi_metadata(package_name: str) -> dict[str, Any] | None:
         with urllib.request.urlopen(
             f"https://pypi.org/pypi/{package_name}/json", timeout=10
         ) as response:
-            return json.loads(response.read())
+            metadata: dict[str, Any] = json.loads(response.read())
+            return metadata
     except urllib.error.HTTPError as err:
         if err.code == 404:
             print(f"❌ Package '{package_name}' not found on PyPI")
@@ -590,7 +591,7 @@ def _evaluate_spdx_expression(license_str: str) -> bool | None:
         result = _evaluate_spdx_tokens(remaining)
         if remaining:
             # anything left over means we did not understand the string as a whole
-            raise _SpdxSyntaxError
+            raise _SpdxSyntaxError  # noqa: TRY301 - handled by except below
     except _SpdxSyntaxError:
         result = None
 

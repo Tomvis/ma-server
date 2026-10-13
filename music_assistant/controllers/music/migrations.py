@@ -33,9 +33,11 @@ from music_assistant.constants import (
     DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
     DB_TABLE_GENRES,
+    DB_TABLE_LEGACY_PLAYLOG,
     DB_TABLE_LOUDNESS_MEASUREMENTS,
+    DB_TABLE_MEDIA_PROGRESS,
+    DB_TABLE_PLAY_HISTORY,
     DB_TABLE_PLAYLISTS,
-    DB_TABLE_PLAYLOG,
     DB_TABLE_PODCASTS,
     DB_TABLE_PROVIDER_MAPPINGS,
     DB_TABLE_RADIOS,
@@ -122,6 +124,24 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
 
     if prev_version < 15:
         raise MusicAssistantError("Database schema version too old to migrate")
+
+    if prev_version <= 64:
+        tables = {
+            row["name"]
+            for row in await database.get_rows_from_query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN (:legacy_table, :progress_table)",
+                {
+                    "legacy_table": DB_TABLE_LEGACY_PLAYLOG,
+                    "progress_table": DB_TABLE_MEDIA_PROGRESS,
+                },
+                limit=0,
+            )
+        }
+        if DB_TABLE_MEDIA_PROGRESS in tables and DB_TABLE_LEGACY_PLAYLOG not in tables:
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_MEDIA_PROGRESS} RENAME TO {DB_TABLE_LEGACY_PLAYLOG}"
+            )
 
     if prev_version <= 15:
         # add search_name and search_sort_name columns to all tables
@@ -225,7 +245,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
     if prev_version <= 22:
         # add userid column to playlog table
         try:
-            await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN userid TEXT")
+            await database.execute(f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} ADD COLUMN userid TEXT")
         except Exception as err:
             if "duplicate column" not in str(err):
                 raise
@@ -233,10 +253,10 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         # The UNIQUE constraint will be updated when the table is recreated
         # For now, we'll keep the old constraint and add a new one via unique index
         try:
-            await database.execute(f"DROP INDEX IF EXISTS {DB_TABLE_PLAYLOG}_unique_idx")
+            await database.execute(f"DROP INDEX IF EXISTS {DB_TABLE_LEGACY_PLAYLOG}_unique_idx")
             await database.execute(
-                f"CREATE UNIQUE INDEX {DB_TABLE_PLAYLOG}_unique_idx "
-                f"ON {DB_TABLE_PLAYLOG}(item_id,provider,media_type,userid)"
+                f"CREATE UNIQUE INDEX {DB_TABLE_LEGACY_PLAYLOG}_unique_idx "
+                f"ON {DB_TABLE_LEGACY_PLAYLOG}(item_id,provider,media_type,userid)"
             )
         except Exception as err:
             # If we can't create the index due to duplicate entries, log and continue
@@ -255,13 +275,15 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
     if prev_version <= 24:
         # add queue_id and user_initiated columns to playlog table
         try:
-            await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN queue_id TEXT")
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} ADD COLUMN queue_id TEXT"
+            )
         except Exception as err:
             if "duplicate column" not in str(err):
                 raise
         try:
             await database.execute(
-                f"ALTER TABLE {DB_TABLE_PLAYLOG} "
+                f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} "
                 "ADD COLUMN user_initiated BOOLEAN NOT NULL DEFAULT 1"
             )
         except Exception as err:
@@ -710,7 +732,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         # add playback_speed column to playlog (per-item speed for audiobooks/episodes)
         try:
             await database.execute(
-                f"ALTER TABLE {DB_TABLE_PLAYLOG} "
+                f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} "
                 "ADD COLUMN playback_speed REAL NOT NULL DEFAULT 1.0"
             )
         except Exception as err:
@@ -753,7 +775,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         # add artists column to playlog (lightweight artist mappings for track rows) so
         # recency matching can recognize the same song across different releases/providers
         try:
-            await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN artists json")
+            await database.execute(f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} ADD COLUMN artists json")
         except Exception as err:
             if "duplicate column" not in str(err):
                 raise
@@ -761,8 +783,8 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
     if 41 <= prev_version <= 47:
         # Schema slots 41..47 mean different things per release line.
         for table, column_sql in (
-            (DB_TABLE_PLAYLOG, "ADD COLUMN playback_speed REAL NOT NULL DEFAULT 1.0"),
-            (DB_TABLE_PLAYLOG, "ADD COLUMN artists json"),
+            (DB_TABLE_LEGACY_PLAYLOG, "ADD COLUMN playback_speed REAL NOT NULL DEFAULT 1.0"),
+            (DB_TABLE_LEGACY_PLAYLOG, "ADD COLUMN artists json"),
             (DB_TABLE_PLAYLISTS, "ADD COLUMN [translation_key] TEXT"),
             (DB_TABLE_PLAYLISTS, "ADD COLUMN [translation_params] json"),
             (DB_TABLE_GENRES, "ADD COLUMN [content_type] TEXT"),
@@ -785,7 +807,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         # inline constraint by rebuilding the table.
         stale_unique = False
         for index in await database.get_rows_from_query(
-            f"PRAGMA index_list({DB_TABLE_PLAYLOG})", limit=0
+            f"PRAGMA index_list({DB_TABLE_LEGACY_PLAYLOG})", limit=0
         ):
             if not index["unique"]:
                 continue
@@ -801,10 +823,10 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         if stale_unique:
             logger.info("Rebuilding playlog table to update its unique constraint")
             await database.execute(
-                f"ALTER TABLE {DB_TABLE_PLAYLOG} RENAME TO {DB_TABLE_PLAYLOG}_old"
+                f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} RENAME TO {DB_TABLE_LEGACY_PLAYLOG}_old"
             )
             await database.execute(
-                f"""CREATE TABLE {DB_TABLE_PLAYLOG}(
+                f"""CREATE TABLE {DB_TABLE_LEGACY_PLAYLOG}(
                     [id] INTEGER PRIMARY KEY AUTOINCREMENT,
                     [item_id] TEXT NOT NULL,
                     [provider] TEXT NOT NULL,
@@ -824,15 +846,15 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
             # rows from before the userid column existed have no owner and cannot be
             # kept under the NOT NULL schema
             await database.execute(
-                f"INSERT INTO {DB_TABLE_PLAYLOG} "
+                f"INSERT INTO {DB_TABLE_LEGACY_PLAYLOG} "
                 "(id, item_id, provider, media_type, name, image, artists, timestamp, "
                 "fully_played, seconds_played, userid, queue_id, user_initiated, "
                 "playback_speed) "
                 "SELECT id, item_id, provider, media_type, name, image, artists, timestamp, "
                 "fully_played, seconds_played, userid, queue_id, user_initiated, "
-                f"playback_speed FROM {DB_TABLE_PLAYLOG}_old WHERE userid IS NOT NULL"
+                f"playback_speed FROM {DB_TABLE_LEGACY_PLAYLOG}_old WHERE userid IS NOT NULL"
             )
-            await database.execute(f"DROP TABLE {DB_TABLE_PLAYLOG}_old")
+            await database.execute(f"DROP TABLE {DB_TABLE_LEGACY_PLAYLOG}_old")
 
     if prev_version <= 50:
         # external id matching moved from a (unindexable) LIKE scan on the external_ids
@@ -1042,7 +1064,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         for table, column in (
             (DB_TABLE_PLAYLISTS, "[translation_key] TEXT"),
             (DB_TABLE_PLAYLISTS, "[translation_params] json"),
-            (DB_TABLE_PLAYLOG, "[playback_speed] REAL NOT NULL DEFAULT 1.0"),
+            (DB_TABLE_LEGACY_PLAYLOG, "[playback_speed] REAL NOT NULL DEFAULT 1.0"),
         ):
             try:
                 await database.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
@@ -1404,14 +1426,14 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         playlog_columns = {
             x["name"]
             for x in await database.get_rows_from_query(
-                f"PRAGMA table_info({DB_TABLE_PLAYLOG})", limit=0
+                f"PRAGMA table_info({DB_TABLE_LEGACY_PLAYLOG})", limit=0
             )
         }
         if {"image", "media_type"} <= playlog_columns:
             # the playlog keeps the image a playlist had when it was played, so a collage
             # would show as a broken image in the recently played listing
             await database.execute(
-                f"UPDATE {DB_TABLE_PLAYLOG} SET image = NULL "
+                f"UPDATE {DB_TABLE_LEGACY_PLAYLOG} SET image = NULL "
                 "WHERE media_type = 'playlist' AND image LIKE '%\"/collage/%' "
                 "AND image LIKE '%\"builtin\"%'"
             )
@@ -1460,12 +1482,12 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         playlog_columns = {
             x["name"]
             for x in await database.get_rows_from_query(
-                f"PRAGMA table_info({DB_TABLE_PLAYLOG})", limit=0
+                f"PRAGMA table_info({DB_TABLE_LEGACY_PLAYLOG})", limit=0
             )
         }
         if "image" in playlog_columns:
             await database.execute(
-                f"UPDATE {DB_TABLE_PLAYLOG} SET image = NULL "
+                f"UPDATE {DB_TABLE_LEGACY_PLAYLOG} SET image = NULL "
                 "WHERE CASE WHEN json_valid(image) THEN json_extract(image, '$.path') END = ''"
             )
 
@@ -1497,6 +1519,62 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
             await mass.music.genres.restore_default_genres(full_restore=False)
         except Exception as err:
             logger.warning("Could not seed default podcast/audiobook genres: %s", err)
+
+    if prev_version <= 67:
+        # Upstream gates this at "prev_version <= 65"; widened to <= 67 (DB_SCHEMA_VERSION
+        # 68) for the same reason as the <= 64 step above. Idempotent: the table is created
+        # IF NOT EXISTS and the rename only runs while media_progress is missing.
+        await database.execute(
+            f"""CREATE TABLE IF NOT EXISTS {DB_TABLE_PLAY_HISTORY}(
+                [id] INTEGER PRIMARY KEY AUTOINCREMENT,
+                [item_id] TEXT NOT NULL,
+                [provider] TEXT NOT NULL,
+                [media_type] TEXT NOT NULL,
+                [userid] TEXT NOT NULL,
+                [queue_id] TEXT,
+                [timestamp] INTEGER NOT NULL,
+                [user_initiated] BOOLEAN NOT NULL DEFAULT 1,
+                [name] TEXT NOT NULL,
+                [image] json,
+                [artists] json
+            );"""
+        )
+        tables = {
+            row["name"]
+            for row in await database.get_rows_from_query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN (:legacy_table, :progress_table)",
+                {
+                    "legacy_table": DB_TABLE_LEGACY_PLAYLOG,
+                    "progress_table": DB_TABLE_MEDIA_PROGRESS,
+                },
+                limit=0,
+            )
+        }
+        if DB_TABLE_LEGACY_PLAYLOG in tables and DB_TABLE_MEDIA_PROGRESS not in tables:
+            for index_name in (
+                f"{DB_TABLE_LEGACY_PLAYLOG}_unique_idx",
+                f"{DB_TABLE_LEGACY_PLAYLOG}_userid_timestamp_idx",
+                f"{DB_TABLE_LEGACY_PLAYLOG}_provider_media_type_idx",
+            ):
+                await database.execute(f"DROP INDEX IF EXISTS {index_name}")
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_LEGACY_PLAYLOG} RENAME TO {DB_TABLE_MEDIA_PROGRESS}"
+            )
+
+    if prev_version <= 67:
+        # Upstream gates this at "prev_version <= 66"; widened to <= 67 (DB_SCHEMA_VERSION
+        # 68) for the same reason as the <= 64 step above.
+        # add is_endless to radios; every existing row is an endless stream or feed,
+        # so the default is right
+        try:
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_RADIOS} ADD COLUMN is_endless BOOLEAN DEFAULT 1 NOT NULL"
+            )
+        except Exception as err:
+            # create_tables makes a missing radios table with the column already in place
+            if "duplicate column" not in str(err) and "no such table" not in str(err):
+                raise
 
     # (re)build the FTS search tables so they are in sync with the content tables;
     # this both populates them on first migration to the FTS-enabled schema and
