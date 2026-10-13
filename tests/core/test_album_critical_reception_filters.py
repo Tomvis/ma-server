@@ -10,11 +10,14 @@ import json
 import sqlite3
 from typing import get_type_hints
 
+from music_assistant_models.enums import MediaType, SortDirection, SortField
+
 from music_assistant.controllers.music.constants import LEGACY_SORT_KEYS
 from music_assistant.controllers.music.media.albums import (
     AlbumsController,
     _apply_critical_reception_filters,
 )
+from music_assistant.controllers.music.sorting import MEDIA_TYPE_SORT_FIELDS
 from music_assistant.helpers.api import parse_arguments
 
 
@@ -354,21 +357,38 @@ def test_dr_bucket_untagged_requires_both_null() -> None:
 
 def test_sort_keys_are_registered_for_albums() -> None:
     """
-    The new album-scoped sort keys live on AlbumsController.extra_sort_keys.
+    The album-scoped sort keys live on AlbumsController.extra_sort_keys, typed as album-only.
 
-    They reference albums.metadata JSON paths that only exist on this table, so
-    they must not leak into the shared LEGACY_SORT_KEYS table.
+    They reference albums.metadata JSON paths that only exist on this table: each maps to a
+    fork SortField that only the album listings offer, so resolve_sort rejects it elsewhere.
     """
-    album_keys = (
-        "dr",
-        "dr_desc",
-        "amg_rating",
-        "amg_rating_desc",
-        "tps_rating",
-        "tps_rating_desc",
+    fields = {
+        SortField.DR,
+        SortField.AMG_RATING,
+        SortField.TPS_RATING,
+        SortField.LISTEN_LATER_ADDED_AT,
+    }
+    for field in fields:
+        for key, direction in ((field.value, SortDirection.ASC), (f"{field.value}_desc", None)):
+            assert key in AlbumsController.extra_sort_keys, f"sort key {key!r} missing"
+            assert LEGACY_SORT_KEYS[key] == (field, direction or SortDirection.DESC)
+    for media_type, offered in MEDIA_TYPE_SORT_FIELDS.items():
+        if media_type != MediaType.ALBUM:
+            assert not fields & set(offered), f"album-only sort offered for {media_type}"
+    assert fields <= set(MEDIA_TYPE_SORT_FIELDS[MediaType.ALBUM])
+
+
+def test_typed_album_sort_renders_the_extra_sort_key() -> None:
+    """A typed fork sort field renders the extra_sort_keys SQL of its direction."""
+    controller = AlbumsController.__new__(AlbumsController)
+    keys = AlbumsController.extra_sort_keys
+    assert controller._get_sort_sql(SortField.DR, SortDirection.ASC) == keys["dr"]
+    assert controller._get_sort_sql(SortField.DR, None) == keys["dr_desc"]
+    assert (
+        controller._get_sort_sql(SortField.AMG_RATING, SortDirection.DESC)
+        == keys["amg_rating_desc"]
     )
-    for key in album_keys:
-        assert key in AlbumsController.extra_sort_keys, f"sort key {key!r} missing"
-        assert key not in LEGACY_SORT_KEYS, (
-            f"album-scoped sort key {key!r} leaked into LEGACY_SORT_KEYS"
-        )
+    assert (
+        controller._get_sort_sql(SortField.LISTEN_LATER_ADDED_AT, None)
+        == keys["listen_later_added_at_desc"]
+    )

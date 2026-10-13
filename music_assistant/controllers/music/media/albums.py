@@ -59,6 +59,7 @@ from music_assistant.controllers.music.helpers import (
 )
 from music_assistant.controllers.music.listing import apply_listing, resolve_listing_sort
 from music_assistant.controllers.music.listing_cache import Listing, cached_listing
+from music_assistant.controllers.music.sorting import get_default_direction
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.compare import (
     ALBUM_RETAIL_SUFFIX_KEYS,
@@ -2411,11 +2412,20 @@ class AlbumsController(MediaControllerBase[Album]):
         )
 
     def _get_sort_sql(self, field: SortField, direction: SortDirection | None) -> str:
-        """Return the ORDER BY clause for a sort field, ARTIST_NAME through the artists join."""
+        """
+        Return the ORDER BY clause for a sort field, ARTIST_NAME through the artists join.
+
+        The fork's own fields (DR, AMG_RATING, ...) are the extra_sort_keys of the same
+        name: "<field>" ascending, "<field>_desc" descending.
+        """
         if field == SortField.ARTIST_NAME:
             if direction == SortDirection.DESC:
                 return "artists.search_name DESC, year DESC"
             return "artists.search_name ASC, year DESC"
+        if field.value in self.extra_sort_keys:
+            direction = direction or get_default_direction(field)
+            asc = direction == SortDirection.ASC
+            return self.extra_sort_keys[field.value if asc else f"{field.value}_desc"]
         return super()._get_sort_sql(field, direction)
 
     def _parse_summary_row(

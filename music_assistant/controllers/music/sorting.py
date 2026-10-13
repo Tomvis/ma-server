@@ -109,6 +109,31 @@ SORT_FIELD_DEFINITIONS: Final[dict[SortField, SortOptionInfo]] = {
         supports_direction=False,
         label_key="original",
     ),
+    # fork: the album-only sorts, served from AlbumsController.extra_sort_keys
+    SortField.DR: SortOptionInfo(
+        field=SortField.DR,
+        supports_direction=True,
+        default_direction=SortDirection.DESC,
+        label_key="dr",
+    ),
+    SortField.AMG_RATING: SortOptionInfo(
+        field=SortField.AMG_RATING,
+        supports_direction=True,
+        default_direction=SortDirection.DESC,
+        label_key="amg_rating",
+    ),
+    SortField.TPS_RATING: SortOptionInfo(
+        field=SortField.TPS_RATING,
+        supports_direction=True,
+        default_direction=SortDirection.DESC,
+        label_key="tps_rating",
+    ),
+    SortField.LISTEN_LATER_ADDED_AT: SortOptionInfo(
+        field=SortField.LISTEN_LATER_ADDED_AT,
+        supports_direction=True,
+        default_direction=SortDirection.DESC,
+        label_key="listen_later_added_at",
+    ),
 }
 
 # the sort fields every library listing offers, the listing default first
@@ -141,7 +166,14 @@ def _library_sort_options(*own_fields: SortField) -> tuple[SortOptionInfo, ...]:
 # the sort options of the library listings, the first one being the listing's default
 _LIBRARY_LISTING_SORT_OPTIONS: Final[dict[ListingType, tuple[SortOptionInfo, ...]]] = {
     ListingType.LIBRARY_ARTISTS: _library_sort_options(),
-    ListingType.LIBRARY_ALBUMS: _library_sort_options(SortField.YEAR, SortField.ARTIST_NAME),
+    ListingType.LIBRARY_ALBUMS: _library_sort_options(
+        SortField.YEAR,
+        SortField.ARTIST_NAME,
+        SortField.DR,
+        SortField.AMG_RATING,
+        SortField.TPS_RATING,
+        SortField.LISTEN_LATER_ADDED_AT,
+    ),
     ListingType.LIBRARY_TRACKS: _library_sort_options(SortField.DURATION, SortField.ARTIST_NAME),
     ListingType.LIBRARY_PLAYLISTS: _library_sort_options(),
     ListingType.LIBRARY_RADIOS: _library_sort_options(),

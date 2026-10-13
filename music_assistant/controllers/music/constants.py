@@ -173,6 +173,15 @@ LEGACY_SORT_KEYS: Final[dict[str, tuple[SortField, SortDirection | None]]] = {
     "track_artist_name_desc": (SortField.ARTIST_NAME, SortDirection.DESC),
     "favorite_timestamp": (SortField.FAVORITE_TIMESTAMP, SortDirection.ASC),
     "favorite_timestamp_desc": (SortField.FAVORITE_TIMESTAMP, SortDirection.DESC),
+    # fork: the album-only sorts
+    "dr": (SortField.DR, SortDirection.ASC),
+    "dr_desc": (SortField.DR, SortDirection.DESC),
+    "amg_rating": (SortField.AMG_RATING, SortDirection.ASC),
+    "amg_rating_desc": (SortField.AMG_RATING, SortDirection.DESC),
+    "tps_rating": (SortField.TPS_RATING, SortDirection.ASC),
+    "tps_rating_desc": (SortField.TPS_RATING, SortDirection.DESC),
+    "listen_later_added_at": (SortField.LISTEN_LATER_ADDED_AT, SortDirection.ASC),
+    "listen_later_added_at_desc": (SortField.LISTEN_LATER_ADDED_AT, SortDirection.DESC),
     "random": (SortField.RANDOM, None),
     "random_play_count": (SortField.RANDOM_PLAY_COUNT, None),
 }
