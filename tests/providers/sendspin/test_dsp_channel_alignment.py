@@ -239,7 +239,11 @@ class _SessionHarness:
         self.returned += 1
 
     async def _until(self, condition: Callable[[], bool]) -> None:
-        for _ in range(20_000):
+        # fork: bounded by time, not iterations; on a fast host 20k sleep(0)s ran out before
+        # the fake ffmpeg's pipe I/O landed and the loop "stalled" 2 runs in 3 (HW-108)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline:
             if condition():
                 return
             await asyncio.sleep(0)
