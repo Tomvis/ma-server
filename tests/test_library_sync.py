@@ -515,6 +515,9 @@ async def test_refresh_item_marks_only_a_file_backed_fetch_authoritative(streami
     )
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    # no ids, so the listing invalidation at the end of the refresh has nothing to drop
+    returned_item.provider_mappings = []
+    returned_item.uri = None
     seen: list[object] = []
 
     async def _update(*_args: object, **_kwargs: object) -> Mock:
