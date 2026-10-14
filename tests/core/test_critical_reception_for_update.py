@@ -11,6 +11,8 @@ every sync. An absent amg_dr is "not reported" (the tag left the files), never a
 
 from __future__ import annotations
 
+from typing import Any
+
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
     ReviewLink,
@@ -26,7 +28,7 @@ def _cr(
     return CriticalReception(amg_dr=amg_dr, sources=sources)
 
 
-def _amg(**fields: object) -> ReviewSourceEntry:
+def _amg(**fields: Any) -> ReviewSourceEntry:
     return ReviewSourceEntry(source="AMG", **fields)
 
 
