@@ -63,7 +63,9 @@ class MusicRaterProvider(PluginProvider):
         """Initialize the provider."""
         super().__init__(mass, manifest, config, supported_features)
         self._url = cast("str", config.get_value(CONF_URL, "")).rstrip("/")
-        self._api_key = cast("str", config.get_value(CONF_API_KEY, ""))
+        # Construction-time reads go through a plain STRING entry, which does not decrypt
+        # a SECURE_STRING loaded from settings; decrypt_string passes plaintext through.
+        self._api_key = mass.config.decrypt_string(cast("str", config.get_value(CONF_API_KEY, "")))
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return the config entries for this provider."""

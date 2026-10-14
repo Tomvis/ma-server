@@ -119,6 +119,7 @@ def _provider(
 ) -> MusicRaterProvider:
     mass = MagicMock()
     mass.http_session = session
+    mass.config.decrypt_string = lambda value: value.removeprefix("_encrypted_")
 
     async def _iter(**kwargs: Any) -> AsyncGenerator[Album]:
         # streaming mappings of these rows are in_library=False in production
@@ -287,3 +288,12 @@ async def test_recent_pass_reads_only_newly_added_albums() -> None:
     await prov.sync_recent_review_data()
     assert _updated(prov) == {"1": _cr(4.0)}
     assert {c["params"]["album"] for c in session.calls} == {"New"}
+
+
+async def test_stored_api_key_is_decrypted() -> None:
+    """A key loaded from settings arrives encrypted (read through a plain STRING entry)."""
+    session = _Session({("Ihsahn", "Pharos", 2020): {"AMG_RATING": "4.0"}})
+    values = {CONF_URL: "http://mr/api/v1", CONF_API_KEY: "_encrypted_mr_key"}
+    prov = _provider(session, [_album(7, "Pharos", 2020, ["tidal"])], values=values)
+    await prov.sync_review_data()
+    assert session.calls[0]["headers"] == {"Authorization": "Bearer mr_key"}
