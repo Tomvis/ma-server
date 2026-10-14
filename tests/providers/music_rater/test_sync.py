@@ -88,7 +88,9 @@ def _cr(rating: float) -> CriticalReception:
     return CriticalReception(sources=[ReviewSourceEntry(source="AMG", rating=rating)])
 
 
-def _provider(session: _Session, albums: list[Album]) -> MusicRaterProvider:
+def _provider(
+    session: _Session, albums: list[Album], values: dict[str, str] | None = None
+) -> MusicRaterProvider:
     mass = MagicMock()
     mass.http_session = session
 
@@ -105,7 +107,8 @@ def _provider(session: _Session, albums: list[Album]) -> MusicRaterProvider:
     manifest.domain = "music_rater"
     config = MagicMock()
     config.instance_id = "music_rater"
-    values = {CONF_URL: "http://mr/api/v1/", CONF_API_KEY: "mr_key"}
+    if values is None:
+        values = {CONF_URL: "http://mr/api/v1/", CONF_API_KEY: "mr_key"}
     config.get_value = MagicMock(side_effect=lambda key, default=None: values.get(key, default))
     return MusicRaterProvider(mass, manifest, config, set())
 
@@ -193,3 +196,11 @@ async def test_server_error_aborts_the_run(status: int) -> None:
         await prov.sync_review_data()
     assert len(session.calls) == 1
     assert _updated(prov) == {}
+
+
+async def test_unconfigured_does_nothing() -> None:
+    """A freshly added instance has no URL or key yet."""
+    session = _Session({})
+    prov = _provider(session, [_album(7, "Pharos", 2020, ["tidal"])], values={})
+    await prov.sync_review_data()
+    assert session.calls == []

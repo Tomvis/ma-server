@@ -64,8 +64,10 @@ class MusicRaterProvider(PluginProvider):
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return the config entries for this provider."""
         return (
-            ConfigEntry(key=CONF_URL, type=ConfigEntryType.STRING, required=True),
-            ConfigEntry(key=CONF_API_KEY, type=ConfigEntryType.SECURE_STRING, required=True),
+            # Not required: the instance is created with no values before the options
+            # page can be filled, and load-time validation would reject it.
+            ConfigEntry(key=CONF_URL, type=ConfigEntryType.STRING, required=False),
+            ConfigEntry(key=CONF_API_KEY, type=ConfigEntryType.SECURE_STRING, required=False),
         )
 
     async def handle_async_init(self) -> None:
@@ -84,6 +86,9 @@ class MusicRaterProvider(PluginProvider):
 
     async def sync_review_data(self) -> None:
         """Write music-rater's current review data to every streaming-only album."""
+        if not (self._url and self._api_key):
+            self.logger.warning("music-rater URL or API key not set; skipping the refresh")
+            return
         stats: Counter[str] = Counter()
         # Streaming mappings of these rows are mostly in_library=False (the old
         # household Listen Later shelf never added them to the Tidal/Bandcamp library),
