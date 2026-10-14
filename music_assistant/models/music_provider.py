@@ -54,7 +54,7 @@ from music_assistant.controllers.tasks.context import (
     report_current_task_failure,
     update_current_task_progress_text,
 )
-from music_assistant.helpers.critical_reception import critical_reception_is_richer
+from music_assistant.helpers.critical_reception import critical_reception_for_update
 
 from .media_capabilities import AudioStreamMixin, MediaCatalogMixin, RecommendationsMixin
 from .provider import Provider
@@ -1497,8 +1497,8 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         library_item = await self.mass.music.albums.add_item_to_library(prov_item)
                         db_id = int(library_item.item_id)
                     else:
-                        # Enhanced: refresh review data when the provider surfaced something
-                        # richer. critical_reception and dynamic_range are independent, so
+                        # Enhanced: refresh review data when the provider reported a change.
+                        # critical_reception and dynamic_range are independent, so
                         # widen the update condition with whichever changed and let the single
                         # update_item_in_library call below persist both - separate arms meant
                         # a sync refreshing both in one pass only landed one. The authoritative
@@ -1507,8 +1507,9 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         prov_meta = prov_item.metadata
                         cr_new = prov_meta.critical_reception if prov_meta else None
                         dr_new = prov_meta.dynamic_range if prov_meta else None
-                        cr_richer = cr_new is not None and critical_reception_is_richer(
-                            cr_new, sync_details.critical_reception
+                        cr_changed = (
+                            critical_reception_for_update(cr_new, sync_details.critical_reception)
+                            != sync_details.critical_reception
                         )
                         # A plain difference is enough to mark the DR pending: the merge
                         # always persists a non-None incoming value, so the very next sync
@@ -1516,7 +1517,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         dr_changed = dr_new is not None and dr_new != sync_details.dynamic_range
                         if (
                             self._library_item_needs_update(sync_details, prov_item)
-                            or cr_richer
+                            or cr_changed
                             or dr_changed
                         ):
                             library_item = await self.mass.music.albums.update_item_in_library(

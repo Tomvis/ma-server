@@ -71,7 +71,7 @@ from music_assistant.helpers.compare import (
     loose_compare_strings,
     strip_album_retail_suffix,
 )
-from music_assistant.helpers.critical_reception import critical_reception_is_richer
+from music_assistant.helpers.critical_reception import critical_reception_for_update
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.helpers.external_ids import (
@@ -1666,12 +1666,10 @@ class AlbumsController(MediaControllerBase[Album]):
         # 2.10 factored the stored-vs-incoming decision into metadata_for_update, which
         # also fixes the case this branch used to only paper over: an overwrite carrying
         # a bare stub (providers embed those in track payloads) now merges instead of
-        # wiping. The critical-reception arbitration still has to run on top of it --
-        # model.update() deep-merges CR into a superset, but a wholesale overwrite still
-        # replaces a rich stored CR with an empty one, silently losing the
-        # filesystem-tag-derived value. Judge whatever the helper returned against the
-        # stored CR and put the stored one back only when the incoming one regressed, so
-        # a purely additive update (a newly surfaced TPS source) still survives.
+        # wiping. Critical reception is decided on top of it: model.update() deep-merges
+        # CR into a superset, which would keep accolades music-rater has since corrected
+        # away, and an overwrite without CR would drop it. The provider's CR replaces
+        # the stored one; without one the stored CR stays.
         if cur_item.metadata is None:
             # `metadata` has a default_factory so this should never happen, but the
             # stored_cr read below already guarded for it — keep the two consistent
@@ -1679,20 +1677,9 @@ class AlbumsController(MediaControllerBase[Album]):
             cur_item.metadata = MediaItemMetadata()
         stored_cr = cur_item.metadata.critical_reception
         metadata = metadata_for_update(cur_item.metadata, update.metadata, overwrite)
-        if update.metadata is not None and not critical_reception_is_richer(
-            metadata.critical_reception, stored_cr
-        ):
-            metadata.critical_reception = stored_cr
-        elif (
-            stored_cr is not None
-            and stored_cr.amg_dr is not None
-            and metadata.critical_reception is not None
-            and metadata.critical_reception.amg_dr is None
-        ):
-            # files no longer carry amg_dr; an overwrite must not drop the stored one
-            metadata.critical_reception = replace(
-                metadata.critical_reception, amg_dr=stored_cr.amg_dr
-            )
+        metadata.critical_reception = critical_reception_for_update(
+            update.metadata.critical_reception if update.metadata else None, stored_cr
+        )
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:

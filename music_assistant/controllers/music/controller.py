@@ -1623,9 +1623,9 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             # (mirrors the file-tag path).
             normalize_review_entries(critical_reception)
             # Land CR on the in-memory album so _add_library_item persists it on
-            # the initial insert. For an existing listen-later row the merge
-            # path in _update_library_item replaces CR when the new payload is
-            # strictly richer (see critical_reception_is_richer).
+            # the initial insert. For an existing listen-later row
+            # _update_library_item replaces the stored CR with this payload
+            # (see critical_reception_for_update).
             if candidate.metadata is None:
                 candidate.metadata = MediaItemMetadata()
             candidate.metadata.critical_reception = critical_reception
@@ -1642,7 +1642,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         # Always go through add_item_to_library — it routes new items through
         # _add_library_item (in_library left at default 0, no provider sync) and
         # existing rows through _update_library_item, which merges metadata
-        # under the richer-wins rule. Skipping the call for a candidate already
+        # and takes this CR. Skipping the call for a candidate already
         # resolved as `library://` would silently drop the supplied CR payload.
         candidate = await self.albums.add_item_to_library(candidate)
         # Re-check in_library on the freshly persisted row: between the pre-flight

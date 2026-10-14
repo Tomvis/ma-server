@@ -2,11 +2,11 @@
 Integration tests for the review-data refresh inside the album library sync.
 
 `MusicProvider._sync_library_albums` folds the critical_reception / dynamic_range
-refresh into the *single* `update_item_in_library` call of the sync loop: a richer
+refresh into the *single* `update_item_in_library` call of the sync loop: a changed
 CR (or a changed DR) widens the update condition instead of triggering a second
-read-modify-write of the same row. Consequence pinned here: what lands in the DB
-is the merge produced by `AlbumsController._update_library_item` (stored CR unioned
-with the provider CR), not the raw provider CR assigned wholesale.
+read-modify-write of the same row. The provider CR replaces the stored one (the
+stored amg_dr survives when the files no longer report it); a provider that reports
+none leaves it alone.
 
 Uses the full ``mass`` fixture from ``tests/conftest.py`` so the AlbumsController is
 backed by a real SQLite database.
@@ -25,11 +25,12 @@ from music_assistant_models.media_items import Album, Artist, ProviderMapping
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
     MediaItemMetadata,
+    ReviewLink,
     ReviewSourceEntry,
 )
 from music_assistant_models.provider import ProviderManifest
 
-from music_assistant.helpers.critical_reception import critical_reception_is_richer
+from music_assistant.helpers.critical_reception import critical_reception_for_update
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -216,11 +217,11 @@ async def test_sync_persists_richer_cr_through_the_single_update_path(
 
 
 @pytest.mark.usefixtures("fake_provider")
-async def test_sync_stores_merged_cr_superset_not_raw_provider_cr(
+async def test_sync_replaces_stored_cr_with_provider_cr(
     mass: MusicAssistant,
     fake_provider: _FakeSyncProvider,
 ) -> None:
-    """A DR-triggered update stores the stored/provider CR union, not the provider CR."""
+    """The provider CR replaces the stored one: an unreported source is dropped (MUSIC-80)."""
     fake_provider.library_albums = [
         _make_album(
             MediaItemMetadata(
@@ -237,8 +238,6 @@ async def test_sync_stores_merged_cr_superset_not_raw_provider_cr(
     db_ids = await fake_provider._sync_library_albums()
     db_id = next(iter(db_ids))
 
-    # the provider only re-probed TPS, so its CR is *not* richer than the stored one;
-    # the changed DR is what pulls this album into the update branch
     prov_item = _make_album(
         MediaItemMetadata(
             dynamic_range=13.0,
@@ -257,12 +256,97 @@ async def test_sync_stores_merged_cr_superset_not_raw_provider_cr(
     stored = await _stored_album(mass, db_id)
     assert stored.metadata.dynamic_range == 13.0
     stored_sources = _sources_by_name(stored.metadata.critical_reception)
-    # superset: the stored-only AMG source survives (a wholesale assignment of the
-    # provider CR would drop it) while TPS takes the refreshed provider values
-    assert set(stored_sources) == {"AMG", "TPS"}
-    assert stored_sources["AMG"].rating == 4.5
+    assert set(stored_sources) == {"TPS"}
     assert stored_sources["TPS"].rating == 8.5
     assert stored_sources["TPS"].accolades == ["Album of the Year (2000)"]
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_sync_lands_corrected_cr_with_fewer_fields(
+    mass: MusicAssistant,
+    fake_provider: _FakeSyncProvider,
+) -> None:
+    """A re-tag that drops a mismatched accolade and gains review text lands (MUSIC-80)."""
+    fake_provider.library_albums = [
+        _make_album(
+            MediaItemMetadata(
+                critical_reception=CriticalReception(
+                    sources=[
+                        ReviewSourceEntry(
+                            source="AMG",
+                            rating=4.5,
+                            accolades=["Album of the Year (2013)", "Review"],
+                            links=[
+                                ReviewLink(label="Album of the Year (2013)", url="https://a/aoty"),
+                                ReviewLink(label="Review", url="https://a/wrong-review"),
+                            ],
+                        )
+                    ]
+                ),
+            )
+        )
+    ]
+    db_id = next(iter(await fake_provider._sync_library_albums()))
+
+    corrected = ReviewSourceEntry(
+        source="AMG",
+        rating=4.5,
+        accolades=["Album of the Year (2013)"],
+        links=[ReviewLink(label="Album of the Year (2013)", url="https://a/aoty")],
+        review="Full text.",
+    )
+    fake_provider.library_albums = [
+        _make_album(MediaItemMetadata(critical_reception=CriticalReception(sources=[corrected])))
+    ]
+    await fake_provider._sync_library_albums()
+
+    stored = await _stored_album(mass, db_id)
+    assert _sources_by_name(stored.metadata.critical_reception)["AMG"] == corrected
+
+
+@pytest.mark.usefixtures("fake_provider")
+@pytest.mark.parametrize("prov_cr", [None, CriticalReception(sources=[])])
+async def test_sync_keeps_stored_cr_when_provider_reports_none(
+    mass: MusicAssistant,
+    fake_provider: _FakeSyncProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    prov_cr: CriticalReception | None,
+) -> None:
+    """No CR (or an empty one) is not a report: the stored CR stays and nothing is written."""
+    stored_cr = CriticalReception(sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
+    fake_provider.library_albums = [_make_album(MediaItemMetadata(critical_reception=stored_cr))]
+    db_id = next(iter(await fake_provider._sync_library_albums()))
+
+    fake_provider.library_albums = [_make_album(MediaItemMetadata(critical_reception=prov_cr))]
+    updates = _record_updates(mass, monkeypatch)
+    await fake_provider._sync_library_albums()
+
+    assert updates == []
+    stored = await _stored_album(mass, db_id)
+    assert stored.metadata.critical_reception == stored_cr
+
+
+@pytest.mark.usefixtures("fake_provider")
+async def test_sync_does_not_rewrite_when_only_stored_amg_dr_differs(
+    mass: MusicAssistant,
+    fake_provider: _FakeSyncProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored amg_dr the files no longer report must not trigger a write every sync."""
+    sources = [ReviewSourceEntry(source="AMG", rating=4.0, review="Text.")]
+    fake_provider.library_albums = [
+        _make_album(
+            MediaItemMetadata(critical_reception=CriticalReception(amg_dr=7.0, sources=sources))
+        )
+    ]
+    await fake_provider._sync_library_albums()
+
+    fake_provider.library_albums = [
+        _make_album(MediaItemMetadata(critical_reception=CriticalReception(sources=sources)))
+    ]
+    updates = _record_updates(mass, monkeypatch)
+    await fake_provider._sync_library_albums()
+    assert updates == []
 
 
 async def test_sync_lands_review_text_when_probe_no_longer_reports_amg_dr(
@@ -336,7 +420,7 @@ async def test_sync_writes_once_when_needs_update_and_review_data_both_changed(
     fake_provider: _FakeSyncProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """needs_update *and* richer CR *and* changed DR still collapse into a single write."""
+    """needs_update *and* changed CR *and* changed DR still collapse into a single write."""
     fake_provider.library_albums = [
         _make_album(
             MediaItemMetadata(
@@ -353,9 +437,6 @@ async def test_sync_writes_once_when_needs_update_and_review_data_both_changed(
     # a changed date_added makes _library_item_needs_update True on its own, while the
     # CR gained a source and the DR moved - the combination that used to fan out into
     # the plain update plus a second read-modify-write of the same row.
-    # The provider re-sends AMG alongside the new TPS so the CR really is *richer*
-    # (dropping AMG would make critical_reception_is_richer False and leave only the
-    # DR arm under test).
     prov_item = _make_album(
         MediaItemMetadata(
             dynamic_range=13.0,
@@ -375,10 +456,10 @@ async def test_sync_writes_once_when_needs_update_and_review_data_both_changed(
     assert sync_details is not None
     assert fake_provider._library_item_needs_update(sync_details, prov_item) is True
     assert (
-        critical_reception_is_richer(
+        critical_reception_for_update(
             prov_item.metadata.critical_reception, sync_details.critical_reception
         )
-        is True
+        != sync_details.critical_reception
     )
 
     updates = _record_updates(mass, monkeypatch)
