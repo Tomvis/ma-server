@@ -1,14 +1,15 @@
-"""Tests for the music-rater review-data refresh of streaming-only albums (MUSIC-79)."""
+"""Tests for the music-rater review-data refresh of library albums (MUSIC-79, MUSIC-84)."""
 
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from typing import Any, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
 import pytest
-from music_assistant_models.enums import ProviderType
+from music_assistant_models.enums import ExternalID, ProviderType, SortDirection, SortField
 from music_assistant_models.media_items import Album, Artist, ProviderMapping, UniqueList
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
@@ -21,6 +22,11 @@ from music_assistant.providers.music_rater import (
     CONF_URL,
     MusicRaterProvider,
 )
+
+RG_A = "11111111-1111-4111-8111-111111111111"
+RG_HIT = "22222222-2222-4222-8222-222222222222"
+RG_UNKNOWN = "33333333-3333-4333-8333-333333333333"
+RG_ONLY = "44444444-4444-4444-8444-444444444444"
 
 
 class _Response:
@@ -43,10 +49,21 @@ class _Response:
 
 
 class _Session:
-    """Answers GET /tags/for-album from a {(artist, album, year): fields} table."""
+    """
+    Answer music-rater's tag routes.
 
-    def __init__(self, table: dict[tuple[str, str, int], dict[str, Any]], status: int = 0) -> None:
+    GET /tags/for-album from a {(artist, album, year): fields} table, and
+    GET /tags/by-release-group/{id} from a {release group id: fields} table.
+    """
+
+    def __init__(
+        self,
+        table: dict[tuple[str, str, int], dict[str, Any]],
+        status: int = 0,
+        by_rgid: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self.table = table
+        self.by_rgid = by_rgid or {}
         self.status = status
         self.calls: list[dict[str, Any]] = []
 
@@ -54,6 +71,11 @@ class _Session:
         self.calls.append({"url": url, **kwargs})
         if self.status:
             return _Response(self.status)
+        if "/tags/by-release-group/" in url:
+            rgid = url.rsplit("/", 1)[1]
+            if rgid in self.by_rgid:
+                return _Response(200, {"fields": self.by_rgid[rgid]})
+            return _Response(404, {"detail": "nope"})
         params = kwargs["params"]
         key = (params["artist"], params["album"], params["year"])
         if key in self.table:
@@ -67,8 +89,9 @@ def _album(
     year: int | None,
     domains: list[str],
     cr: CriticalReception | None = None,
+    rgids: tuple[str, ...] = (),
 ) -> Album:
-    return Album(
+    album = Album(
         item_id=str(item_id),
         provider="library",
         name=name,
@@ -82,6 +105,9 @@ def _album(
             for d in domains
         },
     )
+    for rgid in rgids:
+        album.add_external_id(ExternalID.MB_RELEASEGROUP, rgid)
+    return album
 
 
 def _cr(rating: float) -> CriticalReception:
@@ -96,8 +122,14 @@ def _provider(
 
     async def _iter(**kwargs: Any) -> AsyncGenerator[Album]:
         # streaming mappings of these rows are in_library=False in production
-        assert kwargs == {"library_items_only": False}
-        for album in albums:
+        assert kwargs["library_items_only"] is False
+        ordered = albums
+        if kwargs.get("sort_field") == SortField.TIMESTAMP_ADDED:
+            assert kwargs["sort_direction"] == SortDirection.DESC
+            ordered = sorted(
+                albums, key=lambda a: a.date_added or datetime.min.replace(tzinfo=UTC), reverse=True
+            )
+        for album in ordered:
             yield album
 
     mass.music.albums.iter_library_items = _iter
@@ -137,16 +169,49 @@ async def test_unchanged_cr_is_not_written() -> None:
     assert _updated(prov) == {}
 
 
-async def test_file_tagged_albums_are_skipped() -> None:
-    """Navidrome and filesystem albums get their CR from the files' tags."""
-    session = _Session({})
+async def test_file_tagged_albums_are_refreshed_too() -> None:
+    """Navidrome and filesystem albums read their CR from music-rater as well."""
+    session = _Session(
+        {("Ihsahn", "B", 2020): {"AMG_RATING": "4.0"}},
+        by_rgid={RG_A: {"AMG_RATING": "3.5"}},
+    )
     albums = [
-        _album(1, "A", 2020, ["opensubsonic", "tidal"]),
+        _album(1, "A", 2020, ["opensubsonic", "tidal"], rgids=(RG_A,)),
         _album(2, "B", 2020, ["filesystem_local"]),
     ]
     prov = _provider(session, albums)
     await prov.sync_review_data()
-    assert session.calls == []
+    assert _updated(prov) == {"1": _cr(3.5), "2": _cr(4.0)}
+
+
+async def test_release_group_is_tried_before_identity() -> None:
+    """The release-group id is the files' own key; artist/album/year is the fallback."""
+    session = _Session(
+        {("Ihsahn", "Pharos", 2020): {"AMG_RATING": "2.0"}},
+        by_rgid={RG_HIT: {"AMG_RATING": "4.0"}},
+    )
+    prov = _provider(session, [_album(7, "Pharos", 2020, ["opensubsonic"], rgids=(RG_HIT,))])
+    await prov.sync_review_data()
+    assert _updated(prov) == {"7": _cr(4.0)}
+    assert [c["url"] for c in session.calls] == [f"http://mr/api/v1/tags/by-release-group/{RG_HIT}"]
+    assert session.calls[0]["headers"] == {"Authorization": "Bearer mr_key"}
+
+
+async def test_unknown_release_group_falls_back_to_identity() -> None:
+    """A release-group id music-rater has never resolved falls through to artist/album/year."""
+    session = _Session({("Ihsahn", "Pharos", 2020): {"AMG_RATING": "4.0"}})
+    prov = _provider(session, [_album(7, "Pharos", 2020, ["opensubsonic"], rgids=(RG_UNKNOWN,))])
+    await prov.sync_review_data()
+    assert _updated(prov) == {"7": _cr(4.0)}
+    assert session.calls[0]["url"].endswith(f"/tags/by-release-group/{RG_UNKNOWN}")
+
+
+async def test_album_without_year_uses_its_release_group() -> None:
+    """The identity lookup needs a year; the release-group lookup does not."""
+    session = _Session({}, by_rgid={RG_ONLY: {"AMG_RATING": "4.0"}})
+    prov = _provider(session, [_album(7, "Pharos", None, ["opensubsonic"], rgids=(RG_ONLY,))])
+    await prov.sync_review_data()
+    assert _updated(prov) == {"7": _cr(4.0)}
 
 
 async def test_year_falls_back_one_either_side() -> None:
@@ -167,8 +232,8 @@ async def test_no_match_keeps_stored_cr() -> None:
     assert _updated(prov) == {}
 
 
-async def test_album_without_year_is_skipped() -> None:
-    """The identity lookup needs a year."""
+async def test_album_without_year_or_release_group_is_skipped() -> None:
+    """With neither a release-group id nor a year there is nothing to look up by."""
     session = _Session({})
     prov = _provider(session, [_album(7, "Pharos", None, ["tidal"])])
     await prov.sync_review_data()
@@ -204,3 +269,21 @@ async def test_unconfigured_does_nothing() -> None:
     prov = _provider(session, [_album(7, "Pharos", 2020, ["tidal"])], values={})
     await prov.sync_review_data()
     assert session.calls == []
+
+
+async def test_recent_pass_reads_only_newly_added_albums() -> None:
+    """The hourly pass covers albums added within its window, newest first, and stops there."""
+    session = _Session(
+        {
+            ("Ihsahn", "New", 2026): {"AMG_RATING": "4.0"},
+            ("Ihsahn", "Old", 2020): {"AMG_RATING": "3.0"},
+        }
+    )
+    new = _album(1, "New", 2026, ["opensubsonic"])
+    new.date_added = datetime.now(UTC) - timedelta(minutes=5)
+    old = _album(2, "Old", 2020, ["opensubsonic"])
+    old.date_added = datetime.now(UTC) - timedelta(days=30)
+    prov = _provider(session, [old, new])
+    await prov.sync_recent_review_data()
+    assert _updated(prov) == {"1": _cr(4.0)}
+    assert {c["params"]["album"] for c in session.calls} == {"New"}

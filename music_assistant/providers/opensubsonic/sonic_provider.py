@@ -2,14 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import os
-import re
-import tempfile
 from contextlib import suppress
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from aiohttp import ClientResponseError
@@ -24,15 +18,21 @@ from libopensonic.errors import (
 )
 from libopensonic.media import PodcastChannel
 from music_assistant_models.config_entries import ConfigEntry
-from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType, StreamType
+from music_assistant_models.enums import (
+    ConfigEntryType,
+    ContentType,
+    ExternalID,
+    MediaType,
+    StreamType,
+)
 from music_assistant_models.errors import (
     ActionUnavailable,
-    InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
     ProviderPermissionDenied,
     UnsupportedFeaturedException,
 )
+from music_assistant_models.helpers import is_valid_uuid
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -50,7 +50,6 @@ from music_assistant_models.media_items import (
     Track,
     UniqueList,
 )
-from music_assistant_models.media_items.metadata import CriticalReception
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import (
@@ -62,8 +61,6 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.podcast_parsers import rank_episodes_by_date
-from music_assistant.helpers.tags import async_parse_tags
-from music_assistant.helpers.util import TaskManager, remove_file
 from music_assistant.models.music_provider import MusicProvider
 
 from .parsers import (
@@ -107,204 +104,40 @@ CONF_RAW_FILE = "request_raw_file"
 
 CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
-CACHE_CATEGORY_CRITICAL_RECEPTION = 3
-CACHE_CATEGORY_CR_WATERMARK = 4
-
-# Raw prefix kept when extracting custom AMG/TPS/DR tags from a format the tag-prefix
-# reader doesn't walk (MP4 'moov' and the like sit near the start of the file).
-# ID3v2-tagged and FLAC files are walked instead (see _TagPrefixReader), so a large
-# embedded cover image can't push their tags past this cap.
-CRITICAL_RECEPTION_PROBE_BYTES = 512 * 1024
-# Audio kept after a leading ID3v2 tag: ffprobe needs a few MPEG frames to accept it.
-_CR_PROBE_AUDIO_TAIL_BYTES = 128 * 1024
-# Largest leading ID3v2 tag kept in memory; bigger tags fall back to the raw prefix.
-_CR_PROBE_MAX_ID3_BYTES = 16 * 1024 * 1024
-# Total bytes read per probe, including cover art read past and not kept.
-_CR_PROBE_MAX_READ_BYTES = 32 * 1024 * 1024
-# CR/DR tags are written to the file once by the offline tagger and rarely change, so
-# the extraction result is cached for a month rather than a day: at 24h every album in
-# the library expired and re-probed itself daily (a 5000-album library paid 5000 probes
-# a day) just to rediscover unchanged tags. A retag is still picked up before the TTL
-# runs out: on Navidrome each library album sync first evicts the entries of albums
-# whose songs changed since the last sync (_evict_changed_album_cr, MUSIC-82); a force
-# refresh (music/refresh_item) sets BYPASS_CACHE, which skips this entry because it is
-# stored non-persistent; and the cache controller's "clear cache" action drops it.
-CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
-# Songs per page when asking Navidrome's native API which songs changed.
-_ND_SONG_PAGE_SIZE = 500
-# Outlives any realistic gap between syncs; a lost watermark only costs one baseline run.
-_CR_WATERMARK_TTL = 86400 * 365
-# Bumped when the CR tags read from files gain a field: an entry written by an older
-# version that has review sources is re-probed once to pick it up (2 = <SRC>_REVIEW).
-_CR_CACHE_VERSION = 2
-# An album whose sampled files ffprobe cannot read fails the same way on every sync, and
-# the Navidrome sync plugin starts a sync after every scan; a short negative entry stops
-# it re-streaming those files all day (MUSIC-20) while still retrying after a retag.
-_CR_UNPARSABLE_CACHE_TTL = 86400
-# How many tracks to ffprobe before giving up. A first track that's a bonus /
-# hidden track may have been written without the album's AMG/TPS/DR tags even
-# when later tracks carry them; sampling a few covers this without blowing up
-# sync cost.
-_CR_PROBE_SONG_ATTEMPTS = 3
-# Wall-clock budget for the whole per-album probe loop (all attempts together).
-# The attempts run sequentially and each can burn the full PARSE_TAGS_TIMEOUT_SECONDS
-# inside ffprobe, so without this the per-album worst case is ~90s — and get_album()
-# awaits this path inline, so that is user-facing stall time. 30s keeps the bound no
-# worse than the ~36s ceiling this code effectively had back when each probe carried
-# its own 12s timeout, while still leaving room for two or three slow-but-working
-# probes (stream fetch + ffprobe) to finish.
-# This bounds CALLER LATENCY, not the work: cancelling cannot stop the asyncio.to_thread
-# worker running ffprobe, so an orphaned probe keeps occupying a default-executor thread
-# until its own PARSE_TAGS_TIMEOUT_SECONDS kills the subprocess.
-_CR_PROBE_ALBUM_BUDGET_SECONDS = 30.0
-# Max albums enriched concurrently per library-sync page. Bounds simultaneous
-# conn.get_album round-trips and ffprobe subprocesses so a page of cache misses
-# overlaps latency without saturating the network or the default thread pool.
-_CR_ENRICH_CONCURRENCY = 4
+# Albums per page when reading DR and release-group ids from Navidrome's native API.
+_ND_ALBUM_PAGE_SIZE = 500
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
 
 
-class _Unparsable:
-    """A probe whose file ffprobe rejects outright, as opposed to a stream error."""
-
-
-_PROBE_UNPARSABLE = _Unparsable()
-
-
-def _parse_nd_time(value: str) -> datetime:
-    """Parse a Navidrome timestamp, whose fraction may run to nanoseconds."""
-    return datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", value))
-
-
-class _TagPrefixReader:
+def _nd_album_extras(nd_album: dict[str, Any]) -> tuple[float | None, str | None]:
     """
-    Collect the smallest prefix of a streamed audio file that still carries its tags.
+    Return the (album DR, release-group id) a Navidrome native API album carries.
 
-    A leading ID3v2 tag is kept whole, followed by a little audio. FLAC metadata is cut
-    down to STREAMINFO plus VORBIS_COMMENT, read past any cover art or padding without
-    keeping it, so the custom tags parse from a few kilobytes wherever the PICTURE block
-    sits. Anything else keeps a raw prefix of CRITICAL_RECEPTION_PROBE_BYTES.
+    Navidrome merges the files' ALBUM_DYNAMIC_RANGE tags into the album's tags; when the
+    tracks disagree there is no single album value, so none is reported.
+
+    :param nd_album: An album object of Navidrome's native API.
     """
+    dr: float | None = None
+    values = {v for v in (nd_album.get("tags") or {}).get("album dynamic range") or [] if v}
+    if len(values) == 1:
+        with suppress(ValueError):
+            dr = float(values.pop())
+    rgid = nd_album.get("mbzReleaseGroupId") or None
+    if rgid is not None and not is_valid_uuid(rgid):
+        rgid = None
+    return dr, rgid
 
-    def __init__(self) -> None:
-        """Start an empty prefix."""
-        self._pending = bytearray()
-        self._out = bytearray()
-        self._phase = "start"
-        self._skip = 0
-        self._read = 0
-        self._id3_size = 0
-        self._tail_start = 0
-        self._last_kept_header: int | None = None
 
-    def feed(self, chunk: bytes) -> bool:
-        """
-        Add the next chunk of the stream.
-
-        :param chunk: Bytes as they arrive from the stream.
-        :return: True once the prefix is complete and reading can stop.
-        """
-        self._pending += chunk
-        self._read += len(chunk)
-        steps = {
-            "start": self._step_start,
-            "id3": self._step_id3,
-            "flac": self._step_flac,
-            "tail": self._step_tail,
-        }
-        while True:
-            if self._skip:
-                dropped = min(self._skip, len(self._pending))
-                del self._pending[:dropped]
-                self._skip -= dropped
-            if self._phase == "done":
-                return True
-            if self._phase == "raw":
-                return len(self._pending) >= CRITICAL_RECEPTION_PROBE_BYTES
-            if self._skip or not steps[self._phase]():
-                return self._read >= _CR_PROBE_MAX_READ_BYTES
-
-    def result(self) -> bytes:
-        """Return the prefix collected so far."""
-        if self._phase in ("start", "raw"):
-            return bytes(self._pending[:CRITICAL_RECEPTION_PROBE_BYTES])
-        if self._phase == "id3":
-            return bytes(self._pending)
-        return bytes(self._out)
-
-    def _step_start(self) -> bool:
-        pending = self._pending
-        if len(pending) < 10:
-            return False
-        if pending[:3] == b"ID3":
-            # synchsafe size: 7 bits per byte, plus the 10-byte header (and footer)
-            size = 10 + sum((pending[6 + i] & 0x7F) << (7 * (3 - i)) for i in range(4))
-            if pending[5] & 0x10:
-                size += 10
-            if size > _CR_PROBE_MAX_ID3_BYTES:
-                self._phase = "raw"
-            else:
-                self._id3_size = size
-                self._phase = "id3"
-        elif pending[:4] == b"fLaC":
-            self._start_flac()
-        else:
-            self._phase = "raw"
-        return True
-
-    def _step_id3(self) -> bool:
-        pending = self._pending
-        size = self._id3_size
-        if len(pending) < size + 4:
-            return False
-        if pending[size : size + 4] == b"fLaC":
-            # FLAC keeps its tags in VORBIS_COMMENT; the stray ID3 tag adds nothing
-            del pending[:size]
-            self._start_flac()
-        else:
-            self._out += pending[:size]
-            del pending[:size]
-            self._tail_start = len(self._out)
-            self._phase = "tail"
-        return True
-
-    def _step_flac(self) -> bool:
-        pending = self._pending
-        if len(pending) < 4:
-            return False
-        header = pending[0]
-        block_type = header & 0x7F
-        length = int.from_bytes(pending[1:4], "big")
-        if block_type in (0, 4):  # STREAMINFO, VORBIS_COMMENT
-            if len(pending) < 4 + length:
-                return False
-            self._last_kept_header = len(self._out)
-            self._out += pending[: 4 + length]
-            del pending[: 4 + length]
-        else:
-            del pending[:4]
-            self._skip = length
-        if block_type == 4 or header & 0x80:
-            if self._last_kept_header is not None:
-                self._out[self._last_kept_header] |= 0x80  # last-metadata-block flag
-            self._phase = "done"
-        return True
-
-    def _step_tail(self) -> bool:
-        self._out += self._pending
-        self._pending.clear()
-        if len(self._out) - self._tail_start < _CR_PROBE_AUDIO_TAIL_BYTES:
-            return False
-        del self._out[self._tail_start + _CR_PROBE_AUDIO_TAIL_BYTES :]
-        self._phase = "done"
-        return True
-
-    def _start_flac(self) -> None:
-        self._out += b"fLaC"
-        del self._pending[:4]
-        self._phase = "flac"
+def _apply_nd_album_extras(album: Album, extras: tuple[float | None, str | None]) -> None:
+    """Set the album DR and release-group id read from Navidrome's native API on an album."""
+    dr, rgid = extras
+    if dr is not None:
+        album.metadata.dynamic_range = dr
+    if rgid is not None:
+        album.add_external_id(ExternalID.MB_RELEASEGROUP, rgid)
 
 
 class OpenSonicProvider(MusicProvider):
@@ -672,7 +505,11 @@ class OpenSonicProvider(MusicProvider):
         Note the pagination, the open subsonic docs say that this method is limited to
         returning 500 items per invocation.
         """
-        await self._evict_changed_album_cr()
+        try:
+            extras = await self._nd_library_album_extras()
+        except Exception as err:
+            self.logger.debug("Reading album DR from the server failed: %s", err)
+            extras = {}
         offset = 0
         size = self._pagination_size
         albums = await self.conn.get_album_list2(
@@ -681,21 +518,10 @@ class OpenSonicProvider(MusicProvider):
             offset=offset,
         )
         while albums:
-            # Pull AMG/TPS/DR custom tags out of one track per album. These don't
-            # ride on the OpenSubsonic schema, so we ffprobe a short prefix of the
-            # audio. Enrich the whole page with bounded concurrency before yielding
-            # so cache-miss albums overlap their network/ffprobe latency instead of
-            # serializing. _enrich_album_with_critical_reception swallows its own
-            # failures (non-fatal — the album still syncs, just without
-            # critical_reception), so one album can't abort the page.
-            parsed_page = [parse_album(self.logger, self.instance_id, album) for album in albums]
-            async with TaskManager(self.mass, _CR_ENRICH_CONCURRENCY) as tm:
-                for parsed, album in zip(parsed_page, albums, strict=True):
-                    await tm.create_task_with_limit(
-                        self._enrich_album_with_critical_reception(parsed, album.id)
-                    )
-            # Yield in the original page order after enrichment.
-            for parsed in parsed_page:
+            for album in albums:
+                parsed = parse_album(self.logger, self.instance_id, album)
+                if album.id in extras:
+                    _apply_nd_album_extras(parsed, extras[album.id])
                 yield parsed
             offset += size
             albums = await self.conn.get_album_list2(
@@ -782,12 +608,13 @@ class OpenSonicProvider(MusicProvider):
             raise MediaNotFoundError(msg) from e
 
         album = parse_album(self.logger, self.instance_id, sonic_album, sonic_info)
-        # Route through the shared CR cache so library sync and direct get_album
-        # don't both pay for ffprobe; the pre-fetched sonic_album skips a redundant
-        # conn.get_album on cache miss.
-        await self._enrich_album_with_critical_reception(
-            album, prov_album_id, sonic_album=sonic_album
-        )
+        try:
+            nd_album = await self._nd_get(f"/api/album/{prov_album_id}")
+        except Exception as err:
+            self.logger.debug("Reading DR of album %s failed: %s", prov_album_id, err)
+            nd_album = None
+        if isinstance(nd_album, dict):
+            _apply_nd_album_extras(album, _nd_album_extras(nd_album))
         return album
 
     @use_cache(3600 * 3)  # cache for 3 hours
@@ -1362,257 +1189,36 @@ class OpenSonicProvider(MusicProvider):
             recent.items.append(parse_album(self.logger, self.instance_id, sonic_album))
         return recent
 
-    async def _enrich_album_with_critical_reception(
-        self, album: Album, prov_album_id: str, sonic_album: SonicAlbum | None = None
-    ) -> None:
-        """
-        Populate album CR + album-scope DR by ffprobing one track of the album.
-
-        :param sonic_album: Pre-fetched album record forwarded to the CR fetch so callers
-            that already paid for ``conn.get_album`` skip a redundant round-trip on cache miss.
-        """
-        try:
-            cr, album_dr = await self._get_album_critical_reception(prov_album_id, sonic_album)
-        except Exception as err:
-            self.logger.debug(
-                "critical_reception extraction failed for album %s: %s", prov_album_id, err
-            )
-            return
-        if cr is not None:
-            album.metadata.critical_reception = cr
-        if album_dr is not None:
-            album.metadata.dynamic_range = album_dr
-
-    async def _get_album_critical_reception(
-        self,
-        prov_album_id: str,
-        sonic_album: SonicAlbum | None = None,
-    ) -> tuple[CriticalReception | None, float | None]:
-        """
-        Fetch one track of an album, ffprobe it, return (CR, album_dr).
-
-        Cached per album_id for ``CRITICAL_RECEPTION_CACHE_TTL`` so bulk library sync
-        doesn't re-ffprobe every album on each run. Only outcomes of a cleanly completed
-        probe are cached (including the clean "no tags" negative); transient outcomes —
-        album fetch failure, every probe erroring, or the whole-album probe budget of
-        ``_CR_PROBE_ALBUM_BUDGET_SECONDS`` running out — return (possibly partial) results
-        without writing this cache, so a later sync re-probes. Note that only *this* cache
-        is skipped: ``get_album`` carries its own ``@use_cache``, so a transient result
-        reached through it is still served from that cache for its own, shorter TTL.
-
-        :param sonic_album: Pre-fetched album record; lets callers that already paid
-            for ``conn.get_album`` skip the round-trip on cache miss.
-        """
-        # Bind the cache key to the configured server URL so a config edit that
-        # repoints this provider at a different Subsonic server doesn't return
-        # stale CR/DR for an album_id that happens to collide.
-        cache_key = f"{self._cr_cache_namespace()}:{prov_album_id}"
-        cached = await self.mass.cache.get(
-            key=cache_key,
-            provider=self.instance_id,
-            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-            default=None,
-        )
-        if cached is not None and not (cached.get("cr") and cached.get("v", 1) < _CR_CACHE_VERSION):
-            # A stored entry is itself proof that a probe ran cleanly; legacy
-            # {"ok": False} entries decode to (None, None), the same cached
-            # clean negative they always meant. Clean negatives stay valid across
-            # versions: an album without review tags gains no field to re-read.
-            return (
-                CriticalReception.from_dict(cr_data) if (cr_data := cached.get("cr")) else None,
-                float(dr_data) if (dr_data := cached.get("dr")) is not None else None,
-            )
-        if sonic_album is None:
-            try:
-                sonic_album = await self.conn.get_album(prov_album_id)
-            except ParameterError, DataNotFoundError:
-                sonic_album = None
-        if sonic_album is None or not sonic_album.song:
-            # Don't cache "no songs" or "fetch failed" — those states can change
-            # (user uploads tracks, server comes back) and a month-long negative
-            # cache would block a follow-up sync from re-probing.
-            return None, None
-        # Try a handful of tracks and OR-merge their signals. A bonus / hidden
-        # first track may carry CR tags but not ALBUM_DYNAMIC_RANGE, while a
-        # later track carries DR but no CR — break out only once both have been
-        # observed (or we run out of attempts or time) so neither signal is lost.
-        # Cost note: these probes run SEQUENTIALLY and each one can burn the full
-        # PARSE_TAGS_TIMEOUT_SECONDS inside ffprobe on top of its stream fetch, so the
-        # loop as a whole — not each attempt — is bounded by _CR_PROBE_ALBUM_BUDGET_SECONDS,
-        # independent of _CR_PROBE_SONG_ATTEMPTS. Scope is deliberately just this loop: the
-        # cache round-trips and the conn.get_album fetch above sit outside it, so the budget
-        # bounds the probing, not this method end-to-end. Nothing here can stop an ffprobe
-        # already running in an executor thread; the budget bounds the caller's wait, not
-        # the work, and a probe abandoned by the timeout runs on until PARSE_TAGS_TIMEOUT_SECONDS
-        # kills it. Its temp file is still cleaned up: the `finally` in the probe helper is
-        # entered by the CancelledError and gets to run its own awaits, because
-        # asyncio.timeout cancels exactly once at the deadline — though those are two more
-        # default-executor hops, so a saturated pool can stretch the unwind past the budget.
-        cr: CriticalReception | None = None
-        album_dr: float | None = None
-        # Distinguish "probe ran cleanly and found nothing" from "every probe attempt
-        # errored". A clean probe returns a (cr, dr) tuple (possibly (None, None));
-        # a transient failure returns bare None and is skipped below.
-        probed_clean = False
-        unparsable = False
-        started_at = asyncio.get_running_loop().time()
-        try:
-            async with asyncio.timeout(_CR_PROBE_ALBUM_BUDGET_SECONDS):
-                for sonic_song in sonic_album.song[:_CR_PROBE_SONG_ATTEMPTS]:
-                    probe = await self._extract_critical_reception_from_song(sonic_song.id)
-                    if isinstance(probe, _Unparsable):
-                        unparsable = True
-                        continue
-                    if probe is None:
-                        continue
-                    probed_clean = True
-                    probe_cr, probe_dr = probe
-                    if cr is None and probe_cr is not None:
-                        cr = probe_cr
-                    if album_dr is None and probe_dr is not None:
-                        album_dr = probe_dr
-                    if cr is not None and album_dr is not None:
-                        break
-        except TimeoutError:
-            # Either the budget ran out, or a probe raised a TimeoutError of its own —
-            # aiohttp's ServerTimeoutError subclasses it, and conn.stream errors are not
-            # covered by the probe helper's `except Exception`. Both abort the loop, so
-            # distinguish them by elapsed time rather than logging a budget we may not
-            # have spent. Transient either way: hand back whatever earlier probes already
-            # produced (possibly (None, None)) but do NOT write the CR cache, or a
-            # partial/empty result gets pinned for CRITICAL_RECEPTION_CACHE_TTL. The next
-            # sync re-probes and can complete the picture.
-            elapsed = asyncio.get_running_loop().time() - started_at
-            if elapsed >= _CR_PROBE_ALBUM_BUDGET_SECONDS:
-                self.logger.debug(
-                    "critical_reception probe budget of %ss exhausted for album %s",
-                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
-                    prov_album_id,
-                )
-            else:
-                self.logger.debug(
-                    "critical_reception probe for album %s timed out after %.1fs "
-                    "(inside the %ss budget — likely a stalled stream read)",
-                    prov_album_id,
-                    elapsed,
-                    _CR_PROBE_ALBUM_BUDGET_SECONDS,
-                )
-            return cr, album_dr
-        if not probed_clean:
-            if unparsable:
-                await self.mass.cache.set(
-                    key=cache_key,
-                    data={"cr": None, "dr": None},
-                    provider=self.instance_id,
-                    category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-                    expiration=_CR_UNPARSABLE_CACHE_TTL,
-                )
-                return None, None
-            # Every probe attempt errored transiently (stream/ffprobe failure) rather
-            # than cleanly finding no tags. Don't pin a month-long negative cache — mirror
-            # the "fetch failed" path above so the next sync re-probes once it recovers.
-            return None, None
-        await self.mass.cache.set(
-            key=cache_key,
-            data={
-                "cr": cr.to_dict() if cr is not None else None,
-                "dr": album_dr,
-                "v": _CR_CACHE_VERSION,
-            },
-            provider=self.instance_id,
-            category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-            expiration=CRITICAL_RECEPTION_CACHE_TTL,
-        )
-        return cr, album_dr
-
-    def _cr_cache_namespace(self) -> str:
-        """
-        Stable, URL-derived prefix for the CR cache key.
-
-        Without this prefix the cache key is just ``prov_album_id`` — a config
-        edit that swings this provider over to a different Subsonic server
-        keeps the same MA provider instance_id but the album IDs no longer
-        refer to the same albums, so the cache returns stale CR/DR for the
-        new server. Hashing the URL bumps the namespace on any URL change.
-        """
-        url = str(self.config.get_value(CONF_BASE_URL) or "")
-        if not url:
-            return "default"
-        # md5 is fine here — this is a cache namespace, not a security boundary.
-        return hashlib.md5(url.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
-
-    async def _evict_changed_album_cr(self) -> None:
-        """Drop the cached critical reception of albums whose songs changed since the last sync."""
-        namespace = self._cr_cache_namespace()
-        watermark_key = f"{namespace}:songs_updated"
-        try:
-            # never bypassed: a missing watermark would skip this sync's changes for good
-            watermark = await self.mass.cache.get(
-                key=watermark_key,
-                provider=self.instance_id,
-                category=CACHE_CATEGORY_CR_WATERMARK,
-                allow_bypass=False,
-            )
-            changed, newest = await self._nd_changed_album_ids(watermark)
-            for album_id in changed:
-                await self.mass.cache.delete(
-                    key=f"{namespace}:{album_id}",
-                    category=CACHE_CATEGORY_CRITICAL_RECEPTION,
-                    provider=self.instance_id,
-                )
-            if newest is not None:
-                await self.mass.cache.set(
-                    key=watermark_key,
-                    data=newest,
-                    provider=self.instance_id,
-                    category=CACHE_CATEGORY_CR_WATERMARK,
-                    expiration=_CR_WATERMARK_TTL,
-                )
-        except Exception as err:
-            self.logger.debug("Checking the server for changed albums failed: %s", err)
-            return
-        if changed:
-            self.logger.info(
-                "Re-reading critical reception of %s album(s) changed on the server", len(changed)
-            )
-
-    async def _nd_changed_album_ids(self, watermark: str | None) -> tuple[set[str], str | None]:
-        """
-        Return the ids of albums with songs updated after ``watermark``, and the newest update.
-
-        The newest update is None when nothing is newer than ``watermark`` or the server has
-        no Navidrome native API. Without a watermark only the newest update is looked up.
-
-        :param watermark: Navidrome ``updatedAt`` of the newest song seen by the previous call.
-        """
-        since = _parse_nd_time(watermark) if watermark else None
-        size = _ND_SONG_PAGE_SIZE if since else 1
-        changed: set[str] = set()
-        newest: str | None = None
+    async def _nd_library_album_extras(self) -> dict[str, tuple[float | None, str | None]]:
+        """Return the (album DR, release-group id) of every album, by album id."""
+        extras: dict[str, tuple[float | None, str | None]] = {}
         start = 0
-        while (page := await self._nd_song_page(start, start + size)) is not None:
-            for song in page:
-                updated = song.get("updatedAt")
-                if not updated:
-                    continue
-                if since is not None and _parse_nd_time(updated) <= since:
-                    return changed, newest
-                newest = newest or updated
-                if since is not None and (album_id := song.get("albumId")):
-                    changed.add(album_id)
-            if since is None or len(page) < size:
-                break
-            start += size
-        return changed, newest
+        while True:
+            page = await self._nd_get(
+                "/api/album",
+                {
+                    "_sort": "name",
+                    "_order": "ASC",
+                    "_start": str(start),
+                    "_end": str(start + _ND_ALBUM_PAGE_SIZE),
+                },
+            )
+            if not page:
+                return extras
+            for nd_album in page:
+                extras[nd_album["id"]] = _nd_album_extras(nd_album)
+            if len(page) < _ND_ALBUM_PAGE_SIZE:
+                return extras
+            start += _ND_ALBUM_PAGE_SIZE
 
-    async def _nd_song_page(self, start: int, end: int) -> list[dict[str, Any]] | None:
+    async def _nd_get(self, path: str, params: dict[str, str] | None = None) -> Any:
         """
-        Return songs ``start``..``end`` of Navidrome's native API, most recently updated first.
+        Return the JSON answer of a GET on Navidrome's native API.
 
         Returns None when the server has no Navidrome native API.
 
-        :param start: Index of the first song.
-        :param end: Index past the last song.
+        :param path: The API path, e.g. ``/api/album``.
+        :param params: The query parameters.
         """
         if not self._nd_native:
             return None
@@ -1643,22 +1249,15 @@ class OpenSonicProvider(MusicProvider):
                             data = await resp.json(content_type=None)
                 if not isinstance(data, dict) or not data.get("token"):
                     self.logger.info(
-                        "%s has no Navidrome native API, so changed review tags only reach "
-                        "Music Assistant once their %s-day cache expires",
+                        "%s has no Navidrome native API, so albums sync without their DR",
                         self._nd_base_url,
-                        CRITICAL_RECEPTION_CACHE_TTL // 86400,
                     )
                     self._nd_native = False
                     return None
                 self._nd_token = str(data["token"])
             async with session.get(
-                f"{self._nd_base_url}/api/song",
-                params={
-                    "_sort": "updated_at",
-                    "_order": "DESC",
-                    "_start": str(start),
-                    "_end": str(end),
-                },
+                f"{self._nd_base_url}{path}",
+                params=params,
                 headers={"x-nd-authorization": f"Bearer {self._nd_token}"},
             ) as resp:
                 if resp.status == 401:
@@ -1666,65 +1265,5 @@ class OpenSonicProvider(MusicProvider):
                     self._nd_token = None
                     continue
                 resp.raise_for_status()
-                return list(await resp.json())
+                return await resp.json()
         return None
-
-    async def _extract_critical_reception_from_song(
-        self, song_id: str
-    ) -> tuple[CriticalReception | None, float | None] | _Unparsable | None:
-        """
-        Stream a small prefix of the song, ffprobe, return (CR, album_dr) or None.
-
-        Album-scope DR is the upstream tag writer's ALBUM_DYNAMIC_RANGE — same value
-        on every track, so reading any one of them gives us the album-level number.
-        """
-        # Pull a fixed prefix of the file via the Subsonic stream endpoint, write it
-        # to a temp file, then ffprobe that. Stdin-piping to ffprobe is unreliable
-        # for some containers (M4A 'moov' atom can sit before mdat but ffprobe still
-        # wants the file size to validate offsets); a temp file sidesteps all of it.
-        try:
-            resp = await self.conn.stream(song_id, tformat="raw", estimate_length=True)
-        except ParameterError, DataNotFoundError:
-            return None
-        # mkstemp is synchronous (single syscall; not worth the executor hop) and
-        # creates the temp file before any await, so the outer try/finally that
-        # owns the cleanup is entered without a cancellation hole. We close the fd
-        # right away — the prefix is buffered in memory and persisted in one write
-        # below. The aiohttp ClientResponse must be released even if mkstemp raises
-        # (OSError on tmpdir EACCES / ENFILE / disk full), so wrap the whole flow
-        # in `async with resp:` so a mkstemp failure still triggers __aexit__.
-        tmp_path: str | None = None
-        try:
-            async with resp:
-                tmp_fd, tmp_path = tempfile.mkstemp(prefix="ma-cr-", suffix=".bin")
-                os.close(tmp_fd)
-                # Collect the tag-bearing prefix in memory, then persist it in a
-                # single executor hop below.
-                reader = _TagPrefixReader()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    if not chunk or reader.feed(chunk):
-                        break
-            probe_bytes = reader.result()
-            if not probe_bytes:
-                return None
-            await asyncio.to_thread(Path(tmp_path).write_bytes, probe_bytes)
-            # No outer asyncio.wait_for here: async_parse_tags runs parse_tags via
-            # asyncio.to_thread, so cancelling the await would abandon — not stop —
-            # the executor thread. The work is bounded from the inside instead:
-            # the ffprobe subprocess is capped by PARSE_TAGS_TIMEOUT_SECONDS (a hung
-            # ffprobe is killed there and surfaces here as an exception), and the
-            # parse_tags_mutagen pass that follows — which always runs, since
-            # tmp_path is a local existing file — is untimed but is a pure in-memory
-            # parse of a prefix of at most CRITICAL_RECEPTION_PROBE_BYTES. The caller's
-            # wait is bounded separately, per album rather than per probe, by
-            # _CR_PROBE_ALBUM_BUDGET_SECONDS.
-            try:
-                tags = await async_parse_tags(tmp_path)
-            except InvalidDataError:
-                return _PROBE_UNPARSABLE
-            except Exception:
-                return None
-            return tags.critical_reception, tags.album_dynamic_range
-        finally:
-            if tmp_path is not None:
-                await remove_file(tmp_path)
