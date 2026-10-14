@@ -5,8 +5,8 @@ The function decides whether an incoming critical_reception is worth acting on: 
 album library sync uses it to widen the update condition (write the row at all), and
 `AlbumsController._update_library_item` uses it to decide whether to restore the stored
 CR over the deep-merge result. A False answer means "keep what is stored", so the
-function must reject any change that loses data on either dimension (amg_dr or sources)
-— otherwise that field would silently disappear.
+function must reject any change that loses source data — otherwise that field would
+silently disappear. An absent amg_dr is "not reported" (the tag left the files), never a loss.
 """
 
 from __future__ import annotations
@@ -38,16 +38,25 @@ def test_returns_true_when_existing_is_none() -> None:
     assert critical_reception_is_richer(new, None) is True
 
 
-def test_regresses_when_new_drops_amg_dr() -> None:
-    """New gains a source but loses amg_dr — wholesale replace would erase 12.5."""
+def test_absent_amg_dr_does_not_block_a_richer_update() -> None:
+    """
+    New gains review text but carries no amg_dr — still richer (MUSIC-78).
+
+    AMG_ALBUM_DYNAMIC_RANGE left the file tags, so no probe reports amg_dr any more:
+    absent means "not reported", and the callers keep the stored value.
+    """
     existing = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     new = _cr(
         amg_dr=None,
-        sources=[
-            ReviewSourceEntry(source="AMG", rating=4.5),
-            ReviewSourceEntry(source="TPS", rating=8.5),
-        ],
+        sources=[ReviewSourceEntry(source="AMG", rating=4.5, review="Full text.")],
     )
+    assert critical_reception_is_richer(new, existing) is True
+
+
+def test_absent_amg_dr_alone_is_not_richer() -> None:
+    """An otherwise-identical probe without amg_dr must not rewrite the row every sync."""
+    existing = _cr(amg_dr=12.5, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
+    new = _cr(amg_dr=None, sources=[ReviewSourceEntry(source="AMG", rating=4.5)])
     assert critical_reception_is_richer(new, existing) is False
 
 

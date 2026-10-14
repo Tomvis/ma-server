@@ -265,6 +265,71 @@ async def test_sync_stores_merged_cr_superset_not_raw_provider_cr(
     assert stored_sources["TPS"].accolades == ["Album of the Year (2000)"]
 
 
+async def test_sync_lands_review_text_when_probe_no_longer_reports_amg_dr(
+    mass: MusicAssistant,
+    fake_provider: _FakeSyncProvider,
+) -> None:
+    """A stored amg_dr no longer reported by the files must not freeze the CR (MUSIC-78)."""
+    fake_provider.library_albums = [
+        _make_album(
+            MediaItemMetadata(
+                critical_reception=CriticalReception(
+                    amg_dr=7.0, sources=[ReviewSourceEntry(source="AMG", rating=4.0)]
+                ),
+            )
+        )
+    ]
+    db_ids = await fake_provider._sync_library_albums()
+    db_id = next(iter(db_ids))
+
+    fake_provider.library_albums = [
+        _make_album(
+            MediaItemMetadata(
+                critical_reception=CriticalReception(
+                    sources=[ReviewSourceEntry(source="AMG", rating=4.0, review="Full text.")]
+                ),
+            )
+        )
+    ]
+    assert await fake_provider._sync_library_albums() == {db_id}
+
+    stored = await _stored_album(mass, db_id)
+    assert stored.metadata.critical_reception is not None
+    assert stored.metadata.critical_reception.amg_dr == 7.0
+    assert _sources_by_name(stored.metadata.critical_reception)["AMG"].review == "Full text."
+
+
+async def test_overwrite_keeps_stored_amg_dr_the_probe_no_longer_reports(
+    mass: MusicAssistant,
+    fake_provider: _FakeSyncProvider,
+) -> None:
+    """A forced refresh (overwrite) gains the review text without dropping amg_dr."""
+    fake_provider.library_albums = [
+        _make_album(
+            MediaItemMetadata(
+                critical_reception=CriticalReception(
+                    amg_dr=7.0, sources=[ReviewSourceEntry(source="AMG", rating=4.0)]
+                ),
+            )
+        )
+    ]
+    db_id = next(iter(await fake_provider._sync_library_albums()))
+
+    update = _make_album(
+        MediaItemMetadata(
+            critical_reception=CriticalReception(
+                sources=[ReviewSourceEntry(source="AMG", rating=4.0, review="Full text.")]
+            ),
+        )
+    )
+    await mass.music.albums.update_item_in_library(db_id, update, overwrite=True)
+
+    stored = await _stored_album(mass, db_id)
+    assert stored.metadata.critical_reception is not None
+    assert stored.metadata.critical_reception.amg_dr == 7.0
+    assert _sources_by_name(stored.metadata.critical_reception)["AMG"].review == "Full text."
+
+
 @pytest.mark.usefixtures("fake_provider")
 async def test_sync_writes_once_when_needs_update_and_review_data_both_changed(
     mass: MusicAssistant,

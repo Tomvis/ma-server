@@ -1683,6 +1683,16 @@ class AlbumsController(MediaControllerBase[Album]):
             metadata.critical_reception, stored_cr
         ):
             metadata.critical_reception = stored_cr
+        elif (
+            stored_cr is not None
+            and stored_cr.amg_dr is not None
+            and metadata.critical_reception is not None
+            and metadata.critical_reception.amg_dr is None
+        ):
+            # files no longer carry amg_dr; an overwrite must not drop the stored one
+            metadata.critical_reception = replace(
+                metadata.critical_reception, amg_dr=stored_cr.amg_dr
+            )
         if getattr(update, "album_type", AlbumType.UNKNOWN) != AlbumType.UNKNOWN:
             album_type = update.album_type
         else:

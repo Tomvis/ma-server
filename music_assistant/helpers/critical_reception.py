@@ -40,13 +40,18 @@ def critical_reception_is_richer(new: object, existing: object) -> bool:
         return False
     if existing is None:
         return True
-    new_amg_dr = getattr(new, "amg_dr", None)
     cur_amg_dr = getattr(existing, "amg_dr", None)
+    # AMG_ALBUM_DYNAMIC_RANGE left the file tags (music-rater 3.x), so a probe no longer
+    # reports amg_dr: absent means "not reported", not a loss. Rejecting it froze every
+    # album with a stored amg_dr on its old CR, review text never landing (MUSIC-78).
+    # Callers keep the stored value: the model deep-merge falls back to it and
+    # `_update_library_item` carries it over an overwrite.
+    new_amg_dr = getattr(new, "amg_dr", None)
+    if new_amg_dr is None:
+        new_amg_dr = cur_amg_dr
     new_sources = getattr(new, "sources", None) or []
     cur_sources = getattr(existing, "sources", None) or []
-    # Regression on either dimension would erase data on wholesale replace.
-    if cur_amg_dr is not None and new_amg_dr is None:
-        return False
+    # A dropped source would erase data on wholesale replace.
     if len(new_sources) < len(cur_sources):
         return False
     # Per-source field-level regression check: same source name on both sides,
