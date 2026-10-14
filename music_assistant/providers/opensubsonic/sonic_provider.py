@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import tempfile
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
@@ -106,6 +108,7 @@ CONF_RAW_FILE = "request_raw_file"
 CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
 CACHE_CATEGORY_CRITICAL_RECEPTION = 3
+CACHE_CATEGORY_CR_WATERMARK = 4
 
 # Raw prefix kept when extracting custom AMG/TPS/DR tags from a format the tag-prefix
 # reader doesn't walk (MP4 'moov' and the like sit near the start of the file).
@@ -122,10 +125,15 @@ _CR_PROBE_MAX_READ_BYTES = 32 * 1024 * 1024
 # the extraction result is cached for a month rather than a day: at 24h every album in
 # the library expired and re-probed itself daily (a 5000-album library paid 5000 probes
 # a day) just to rediscover unchanged tags. A retag is still picked up before the TTL
-# runs out — a force refresh (music/refresh_item) sets BYPASS_CACHE, which skips this
-# entry because it is stored non-persistent, and the cache controller's "clear cache"
-# action drops it outright.
+# runs out: on Navidrome each library album sync first evicts the entries of albums
+# whose songs changed since the last sync (_evict_changed_album_cr, MUSIC-82); a force
+# refresh (music/refresh_item) sets BYPASS_CACHE, which skips this entry because it is
+# stored non-persistent; and the cache controller's "clear cache" action drops it.
 CRITICAL_RECEPTION_CACHE_TTL = 86400 * 30  # 30 days
+# Songs per page when asking Navidrome's native API which songs changed.
+_ND_SONG_PAGE_SIZE = 500
+# Outlives any realistic gap between syncs; a lost watermark only costs one baseline run.
+_CR_WATERMARK_TTL = 86400 * 365
 # Bumped when the CR tags read from files gain a field: an entry written by an older
 # version that has review sources is re-probed once to pick it up (2 = <SRC>_REVIEW).
 _CR_CACHE_VERSION = 2
@@ -163,6 +171,11 @@ class _Unparsable:
 
 
 _PROBE_UNPARSABLE = _Unparsable()
+
+
+def _parse_nd_time(value: str) -> datetime:
+    """Parse a Navidrome timestamp, whose fraction may run to nanoseconds."""
+    return datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", value))
 
 
 class _TagPrefixReader:
@@ -308,6 +321,10 @@ class OpenSonicProvider(MusicProvider):
     _id_lyrics: bool = False
     _direct_podcast_episode: bool = False
     _raw_file: bool = True
+    _nd_base_url: str | None = None
+    _nd_login: dict[str, str] | None = None
+    _nd_token: str | None = None
+    _nd_native: bool = True
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to setup this provider."""
@@ -655,6 +672,7 @@ class OpenSonicProvider(MusicProvider):
         Note the pagination, the open subsonic docs say that this method is limited to
         returning 500 items per invocation.
         """
+        await self._evict_changed_album_cr()
         offset = 0
         size = self._pagination_size
         albums = await self.conn.get_album_list2(
@@ -1522,6 +1540,134 @@ class OpenSonicProvider(MusicProvider):
             return "default"
         # md5 is fine here — this is a cache namespace, not a security boundary.
         return hashlib.md5(url.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+    async def _evict_changed_album_cr(self) -> None:
+        """Drop the cached critical reception of albums whose songs changed since the last sync."""
+        namespace = self._cr_cache_namespace()
+        watermark_key = f"{namespace}:songs_updated"
+        try:
+            # never bypassed: a missing watermark would skip this sync's changes for good
+            watermark = await self.mass.cache.get(
+                key=watermark_key,
+                provider=self.instance_id,
+                category=CACHE_CATEGORY_CR_WATERMARK,
+                allow_bypass=False,
+            )
+            changed, newest = await self._nd_changed_album_ids(watermark)
+            for album_id in changed:
+                await self.mass.cache.delete(
+                    key=f"{namespace}:{album_id}",
+                    category=CACHE_CATEGORY_CRITICAL_RECEPTION,
+                    provider=self.instance_id,
+                )
+            if newest is not None:
+                await self.mass.cache.set(
+                    key=watermark_key,
+                    data=newest,
+                    provider=self.instance_id,
+                    category=CACHE_CATEGORY_CR_WATERMARK,
+                    expiration=_CR_WATERMARK_TTL,
+                )
+        except Exception as err:
+            self.logger.debug("Checking the server for changed albums failed: %s", err)
+            return
+        if changed:
+            self.logger.info(
+                "Re-reading critical reception of %s album(s) changed on the server", len(changed)
+            )
+
+    async def _nd_changed_album_ids(self, watermark: str | None) -> tuple[set[str], str | None]:
+        """
+        Return the ids of albums with songs updated after ``watermark``, and the newest update.
+
+        The newest update is None when nothing is newer than ``watermark`` or the server has
+        no Navidrome native API. Without a watermark only the newest update is looked up.
+
+        :param watermark: Navidrome ``updatedAt`` of the newest song seen by the previous call.
+        """
+        since = _parse_nd_time(watermark) if watermark else None
+        size = _ND_SONG_PAGE_SIZE if since else 1
+        changed: set[str] = set()
+        newest: str | None = None
+        start = 0
+        while (page := await self._nd_song_page(start, start + size)) is not None:
+            for song in page:
+                updated = song.get("updatedAt")
+                if not updated:
+                    continue
+                if since is not None and _parse_nd_time(updated) <= since:
+                    return changed, newest
+                newest = newest or updated
+                if since is not None and (album_id := song.get("albumId")):
+                    changed.add(album_id)
+            if since is None or len(page) < size:
+                break
+            start += size
+        return changed, newest
+
+    async def _nd_song_page(self, start: int, end: int) -> list[dict[str, Any]] | None:
+        """
+        Return songs ``start``..``end`` of Navidrome's native API, most recently updated first.
+
+        Returns None when the server has no Navidrome native API.
+
+        :param start: Index of the first song.
+        :param end: Index past the last song.
+        """
+        if not self._nd_native:
+            return None
+        if self._nd_login is None:
+            # the native API logs in with the Subsonic credentials; an API key can't
+            username = self.get_setup_value(CONF_USERNAME)
+            password = self.get_setup_value(CONF_PASSWORD)
+            if self.get_setup_value(CONF_API_KEY) or not (username and password):
+                self._nd_native = False
+                return None
+            self._nd_login = {"username": str(username), "password": str(password)}
+        if self._nd_base_url is None:
+            base_url = str(self.get_setup_value(CONF_BASE_URL)).rstrip("/")
+            port = self.get_setup_value(CONF_PORT)
+            path = str(self.get_setup_value(CONF_PATH) or "").strip("/")
+            self._nd_base_url = f"{base_url}:{port or 443}" + (f"/{path}" if path else "")
+        session = self.mass.http_session
+        for _attempt in range(2):
+            if self._nd_token is None:
+                async with session.post(
+                    f"{self._nd_base_url}/auth/login", json=self._nd_login
+                ) as resp:
+                    if resp.status >= 500:
+                        resp.raise_for_status()
+                    data = None
+                    if resp.status == 200:
+                        with suppress(ValueError):
+                            data = await resp.json(content_type=None)
+                if not isinstance(data, dict) or not data.get("token"):
+                    self.logger.info(
+                        "%s has no Navidrome native API, so changed review tags only reach "
+                        "Music Assistant once their %s-day cache expires",
+                        self._nd_base_url,
+                        CRITICAL_RECEPTION_CACHE_TTL // 86400,
+                    )
+                    self._nd_native = False
+                    return None
+                self._nd_token = str(data["token"])
+            async with session.get(
+                f"{self._nd_base_url}/api/song",
+                params={
+                    "_sort": "updated_at",
+                    "_order": "DESC",
+                    "_start": str(start),
+                    "_end": str(end),
+                },
+                headers={"x-nd-authorization": f"Bearer {self._nd_token}"},
+            ) as resp:
+                if resp.status == 401:
+                    # expired session: log in again once
+                    self._nd_token = None
+                    continue
+                resp.raise_for_status()
+                return list(await resp.json())
+        return None
 
     async def _extract_critical_reception_from_song(
         self, song_id: str
