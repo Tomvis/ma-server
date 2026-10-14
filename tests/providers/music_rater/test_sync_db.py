@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 from music_assistant_models.enums import ProviderType
-from music_assistant_models.media_items import Album, Artist, ProviderMapping
+from music_assistant_models.media_items import Album, Artist, ProviderMapping, UniqueList
 from music_assistant_models.media_items.metadata import (
     CriticalReception,
     MediaItemMetadata,
@@ -38,7 +38,7 @@ async def test_refresh_lands_in_the_library_row(
             provider="tidal",
             name="Pharos",
             year=2020,
-            artists=[artist],
+            artists=UniqueList([artist]),
             metadata=MediaItemMetadata(description="bio", critical_reception=stored),
             provider_mappings={mapping},
         )
