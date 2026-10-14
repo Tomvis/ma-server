@@ -10,6 +10,7 @@ CONF_RESET_DB = "reset_db"
 DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
+CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 
 # 60, not 59: upstream took 59 for the playlist `access` column (owner + sharing),
 # and this branch had already spent 59 on listen_later. A fork database is therefore

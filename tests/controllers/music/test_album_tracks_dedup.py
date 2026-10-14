@@ -155,6 +155,29 @@ async def test_genuine_extra_track_is_still_listed(mass: MusicAssistant) -> None
     assert "An Entirely Different Song" in {track.name for track in tracks}
 
 
+async def test_a_numbered_sibling_title_is_still_listed(mass: MusicAssistant) -> None:
+    """A title that differs from a held one only by its number is another track."""
+    db_album = await _seed_album(mass)
+    listing = [
+        _provider_track("Blood Red Sunset 2", 11),
+        _provider_track("Demiurg II", 12),
+    ]
+    with _patch_provider_tracks(listing):
+        tracks = await mass.music.albums.tracks(db_album.item_id, "library")
+    assert [track.name for track in tracks] == [*LIBRARY_TITLES, "Blood Red Sunset 2", "Demiurg II"]
+
+
+async def test_a_respelled_entry_lists_under_the_library_row(mass: MusicAssistant) -> None:
+    """The provider entry dropped as a respelling counts as that library row's copy."""
+    db_album = await _seed_album(mass)
+    listing = [_provider_track("01-Test Artist-Demiurg", 15)]
+    with _patch_provider_tracks(listing):
+        played = await mass.music.albums.playback_listing(db_album.item_id, "library")
+    assert [track.name for track in played.tracks] == LIBRARY_TITLES
+    demiurg = next(track for track in played.tracks if track.name == "Demiurg")
+    assert played.listed_ids["prov_b_inst"] == {demiurg.uri: "prov_b_15"}
+
+
 async def test_dead_mapping_does_not_fail_the_whole_listing(mass: MusicAssistant) -> None:
     """A mapping pointing at a gone album costs its own listing, not the album."""
     db_album = await _seed_album(mass)
