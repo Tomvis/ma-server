@@ -1,0 +1,11 @@
+{
+  "type": "plugin",
+  "domain": "music_rater",
+  "stage": "experimental",
+  "name": "music-rater",
+  "description": "Keeps AMG/TPS review data current on streaming-only library albums, which have no files for music-rater to tag.",
+  "codeowners": ["@Tomvis"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false
+}

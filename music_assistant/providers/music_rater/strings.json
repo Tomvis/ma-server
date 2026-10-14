@@ -1,0 +1,15 @@
+{
+  "manifest": {
+    "description": "Keeps AMG/TPS review data current on streaming-only library albums, which have no files for music-rater to tag."
+  },
+  "config_entries": {
+    "url": {
+      "label": "music-rater API URL",
+      "description": "Base URL of the music-rater API, including /api/v1."
+    },
+    "api_key": {
+      "label": "API key",
+      "description": "A music-rater mr_ key. Review data is limited to the sites its user follows."
+    }
+  }
+}

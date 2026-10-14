@@ -377,6 +377,33 @@ def _build_review_source_entry(
     )
 
 
+def critical_reception_from_tags(tags: dict[str, Any]) -> CriticalReception | None:
+    """
+    Build CriticalReception from AMG/TPS review tags, if any are present.
+
+    Accepts raw tag names (``AMG_RATING``) or the normalized keys AudioTags stores
+    (``amgrating``), so music-rater's ``/tags/for-album`` payload parses exactly like
+    the tags it stamps into files. See ``AudioTags.critical_reception`` for the schema.
+
+    :param tags: Tag name -> value (a string or a list of strings).
+    """
+    normalized = {_normalize_tag_key(key): value for key, value in tags.items()}
+    amg_dr = next(
+        (
+            val
+            for key in ("amgalbumdynamicrange", "amgdr")
+            if (val := _parse_float_tag(normalized.get(key))) is not None
+        ),
+        None,
+    )
+    amg = _build_review_source_entry(normalized, "AMG", "amg")
+    tps = _build_review_source_entry(normalized, "TPS", "tps")
+    sources: list[ReviewSourceEntry] = [s for s in (amg, tps) if s is not None]
+    if amg_dr is None and not sources:
+        return None
+    return CriticalReception(amg_dr=amg_dr, sources=sources or None)
+
+
 def split_items(
     org_str: str | list[str] | tuple[str, ...] | None, allow_unsafe_splitters: bool = False
 ) -> tuple[str, ...]:
@@ -980,13 +1007,7 @@ class AudioTags:
 
         The canonical (measured) DR lives on AudioTags.dynamic_range, not here.
         """
-        amg_dr = self.amg_dr
-        amg = _build_review_source_entry(self.tags, "AMG", "amg")
-        tps = _build_review_source_entry(self.tags, "TPS", "tps")
-        sources: list[ReviewSourceEntry] = [s for s in (amg, tps) if s is not None]
-        if amg_dr is None and not sources:
-            return None
-        return CriticalReception(amg_dr=amg_dr, sources=sources or None)
+        return critical_reception_from_tags(self.tags)
 
     @property
     def chapters(self) -> list[AudioTagsChapter]:
