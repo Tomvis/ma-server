@@ -11,7 +11,7 @@ known only through a streaming catalog (MUSIC-79).
 from __future__ import annotations
 
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from music_assistant_models.background_task import TaskSchedule
@@ -19,6 +19,7 @@ from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, ExternalID, SortDirection, SortField
 
 from music_assistant.helpers.critical_reception import critical_reception_for_update
+from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.tags import critical_reception_from_tags
 from music_assistant.models.plugin import PluginProvider
 
@@ -113,7 +114,7 @@ class MusicRaterProvider(PluginProvider):
         if not (self._url and self._api_key):
             return
         stats: Counter[str] = Counter()
-        cutoff = datetime.now(UTC) - RECENT_WINDOW
+        cutoff = utc() - RECENT_WINDOW
         async for album in self.mass.music.albums.iter_library_items(
             sort_field=SortField.TIMESTAMP_ADDED,
             sort_direction=SortDirection.DESC,
