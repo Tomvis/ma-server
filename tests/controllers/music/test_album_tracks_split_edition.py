@@ -122,6 +122,17 @@ async def test_a_bonus_track_past_the_held_audio_is_still_listed(mass: MusicAssi
     assert [track.name for track in tracks] == ["One", "Two", "Three", "Four (Bonus Track)"]
 
 
+async def test_a_short_bonus_track_is_still_listed(mass: MusicAssistant) -> None:
+    """A bonus track short enough to hide in the album's running time is still offered."""
+    held = [(f"Song {idx}", 360) for idx in range(1, 11)]
+    db_album = await _seed_album(mass, held)
+    listing = [_provider_track(name, idx, seconds) for idx, (name, seconds) in enumerate(held, 1)]
+    listing.append(_provider_track("Hidden Outro", 11, 120))
+    with _patch_provider_tracks(listing):
+        tracks = await mass.music.albums.tracks(db_album.item_id, "library")
+    assert [track.name for track in tracks] == [name for name, _ in held] + ["Hidden Outro"]
+
+
 async def test_unknown_durations_change_nothing(mass: MusicAssistant) -> None:
     """Without durations to compare the listing is merged as before."""
     db_album = await _seed_album(mass, [("Winter’s Gate", 0)])  # noqa: RUF001

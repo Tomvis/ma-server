@@ -417,12 +417,14 @@ def _drop_finer_splits(
         return assembled
     split_uris: set[str] = set()
     for _, tracks in listings:
-        durations = [track.duration for track in tracks]
-        if (
-            len(tracks) > len(library)
-            and all(durations)
-            and sum(held) >= _SPLIT_COVERAGE * sum(durations)
-        ):
+        if len(tracks) <= len(library) or not all(track.duration for track in tracks):
+            continue
+        ordered = sorted(tracks, key=lambda track: (track.disc_number or 1, track.track_number))
+        paired = sum(track.duration for track in ordered[: len(library)])
+        extra = sum(track.duration for track in ordered[len(library) :])
+        # the held audio left over once the listing's first tracks are paired off must
+        # account for the rest, or the rest is content (a bonus track) the library lacks
+        if sum(held) - paired >= _SPLIT_COVERAGE * extra:
             split_uris.update(str(track.uri) for track in tracks if track.provider != "library")
     if not split_uris:
         return assembled
