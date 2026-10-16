@@ -1680,4 +1680,5 @@ async def test_migration_drops_audiobookshelf_image_tokens_on_a_fork_database_st
     await migrate_database(mass, database, MagicMock(), prev_version=68, create_tables=AsyncMock())
 
     row = await database.get_row("audiobooks", {"item_id": 1})
+    assert row is not None
     assert "token=" not in str(row["metadata"])
