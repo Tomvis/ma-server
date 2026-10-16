@@ -393,6 +393,50 @@ def _drop_renamed_copies(assembled: AlbumListing, library: list[Track]) -> Album
     return replace(assembled, tracks=tracks)
 
 
+# share of a listing's running time the library must hold for the listing to add nothing
+_SPLIT_COVERAGE = 0.95
+
+
+def _drop_finer_splits(
+    assembled: AlbumListing,
+    library: list[Track],
+    listings: Sequence[tuple[str, Sequence[Track]]],
+) -> AlbumListing:
+    """
+    Drop the provider entries of a listing that only splits the library's audio finer.
+
+    A one-track CD edition and its seven-part digital release are the same 40 minutes;
+    merged by position, the parts past the first read as tracks the library lacks.
+
+    :param assembled: The album as the listing assembles it.
+    :param library: The album's library rows.
+    :param listings: The album's tracklists, each with the provider instance that served it.
+    """
+    held = [row.duration for row in library]
+    if not held or not all(held):
+        return assembled
+    split_uris: set[str] = set()
+    for _, tracks in listings:
+        durations = [track.duration for track in tracks]
+        if (
+            len(tracks) > len(library)
+            and all(durations)
+            and sum(held) >= _SPLIT_COVERAGE * sum(durations)
+        ):
+            split_uris.update(str(track.uri) for track in tracks if track.provider != "library")
+    if not split_uris:
+        return assembled
+    kept = [
+        track
+        for track in assembled.tracks
+        if track.provider == "library" or str(track.uri) not in split_uris
+    ]
+    for listed in assembled.listed_ids.values():
+        for uri in split_uris:
+            listed.pop(uri, None)
+    return replace(assembled, tracks=kept)
+
+
 def _rating_bucket_clause(
     source: str, values: Iterable[float], param_prefix: str
 ) -> tuple[str, dict[str, Any]]:
@@ -1925,6 +1969,7 @@ class AlbumsController(MediaControllerBase[Album]):
             db_track.disc_number = source.disc_number
             db_track.track_number = source.track_number
         assembled = _drop_renamed_copies(album_listing(db_items, listings), db_items)
+        assembled = _drop_finer_splits(assembled, db_items, listings)
         # a reference to the album, which carries no user's favorite state
         album_mapping = ItemMapping.from_item(library_album)
         for track in assembled.tracks:
