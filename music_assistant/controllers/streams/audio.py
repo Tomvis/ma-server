@@ -118,10 +118,12 @@ from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.fades import SmartFade, StandardCrossFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.stream_sources import (
-    DEFAULT_POLICY,
     SourceCandidate,
+    StreamSourceMode,
+    StreamSourcePolicy,
     rank_provider_mappings,
     rank_stream_sources,
+    read_stream_source_policy,
 )
 from music_assistant.helpers import ssl as ssl_util
 from music_assistant.helpers.aiohttp_client import encoded_request_url
@@ -1131,7 +1133,9 @@ class StreamsAudio:
         temp_file = f"/tmp/{shortuuid.random(20)}.txt"  # noqa: S108
         try:
             async with aiofiles.open(temp_file, "w") as f:
-                await f.write(build_concat_filelist(files_list))
+                await f.write(
+                    build_concat_filelist(files_list, verify_ssl=streamdetails.verify_ssl)
+                )
             async for chunk in get_ffmpeg_stream(
                 audio_input=temp_file,
                 input_format=streamdetails.audio_format,
@@ -2805,7 +2809,10 @@ class StreamsAudio:
                     overlay_enabled=overlay_active(queue),
                 )
                 # append to play log so the queue controller can work out which track is playing
-                play_log_entry = PlayLogEntry(queue_track.queue_item_id)
+                play_log_entry = PlayLogEntry(
+                    queue_track.queue_item_id,
+                    seek_position=queue_track.streamdetails.seek_position,
+                )
                 flow_log.append(play_log_entry)
 
                 bytes_written = 0
@@ -2984,6 +2991,7 @@ class StreamsAudio:
                                 remaining_bytes = b""
                                 # mix failed — undo the eager seek_position
                                 queue_track.streamdetails.seek_position = raw_seek_position
+                                play_log_entry.seek_position = raw_seek_position
                                 # The mixer teardown cancels its feeder, which was
                                 # likely parked reading item_stream - that ends the
                                 # stream itself. Play the track from a fresh stream
@@ -3029,11 +3037,13 @@ class StreamsAudio:
                             blended = max(
                                 0, mix_start_collected + overlap_pulled - len(overlap_overshoot)
                             )
+                            assert play_log_entry.seek_position is not None
                             queue_track.streamdetails.seek_position = min(
-                                queue_track.streamdetails.seek_position,
+                                play_log_entry.seek_position,
                                 raw_seek_position
                                 + blended / pcm_sample_size * track_playback_speed,
                             )
+                            play_log_entry.seek_position = queue_track.streamdetails.seek_position
                             last_fadeout_part = b""
                             last_streamdetails = None
                             last_queue_track = None
@@ -3069,6 +3079,7 @@ class StreamsAudio:
                     if last_fadeout_part:
                         # crossfade into this item never happened — undo the eager seek_position
                         queue_track.streamdetails.seek_position = raw_seek_position
+                        play_log_entry.seek_position = raw_seek_position
                     continue
 
                 #### HANDLE END OF TRACK
@@ -3083,6 +3094,7 @@ class StreamsAudio:
                     play_log_entry.seconds_streamed = 0
                     if last_fadeout_part:
                         queue_track.streamdetails.seek_position = raw_seek_position
+                        play_log_entry.seek_position = raw_seek_position
                     continue
                 if last_fadeout_part:
                     # edge case: we did not get enough data to make the crossfade
@@ -3092,6 +3104,7 @@ class StreamsAudio:
                         await asyncio.sleep(0)
                     # no crossfade happened — undo the eager seek_position
                     queue_track.streamdetails.seek_position = raw_seek_position
+                    play_log_entry.seek_position = raw_seek_position
                     # full tail was pre-counted and is now yielded as-is
                     last_fadeout_part = b""
                 # a fade needs enough of the outgoing track to overlap with; a holdback that
@@ -3142,8 +3155,9 @@ class StreamsAudio:
                     tail_seconds = len(last_fadeout_part) / pcm_sample_size
                     # streamdetails.duration is in media-time; seconds_streamed is stream-time
                     # (post-atempo), so we scale by the track's playback_speed to recover media-time.
+                    assert play_log_entry.seek_position is not None
                     queue_track.streamdetails.duration = int(
-                        queue_track.streamdetails.seek_position
+                        play_log_entry.seek_position
                         + (seconds_streamed + tail_seconds) * track_playback_speed
                     )
                     # propagate accurate duration to queue_item so UI displays it
@@ -3224,7 +3238,7 @@ class StreamsAudio:
             async for chunk in audio_input:
                 yield chunk
             return
-        overlay_input, pass_fds = overlay
+        overlay_input, pass_fds, verify_ssl = overlay
         try:
             async for chunk in get_ffmpeg_overlay_stream(
                 audio_input=audio_input,
@@ -3233,6 +3247,7 @@ class StreamsAudio:
                 overlay_volume=queue.overlay_volume,
                 chunk_size=pcm_format.pcm_sample_size,
                 pass_fds=pass_fds,
+                verify_ssl=verify_ssl,
             ):
                 yield chunk
         finally:
@@ -3689,11 +3704,20 @@ class StreamsAudio:
                 if origin and origin.provider_instance and origin.item_id
                 else None
             )
+            policy = read_stream_source_policy(mass, queue_item.queue_id)
+            if policy.mode == StreamSourceMode.BEST_QUALITY_PER_TRACK and media_item.media_type in (
+                MediaType.AUDIOBOOK,
+                MediaType.PODCAST_EPISODE,
+            ):
+                # ranking every track on its own is about music: the pin keeps an audiobook or
+                # episode, and its progress, on the account it was started from
+                policy = replace(policy, mode=StreamSourceMode.BEST_QUALITY)
             candidates = self._get_streamdetail_candidates(
                 media_item.provider_mappings,
                 preferred_providers,
                 excluded_provider_instances,
                 allowed,
+                policy,
                 pinned=pinned,
             )
             if not candidates and allowed is not None:
@@ -3704,6 +3728,7 @@ class StreamsAudio:
                     preferred_providers,
                     excluded_provider_instances,
                     None,
+                    policy,
                     pinned=pinned,
                 )
                 if blocked:
@@ -4027,6 +4052,7 @@ class StreamsAudio:
         preferred_providers: list[str],
         excluded_provider_instances: set[str],
         allowed: list[str] | None,
+        policy: StreamSourcePolicy,
         pinned: tuple[str, str] | None = None,
     ) -> list[tuple[ProviderMapping, Provider]]:
         """
@@ -4039,6 +4065,7 @@ class StreamsAudio:
         :param preferred_providers: Provider instances the playback user owns, tried first.
         :param excluded_provider_instances: Provider instances unavailable to this attempt.
         :param allowed: Music sources the playback user may use, or None for all of them.
+        :param policy: The source selection settings to rank under.
         :param pinned: The (provider instance, item id) the item is to be played from, if any.
         :return: Ordered provider mapping candidates.
         """
@@ -4073,7 +4100,7 @@ class StreamsAudio:
                     and provider.is_streaming_provider,
                 )
         ranked = rank_stream_sources(
-            candidates.values(), pinned=pinned, preferred=preferred_providers, policy=DEFAULT_POLICY
+            candidates.values(), pinned=pinned, preferred=preferred_providers, policy=policy
         )
         if ranked and self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
@@ -4434,6 +4461,7 @@ class StreamsAudio:
             collect_log_history=True,
             loglevel=ffmpeg_loglevel,
             pass_fds=pass_fds,
+            verify_ssl=streamdetails.verify_ssl,
         )
 
         try:
@@ -5555,9 +5583,11 @@ class StreamsAudio:
 
     async def _resolve_overlay_input(
         self, queue: PlayerQueue
-    ) -> tuple[str, tuple[int, ...]] | None:
+    ) -> tuple[str, tuple[int, ...], bool] | None:
         """
-        Resolve the queue's overlay source to the input for ffmpeg, with the descriptors it needs.
+        Resolve the queue's overlay source to the input for ffmpeg.
+
+        Returns the input, the descriptors it needs and whether its certificate must be verified.
 
         Returns None (with a warning logged) when the source can not be resolved,
         so the caller can degrade to music-only playback. The caller closes the descriptors.
@@ -5609,7 +5639,7 @@ class StreamsAudio:
                 err,
             )
             return None
-        return inputs[0], pass_fds
+        return inputs[0], pass_fds, streamdetails.verify_ssl
 
     async def _add_remote_mp3_input_args(
         self,

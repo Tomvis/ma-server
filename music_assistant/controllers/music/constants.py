@@ -60,7 +60,11 @@ CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 # 68: upstream took 66 (playlog split into media_progress + play_history) and 67
 # (radios.is_endless), gated at "prev_version <= 65" and "<= 66". This branch was
 # already stamped 67, so both are widened to "<= 67" and the version moved to 68.
-DB_SCHEMA_VERSION: Final[int] = 68
+#
+# 69: upstream took 68 (audiobookshelf image urls lose their api token), gated at
+# "prev_version <= 67". This branch was already stamped 68, so it is widened to "<= 68"
+# and the version moved to 69.
+DB_SCHEMA_VERSION: Final[int] = 69
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
@@ -72,6 +76,11 @@ CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 CACHE_CATEGORY_LISTINGS: Final[int] = 11
 # how long an assembled listing is served without asking the providers again
 LISTING_CACHE_EXPIRATION: Final[int] = 15 * 60
+# a browse folder can show what is live right now, so it is kept just long enough to page
+# through it
+BROWSE_CACHE_EXPIRATION: Final[int] = 2 * 60
+# how many similar artists or tracks the providers are asked for, the size of such a listing
+SIMILAR_ITEMS_LIMIT: Final[int] = 25
 
 # max time to wait for a single provider's search results before
 # contributing empty results for it, so one slow provider can never block
@@ -146,7 +155,8 @@ RANDOM_SORT_FIELDS: Final[frozenset[SortField]] = frozenset(
     {SortField.RANDOM, SortField.RANDOM_PLAY_COUNT}
 )
 
-# the deprecated order_by keys of library listings and the typed sort each one stands for
+# the deprecated sort keys (order_by of the listings, sort_by of play requests) and the typed
+# sort each one stands for
 LEGACY_SORT_KEYS: Final[dict[str, tuple[SortField, SortDirection | None]]] = {
     "name": (SortField.NAME, SortDirection.ASC),
     "name_desc": (SortField.NAME, SortDirection.DESC),
@@ -172,6 +182,10 @@ LEGACY_SORT_KEYS: Final[dict[str, tuple[SortField, SortDirection | None]]] = {
     "album_artist_name_desc": (SortField.ARTIST_NAME, SortDirection.DESC),
     "track_artist_name": (SortField.ARTIST_NAME, SortDirection.ASC),
     "track_artist_name_desc": (SortField.ARTIST_NAME, SortDirection.DESC),
+    # the album and playlist pages of the web frontend send these with a play request
+    "artist": (SortField.ARTIST_NAME, SortDirection.ASC),
+    "album": (SortField.ALBUM_NAME, SortDirection.ASC),
+    "track_number": (SortField.TRACK_NUMBER, SortDirection.ASC),
     "favorite_timestamp": (SortField.FAVORITE_TIMESTAMP, SortDirection.ASC),
     "favorite_timestamp_desc": (SortField.FAVORITE_TIMESTAMP, SortDirection.DESC),
     # fork: the album-only sorts

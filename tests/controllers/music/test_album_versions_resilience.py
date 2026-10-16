@@ -115,7 +115,8 @@ async def test_versions_survives_a_provider_that_raises() -> None:
 
     controller.search = AsyncMock(side_effect=_search)  # type: ignore[method-assign]
 
-    result = await controller.versions("lib1", "library")
+    # the isolation lives in the assembly step that versions() caches and pages
+    result = await controller._assemble_versions("lib1", "library")
 
     # the healthy provider's version is still returned; only bandcamp drops out
     assert [a.item_id for a in result] == ["t1"]
@@ -142,6 +143,7 @@ async def test_versions_survives_a_failing_get_album_versions() -> None:
 
     controller.search = AsyncMock(side_effect=_search)  # type: ignore[method-assign]
 
-    result = await controller.versions("lib1", "library")
+    # the isolation lives in the assembly step that versions() caches and pages
+    result = await controller._assemble_versions("lib1", "library")
 
     assert [a.item_id for a in result] == ["t1"]

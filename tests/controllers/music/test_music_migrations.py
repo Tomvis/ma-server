@@ -1599,3 +1599,85 @@ async def test_migration_splits_playlog_and_adds_is_endless_on_a_fork_database_s
     assert DB_TABLE_LEGACY_PLAYLOG not in tables
     assert DB_TABLE_PLAY_HISTORY in tables
     assert "is_endless" in await _table_columns(database, "radios")
+
+
+async def test_migration_drops_the_token_from_audiobookshelf_image_urls(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A pre-68 database loses the audiobookshelf api token from its stored image urls.
+
+    The cover version stays, images of other providers and unparsable rows are left alone,
+    and running the migration twice is harmless.
+    """
+    base = "http://abs.local"
+    cover = _image("thumb", f"{base}/api/items/li_1/cover?token=secret&ts=5", "audiobookshelf--a")
+    author = _image("thumb", f"{base}/api/authors/au_1/image?token=secret", "audiobookshelf--a")
+    other = _image("thumb", "https://example.com/cover?token=keep", "other--b")
+    for table in ("artists", "audiobooks"):
+        await database.execute(f"ALTER TABLE {table} ADD COLUMN metadata json")
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        await database.execute(f"CREATE TABLE {table}([id] INTEGER PRIMARY KEY, [image] json)")
+    stored = {
+        ("artists", 1): serialize_to_json({"images": [author, other]}),
+        ("artists", 2): 'not json "token="',
+        ("audiobooks", 1): serialize_to_json({"images": [cover]}),
+    }
+    for (table, item_id), metadata in stored.items():
+        await database.execute(
+            f"INSERT INTO {table} (item_id, metadata) VALUES (:item_id, :metadata)",
+            {"item_id": item_id, "metadata": metadata},
+        )
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        await database.execute(
+            f"INSERT INTO {table} (id, image) VALUES (1, :image)",
+            {"image": serialize_to_json(cover)},
+        )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    for _ in range(2):
+        await migrate_database(
+            mass, database, MagicMock(), prev_version=67, create_tables=AsyncMock()
+        )
+
+    clean_cover = {**cover, "path": f"{base}/api/items/li_1/cover?ts=5"}
+    clean_author = {**author, "path": f"{base}/api/authors/au_1/image"}
+    artists = {
+        row["item_id"]: row["metadata"]
+        for row in await database.get_rows_from_query("SELECT item_id, metadata FROM artists")
+    }
+    assert json.loads(artists[1]) == {"images": [clean_author, other]}
+    assert artists[2] == stored[("artists", 2)]
+    audiobook = await database.get_rows_from_query("SELECT metadata FROM audiobooks")
+    assert json.loads(audiobook[0]["metadata"]) == {"images": [clean_cover]}
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        played = await database.get_rows_from_query(f"SELECT image FROM {table}")
+        assert json.loads(played[0]["image"]) == clean_cover
+
+
+async def test_migration_drops_audiobookshelf_image_tokens_on_a_fork_database_stamped_68(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 68 by this branch still gets upstream's 68 step.
+
+    Upstream gates the token drop at "prev_version <= 67", but this branch was already
+    stamped 68, so it is widened to "<= 68" (and DB_SCHEMA_VERSION moved to 69). Revert the
+    gate and this test fails.
+    """
+    path = "http://abs.local/api/items/li_1/cover?token=secret"
+    await database.execute("ALTER TABLE audiobooks ADD COLUMN metadata json")
+    await database.execute(
+        "INSERT INTO audiobooks (item_id, metadata) VALUES (1, :metadata)",
+        {"metadata": serialize_to_json({"images": [_image("thumb", path, "audiobookshelf--a")]})},
+    )
+    await database.commit()
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=68, create_tables=AsyncMock())
+
+    row = await database.get_row("audiobooks", {"item_id": 1})
+    assert "token=" not in str(row["metadata"])
