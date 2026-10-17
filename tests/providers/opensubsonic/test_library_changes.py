@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -63,6 +64,12 @@ def _serve(provider: OpenSonicProvider, library: _Library) -> None:
 
 def _cursor(**newest: str) -> str:
     return json_dumps(newest)
+
+
+@pytest.fixture(autouse=True)
+def _no_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read changes from the cursor exactly; test_recent_changes_are_read_again covers it."""
+    monkeypatch.setattr(sonic_provider, "_ND_CHANGES_OVERLAP", timedelta(0))
 
 
 def test_nd_time_keeps_nanoseconds() -> None:
@@ -136,6 +143,31 @@ async def test_pre_imported_at_cursor_asks_for_a_full_sync(provider: OpenSonicPr
     assert changes is not None
     assert not changes.complete
     assert json_loads(changes.cursor) == {"artist": T0, "album_imported": T1, "song": T1}
+
+
+@pytest.mark.asyncio
+async def test_recent_changes_are_read_again(
+    provider: OpenSonicProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A change scanned after a newer mtime was already seen still shows up."""
+    monkeypatch.setattr(sonic_provider, "_ND_CHANGES_OVERLAP", timedelta(minutes=10))
+    library = _Library(
+        song=[
+            _item("seen", "2026-10-17T11:00:00Z"),
+            _item("late", "2026-10-17T10:55:00Z", missing=True),
+            _item("old", "2026-10-17T10:49:59Z"),
+        ]
+    )
+    _serve(provider, library)
+
+    changes = await provider.get_library_changes(
+        _cursor(artist=T0, album_imported=T0, song="2026-10-17T11:00:00Z")
+    )
+
+    assert changes is not None
+    assert changes.changed == {MediaType.TRACK: {"seen"}}
+    assert changes.removed == {MediaType.TRACK: {"late"}}
+    assert json_loads(changes.cursor)["song"] == "2026-10-17T11:00:00Z"
 
 
 @pytest.mark.asyncio

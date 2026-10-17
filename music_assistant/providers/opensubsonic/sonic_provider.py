@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from aiohttp import ClientResponseError
@@ -112,6 +112,9 @@ _ND_ALBUM_PAGE_SIZE = 500
 _ND_CHANGES_PAGE_SIZE = 500
 # More changed items than this since the last sync are taken in by a full sync instead.
 _ND_MAX_CHANGES = 2000
+# Changes this close before the cursor are read again: a song is dated by its file mtime, which
+# can be older than a change Navidrome scanned before it (and stored under a newer time).
+_ND_CHANGES_OVERLAP = timedelta(minutes=10)
 # The native API resources library changes are read from, in the order they are synced: the
 # field that dates a change and the cursor key it is tracked under. A song's updatedAt is its
 # file's mtime, so a file that comes back (moved, re-imported) keeps an old one, while an
@@ -1321,7 +1324,10 @@ class OpenSonicProvider(MusicProvider):
         :param since: The change time of the newest item seen before.
         :param limit: The most changed items to return.
         """
-        since_time = _nd_time(since) if since else None
+        since_time = None
+        if since:
+            since_seconds, since_nanoseconds = _nd_time(since)
+            since_time = (since_seconds - _ND_CHANGES_OVERLAP, since_nanoseconds)
         newest: str | None = None
         items: list[dict[str, Any]] = []
         start = 0
