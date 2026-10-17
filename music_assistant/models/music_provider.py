@@ -7,9 +7,9 @@ import logging
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import aiohttp
 from music_assistant_models.background_task import TaskSchedule
@@ -32,6 +32,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
     MediaItemImage,
+    MediaItemMetadata,
     MediaItemTranscriptCue,
     MediaItemType,
     Playlist,
@@ -60,7 +61,7 @@ from .media_capabilities import AudioStreamMixin, MediaCatalogMixin, Recommendat
 from .provider import Provider
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
@@ -76,6 +77,9 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
 
 CACHE_CATEGORY_PREV_LIBRARY_IDS: Final[int] = 1
+# the cursor of the last library changes applied, see get_library_changes
+CACHE_CATEGORY_LIBRARY_CHANGES: Final[int] = 2
+LIBRARY_CHANGES_CURSOR_KEY: Final[str] = "library_changes_cursor"
 DEFAULT_MAX_CONCURRENT_STREAMS: Final[int] = 5
 # a provider-wide payload change fails every single item, so only the first failures
 # of a sync run are logged in full to keep the (rotating) log file usable
@@ -138,11 +142,70 @@ class SyncRunState:
     listed_item_ids: dict[MediaType, set[str]] = field(default_factory=dict)
 
 
+@dataclass
+class LibraryChanges:
+    """
+    Library items that changed on a provider since an earlier point in time.
+
+    :param cursor: Provider-defined marker of the point the changes were read up to.
+    :param complete: False when the provider can not tell what changed since the given
+        cursor (none given, or too much changed), so only a full library sync is safe.
+    :param changed: Provider item id's added or changed, per media type.
+    :param removed: Provider item id's removed from the provider's library, per media type.
+    """
+
+    cursor: str
+    complete: bool = True
+    changed: dict[MediaType, set[str]] = field(default_factory=dict)
+    removed: dict[MediaType, set[str]] = field(default_factory=dict)
+
+
+# the media types a changes sync covers, in the order an item's dependencies are added
+LIBRARY_CHANGES_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
+    MediaType.ARTIST,
+    MediaType.ALBUM,
+    MediaType.TRACK,
+)
+
+
 # scoped per run rather than per provider: a standalone import_album_tracks() is
 # launched as its own task, so it must not consume or inflate a running sync's state
 SYNC_RUN_STATE: Final[ContextVar[SyncRunState | None]] = ContextVar(
     "music_provider_sync_run", default=None
 )
+
+
+def _authoritative_metadata(
+    stored: MediaItemMetadata, update: MediaItemMetadata, sources: set[str]
+) -> MediaItemMetadata:
+    """
+    Return stored metadata with what the given provider delivers now in place of its own.
+
+    Fields the provider sets replace the stored ones and its images replace the images it
+    delivered before. What other sources added (their images, fields this provider leaves
+    empty) is kept.
+
+    :param stored: Metadata stored for the library item.
+    :param update: Metadata of the item as the provider delivers it now.
+    :param sources: Instance id and domain of the provider.
+    """
+    merged = MediaItemMetadata.from_dict(stored.to_dict())
+    for fld in fields(update):
+        if fld.name in ("images", "description", "description_language"):
+            continue
+        if (value := getattr(update, fld.name)) is not None:
+            setattr(merged, fld.name, value)
+    if merged.description is None and update.description is not None:
+        # a biography another source added in the user's language takes precedence
+        merged.description = update.description
+        merged.description_language = update.description_language
+    own_images = list(update.images or [])
+    other_images = [x for x in stored.images or [] if x.provider not in sources]
+    if own_images or other_images:
+        merged.images = UniqueList([*own_images, *other_images])
+    else:
+        merged.images = None
+    return merged
 
 
 def sync_run_state() -> SyncRunState:
@@ -1010,6 +1073,37 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         finally:
             SYNC_RUN_STATE.reset(token)
 
+    async def get_library_changes(self, cursor: str | None) -> LibraryChanges | None:
+        """
+        Return the library items that changed on the provider since the given cursor.
+
+        Returns None when the provider can not report its changes, so only full library
+        syncs keep its library up to date.
+
+        :param cursor: The cursor of the previously applied changes, None if there are none.
+        """
+        return None
+
+    async def sync_library_changes(
+        self, changes: LibraryChanges, media_types: Sequence[MediaType]
+    ) -> None:
+        """
+        Apply library changes reported by get_library_changes to the library.
+
+        Unlike a full sync, a changed item replaces what this provider stored for it before,
+        so edits that keep the item's id (retags, re-encodes, new artwork) reach the library.
+
+        :param changes: The changes to apply.
+        :param media_types: The media types to apply the changes of.
+        """
+        token = SYNC_RUN_STATE.set(SyncRunState())
+        try:
+            # changed items must be fetched fresh, not from the provider's item cache
+            async with self.mass.cache.handle_refresh(True):
+                await self._run_library_changes_sync(changes, media_types)
+        finally:
+            SYNC_RUN_STATE.reset(token)
+
     def report_skipped_sync_item(
         self, media_type: MediaType, item_id: str | None, err: Exception
     ) -> None:
@@ -1143,7 +1237,9 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 yield track
             page += 1
 
-    async def _run_library_sync(self, media_type: MediaType) -> None:  # noqa: PLR0915  # reference implementation kept in one readable piece
+    async def _run_library_sync(
+        self, media_type: MediaType
+    ) -> None:  # reference implementation kept in one readable piece
         """Sync the given media type into the library and process its deletions."""
         # this reference implementation may be overridden
         # with a provider specific approach if needed
@@ -1172,7 +1268,6 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
 
         # process deletions (= no longer in library)
         update_current_task_progress_text("Checking library deletions")
-        controller = self.mass.music.get_controller(media_type)
         await self._keep_skipped_items(media_type, cur_db_ids)
         prev_library_items: list[int] | None
         if media_type in sync_state.incomplete_media_types:
@@ -1199,61 +1294,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             ):
                 for db_id in prev_library_items:
                     if db_id not in cur_db_ids:
-                        try:
-                            library_item = await controller.get_library_item(db_id)
-                        except MediaNotFoundError:
-                            # edge case: the item is (already) removed from MA library as well
-                            continue
-                        # check if we have other provider-mappings (marked as in-library)
-                        remaining_providers_in_library = {
-                            x.provider_instance
-                            for x in library_item.provider_mappings
-                            if x.provider_instance != self.instance_id and x.in_library
-                        }
-                        # User anchors that should survive a provider-side delete:
-                        # favorite, listen-later, and any play history. Without this
-                        # guard, un-starring an album in subsonic/jellyfin (or
-                        # renaming a local file) would cascade through
-                        # remove_item_from_library and wipe the playlog, killing
-                        # play_count/last_played for that user.
-                        # Evaluated only once the cheap conditions already point at a
-                        # full delete - has_play_history is a DB round-trip per item
-                        # and is irrelevant for streaming providers or when another
-                        # provider still has the item in library.
-                        delete_candidate = (
-                            not remaining_providers_in_library and not self.is_streaming_provider
-                        )
-                        # listen-later is asked of the controller, not of
-                        # library_item.listen_later: the shelf is per-user and this sync
-                        # runs as a background task with no calling user, so the item's
-                        # own flag always reads False here. Consulting it would delete an
-                        # album that another account still has saved.
-                        has_user_anchor = delete_candidate and (
-                            await controller.has_favorite_anchor(db_id)
-                            or await controller.has_listen_later_anchor(db_id)
-                            or await controller.has_play_history(db_id)
-                        )
-                        if delete_candidate and not has_user_anchor:
-                            # for non-streaming providers (local files, library-middlemen
-                            # like subsonic/jellyfin/plex) an item removed from the provider
-                            # is actually gone; fully remove it to avoid dangling records
-                            # that stay visible in artist/album views where in_library is
-                            # not filtered on. Only do this when the user has no stake in
-                            # the row (no favorite, no listen-later, no play history).
-                            await controller.remove_item_from_library(db_id)
-                        else:
-                            if not remaining_providers_in_library:
-                                # the likes came from the sources that no longer hold the
-                                # item; a dislike is the user's own and survives
-                                await self.mass.music.favorites.clear_likes(media_type, db_id)
-                            # unmark this provider mapping as in_library = False
-                            # we keep it in the library database so we can keep the metadata
-                            for prov_map in library_item.provider_mappings:
-                                if prov_map.provider_instance == self.instance_id:
-                                    prov_map.in_library = False
-                            await controller.set_provider_mappings(
-                                db_id, library_item.provider_mappings
-                            )
+                        await self._remove_library_item(media_type, db_id)
                         await asyncio.sleep(0)  # yield to eventloop
             await self._remove_stale_provider_mappings(media_type, cur_db_ids)
         # store current list of id's in cache so we can track changes
@@ -1264,6 +1305,162 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             category=CACHE_CATEGORY_PREV_LIBRARY_IDS,
         )
         update_current_task_progress_text("Finalizing library sync")
+
+    async def _remove_library_item(self, media_type: MediaType, db_id: int) -> None:
+        """
+        Remove a library item that this provider no longer has from the library.
+
+        The item stays, only marked as no longer in this provider's library, while another
+        provider still has it or the user has a stake in it.
+
+        :param media_type: Media type of the library item.
+        :param db_id: Library id of the item.
+        """
+        controller = self.mass.music.get_controller(media_type)
+        try:
+            library_item = await controller.get_library_item(db_id)
+        except MediaNotFoundError:
+            # edge case: the item is (already) removed from MA library as well
+            return
+        # check if we have other provider-mappings (marked as in-library)
+        remaining_providers_in_library = {
+            x.provider_instance
+            for x in library_item.provider_mappings
+            if x.provider_instance != self.instance_id and x.in_library
+        }
+        # User anchors that should survive a provider-side delete:
+        # favorite, listen-later, and any play history. Without this
+        # guard, un-starring an album in subsonic/jellyfin (or
+        # renaming a local file) would cascade through
+        # remove_item_from_library and wipe the playlog, killing
+        # play_count/last_played for that user.
+        # Evaluated only once the cheap conditions already point at a
+        # full delete - has_play_history is a DB round-trip per item
+        # and is irrelevant for streaming providers or when another
+        # provider still has the item in library.
+        delete_candidate = not remaining_providers_in_library and not self.is_streaming_provider
+        # listen-later is asked of the controller, not of
+        # library_item.listen_later: the shelf is per-user and this sync
+        # runs as a background task with no calling user, so the item's
+        # own flag always reads False here. Consulting it would delete an
+        # album that another account still has saved.
+        has_user_anchor = delete_candidate and (
+            await controller.has_favorite_anchor(db_id)
+            or await controller.has_listen_later_anchor(db_id)
+            or await controller.has_play_history(db_id)
+        )
+        if delete_candidate and not has_user_anchor:
+            # for non-streaming providers (local files, library-middlemen
+            # like subsonic/jellyfin/plex) an item removed from the provider
+            # is actually gone; fully remove it to avoid dangling records
+            # that stay visible in artist/album views where in_library is
+            # not filtered on. Only do this when the user has no stake in
+            # the row (no favorite, no listen-later, no play history).
+            await controller.remove_item_from_library(db_id)
+        else:
+            if not remaining_providers_in_library:
+                # the likes came from the sources that no longer hold the
+                # item; a dislike is the user's own and survives
+                await self.mass.music.favorites.clear_likes(media_type, db_id)
+            # unmark this provider mapping as in_library = False
+            # we keep it in the library database so we can keep the metadata
+            for prov_map in library_item.provider_mappings:
+                if prov_map.provider_instance == self.instance_id:
+                    prov_map.in_library = False
+            await controller.set_provider_mappings(db_id, library_item.provider_mappings)
+
+    async def _run_library_changes_sync(
+        self, changes: LibraryChanges, media_types: Sequence[MediaType]
+    ) -> None:
+        """Apply the given library changes of the given media types to the library."""
+        media_types = [
+            media_type
+            for media_type in LIBRARY_CHANGES_MEDIA_TYPES
+            if media_type in media_types and self.mass.music.library_supported(self, media_type)
+        ]
+        sync_changed: dict[MediaType, Callable[[AsyncIterator[Any]], Awaitable[set[int]]]] = {
+            MediaType.ARTIST: self._sync_library_artists,
+            MediaType.ALBUM: self._sync_library_albums,
+            MediaType.TRACK: self._sync_library_tracks,
+        }
+        for media_type in media_types:
+            if item_ids := changes.changed.get(media_type):
+                await sync_changed[media_type](self._iter_changed_items(media_type, item_ids))
+        if not self.library_sync_deletions_enabled():
+            return
+        # tracks go before the albums and artists they belong to
+        for media_type in reversed(media_types):
+            if not (item_ids := changes.removed.get(media_type)):
+                continue
+            update_current_task_progress_text(f"Removing {len(item_ids)} {media_type.value}s")
+            controller = self.mass.music.get_controller(media_type)
+            for item_id in sorted(item_ids):
+                library_item = await controller.get_library_item_by_prov_id(
+                    item_id, self.instance_id
+                )
+                if library_item is None:
+                    continue
+                if any(
+                    x.provider_instance == self.instance_id and x.item_id != item_id
+                    for x in library_item.provider_mappings
+                ):
+                    # the provider still has the item under another id (a replaced file)
+                    await controller.remove_provider_mapping(
+                        library_item.item_id, self.instance_id, item_id
+                    )
+                else:
+                    await self._remove_library_item(media_type, int(library_item.item_id))
+                await asyncio.sleep(0)  # yield to eventloop
+
+    async def _iter_changed_items(
+        self, media_type: MediaType, item_ids: set[str]
+    ) -> AsyncGenerator[Any]:
+        """Yield the provider items of the given changed item id's."""
+        get_item: dict[MediaType, Callable[[str], Awaitable[Any]]] = {
+            MediaType.ARTIST: self.get_artist,
+            MediaType.ALBUM: self.get_album,
+            MediaType.TRACK: self.get_track,
+        }
+        for item_id in sorted(item_ids):
+            try:
+                yield await get_item[media_type](item_id)
+            except MediaNotFoundError:
+                # gone again since the provider listed it; its removal is a change of its own
+                self.logger.debug("Changed %s %s no longer found", media_type.value, item_id)
+            except Exception as err:
+                self._handle_sync_item_failure(media_type, item_id, err)
+
+    async def _update_changed_library_item(
+        self, media_type: MediaType, db_id: int, prov_item: MediaItemType
+    ) -> MediaItemType:
+        """
+        Replace what this provider stored for a library item with its changed provider item.
+
+        :param media_type: Media type of the item.
+        :param db_id: Library id of the item.
+        :param prov_item: The changed item as the provider delivers it.
+        """
+        controller = self.mass.music.get_controller(media_type)
+        stored = await controller.get_library_item(db_id)
+        for prov_map in prov_item.provider_mappings:
+            prov_map.in_library = True
+        prov_item.metadata = _authoritative_metadata(
+            stored.metadata, prov_item.metadata, {self.instance_id, self.domain}
+        )
+        # imported here: the media controllers import this module
+        from music_assistant.controllers.music.media.base import (  # noqa: PLC0415
+            AUTHORITATIVE_REFRESH,
+        )
+
+        # the item comes from the files themselves, so it may also drop an album edition
+        token = AUTHORITATIVE_REFRESH.set(None if self.is_streaming_provider else prov_item)
+        try:
+            return cast(
+                "MediaItemType",
+                await controller.update_item_in_library(db_id, prov_item, overwrite=True),
+            )
+        finally:
+            AUTHORITATIVE_REFRESH.reset(token)
 
     def _update_sync_task_item_status(
         self, media_type: MediaType, processed_items: int, item_name: str | None = None
@@ -1419,12 +1616,16 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             media_type, library_item_id, set(genre_names)
         )
 
-    async def _sync_library_artists(self) -> set[int]:
-        """Sync Library Artists to Music Assistant library."""
+    async def _sync_library_artists(self, items: AsyncIterator[Artist] | None = None) -> set[int]:
+        """
+        Sync Library Artists to Music Assistant library.
+
+        :param items: Only sync these changed artists instead of the whole library.
+        """
         self.logger.debug("Start sync of Artists to Music Assistant library.")
         cur_db_ids: set[int] = set()
         item_count = 0
-        async for prov_item in self.get_library_artists():
+        async for prov_item in items if items is not None else self.get_library_artists():
             item_count += 1
             self._update_sync_task_item_status(MediaType.ARTIST, item_count, prov_item.name)
             self._note_listed_sync_item(MediaType.ARTIST, prov_item.item_id)
@@ -1473,13 +1674,18 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 )
         return cur_db_ids
 
-    async def _sync_library_albums(self) -> set[int]:
-        """Sync Library Albums to Music Assistant library."""
+    async def _sync_library_albums(self, items: AsyncIterator[Album] | None = None) -> set[int]:
+        """
+        Sync Library Albums to Music Assistant library.
+
+        :param items: Only sync these changed albums instead of the whole library, replacing
+            what this provider stored for them before.
+        """
         self.logger.debug("Start sync of Albums to Music Assistant library.")
         cur_db_ids: set[int] = set()
         sync_album_tracks = self.library_sync_album_tracks_enabled()
         item_count = 0
-        async for prov_item in self.get_library_albums():
+        async for prov_item in items if items is not None else self.get_library_albums():
             item_count += 1
             self._update_sync_task_item_status(MediaType.ALBUM, item_count, prov_item.name)
             self._note_listed_sync_item(MediaType.ALBUM, prov_item.item_id)
@@ -1499,6 +1705,11 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         for prov_map in prov_item.provider_mappings:
                             prov_map.in_library = True
                         library_item = await self.mass.music.albums.add_item_to_library(prov_item)
+                        db_id = int(library_item.item_id)
+                    elif items is not None:
+                        library_item = await self._update_changed_library_item(
+                            MediaType.ALBUM, sync_details.item_id, prov_item
+                        )
                         db_id = int(library_item.item_id)
                     else:
                         # Enhanced: refresh review data when the provider reported a change.
@@ -1815,8 +2026,13 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             except Exception as err:
                 self._handle_sync_item_failure(MediaType.TRACK, prov_track.uri, err)
 
-    async def _sync_library_tracks(self) -> set[int]:
-        """Sync Library Tracks to Music Assistant library."""
+    async def _sync_library_tracks(self, items: AsyncIterator[Track] | None = None) -> set[int]:
+        """
+        Sync Library Tracks to Music Assistant library.
+
+        :param items: Only sync these changed tracks instead of the whole library, replacing
+            what this provider stored for them before.
+        """
         self.logger.debug("Start sync of Tracks to Music Assistant library.")
         cur_db_ids: set[int] = set()
         # Enhanced: the provider album id's of every listed library track, and of the ones
@@ -1824,7 +2040,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         track_albums: dict[int, set[str]] = {}
         moved_tracks: dict[int, set[str]] = {}
         item_count = 0
-        async for prov_item in self.get_library_tracks():
+        async for prov_item in items if items is not None else self.get_library_tracks():
             item_count += 1
             self._update_sync_task_item_status(MediaType.TRACK, item_count, prov_item.name)
             self._note_listed_sync_item(MediaType.TRACK, prov_item.item_id)
@@ -1858,6 +2074,11 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                         for prov_map in prov_item.provider_mappings:
                             prov_map.in_library = True
                         library_item = await self.mass.music.tracks.add_item_to_library(prov_item)
+                        db_id = int(library_item.item_id)
+                    elif items is not None:
+                        library_item = await self._update_changed_library_item(
+                            MediaType.TRACK, sync_details.item_id, prov_item
+                        )
                         db_id = int(library_item.item_id)
                     elif (
                         self._library_item_needs_update(sync_details, prov_item)
