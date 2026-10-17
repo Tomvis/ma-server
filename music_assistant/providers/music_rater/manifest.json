@@ -3,7 +3,7 @@
   "domain": "music_rater",
   "stage": "experimental",
   "name": "music-rater",
-  "description": "Keeps AMG/TPS review data current on streaming-only library albums, which have no files for music-rater to tag.",
+  "description": "Keeps AMG/TPS review data current on every library album (Navidrome and streaming).",
   "codeowners": ["@Tomvis"],
   "requirements": [],
   "documentation": "",
