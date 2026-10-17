@@ -153,12 +153,16 @@ class LibraryChanges:
         cursor (none given, or too much changed), so only a full library sync is safe.
     :param changed: Provider item id's added or changed, per media type.
     :param removed: Provider item id's removed from the provider's library, per media type.
+    :param restored: Provider item id's that may be back in the provider's library without
+        reporting a change (e.g. a file moved back), per media type. Only the ones the library
+        lacks are added.
     """
 
     cursor: str
     complete: bool = True
     changed: dict[MediaType, set[str]] = field(default_factory=dict)
     removed: dict[MediaType, set[str]] = field(default_factory=dict)
+    restored: dict[MediaType, set[str]] = field(default_factory=dict)
 
 
 # the media types a changes sync covers, in the order an item's dependencies are added
@@ -1385,8 +1389,13 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             MediaType.TRACK: self._sync_library_tracks,
         }
         for media_type in media_types:
-            if item_ids := changes.changed.get(media_type):
-                await sync_changed[media_type](self._iter_changed_items(media_type, item_ids))
+            changed_ids = changes.changed.get(media_type, set())
+            if restored := changes.restored.get(media_type, set()) - changed_ids:
+                changed_ids = changed_ids | await self._ids_missing_from_library(
+                    media_type, restored
+                )
+            if changed_ids:
+                await sync_changed[media_type](self._iter_changed_items(media_type, changed_ids))
         if not self.library_sync_deletions_enabled():
             return
         # tracks go before the albums and artists they belong to
@@ -1412,6 +1421,26 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 else:
                     await self._remove_library_item(media_type, int(library_item.item_id))
                 await asyncio.sleep(0)  # yield to eventloop
+
+    async def _ids_missing_from_library(
+        self, media_type: MediaType, item_ids: set[str]
+    ) -> set[str]:
+        """Return the given provider item id's this provider has no library mapping for."""
+        missing = set(item_ids)
+        controller = self.mass.music.get_controller(media_type)
+        ordered = sorted(item_ids)
+        for index in range(0, len(ordered), SKIPPED_ITEM_QUERY_LIMIT):
+            for library_item in await controller.get_library_items_by_prov_id(
+                provider_instance=self.instance_id,
+                provider_item_ids=ordered[index : index + SKIPPED_ITEM_QUERY_LIMIT],
+                limit=SKIPPED_ITEM_QUERY_LIMIT,
+            ):
+                missing -= {
+                    x.item_id
+                    for x in library_item.provider_mappings
+                    if x.provider_instance == self.instance_id and x.in_library
+                }
+        return missing
 
     async def _iter_changed_items(
         self, media_type: MediaType, item_ids: set[str]

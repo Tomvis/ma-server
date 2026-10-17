@@ -18,12 +18,19 @@ T1 = "2026-10-17T11:00:00.465031921Z"
 T2 = "2026-10-17T12:00:00Z"
 
 
-def _item(item_id: str, updated: str, missing: bool = False) -> dict[str, Any]:
-    return {"id": item_id, "updatedAt": updated, "missing": missing}
+def _item(
+    item_id: str, updated: str, missing: bool = False, album_id: str | None = None
+) -> dict[str, Any]:
+    return {"id": item_id, "updatedAt": updated, "missing": missing, "albumId": album_id}
+
+
+def _album(album_id: str, imported: str, missing: bool = False) -> dict[str, Any]:
+    # an album's updatedAt is its newest file mtime, which says nothing about a change
+    return {"id": album_id, "importedAt": imported, "updatedAt": T0, "missing": missing}
 
 
 class _Library:
-    """Serve native API resources sorted by updatedAt, newest first."""
+    """Serve native API resources sorted newest first, and an album's songs."""
 
     def __init__(self, **resources: list[dict[str, Any]]) -> None:
         self.resources = {"artist": [], "album": [], "song": [], **resources}
@@ -31,14 +38,23 @@ class _Library:
 
     async def get(self, path: str, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
         assert params is not None
-        assert params["_sort"] == "updatedAt"
-        assert params["_order"] == "DESC"
         resource = path.removeprefix("/api/")
+        start, end = int(params["_start"]), int(params["_end"])
+        if album_id := params.get("album_id"):
+            assert resource == "song"
+            assert params["missing"] == "false"
+            self.requests.append((f"song?album_id={album_id}", params["_start"]))
+            songs = [
+                x for x in self.resources["song"] if x["albumId"] == album_id and not x["missing"]
+            ]
+            return songs[start:end]
+        assert params["_sort"] == ("importedAt" if resource == "album" else "updatedAt")
+        assert params["_order"] == "DESC"
         self.requests.append((resource, params["_start"]))
         items = sorted(
-            self.resources[resource], key=lambda x: _nd_time(x["updatedAt"]), reverse=True
+            self.resources[resource], key=lambda x: _nd_time(x[params["_sort"]]), reverse=True
         )
-        return items[int(params["_start"]) : int(params["_end"])]
+        return items[start:end]
 
 
 def _serve(provider: OpenSonicProvider, library: _Library) -> None:
@@ -59,14 +75,14 @@ def test_nd_time_keeps_nanoseconds() -> None:
 @pytest.mark.asyncio
 async def test_first_call_only_records_a_baseline(provider: OpenSonicProvider) -> None:
     """Without a cursor nothing tells what changed, so a full sync is asked for."""
-    library = _Library(song=[_item("s1", T1), _item("s2", T0)], album=[_item("a1", T1)])
+    library = _Library(song=[_item("s1", T1), _item("s2", T0)], album=[_album("a1", T1)])
     _serve(provider, library)
 
     changes = await provider.get_library_changes(None)
 
     assert changes is not None
     assert not changes.complete
-    assert json_loads(changes.cursor) == {"album": T1, "song": T1}
+    assert json_loads(changes.cursor) == {"album_imported": T1, "song": T1}
 
 
 @pytest.mark.asyncio
@@ -74,18 +90,52 @@ async def test_items_changed_since_the_cursor(provider: OpenSonicProvider) -> No
     """Only items newer than the cursor are reported, missing ones as removed."""
     library = _Library(
         artist=[_item("ar1", T0)],
-        album=[_item("a1", T2), _item("a2", T0)],
+        album=[_album("a1", T2), _album("a2", T0)],
         song=[_item("s1", T2), _item("s2", T2, missing=True), _item("s3", T1), _item("s4", T0)],
     )
     _serve(provider, library)
 
-    changes = await provider.get_library_changes(_cursor(artist=T0, album=T0, song=T1))
+    changes = await provider.get_library_changes(_cursor(artist=T0, album_imported=T0, song=T1))
 
     assert changes is not None
     assert changes.complete
     assert changes.changed == {MediaType.ALBUM: {"a1"}, MediaType.TRACK: {"s1"}}
     assert changes.removed == {MediaType.TRACK: {"s2"}}
-    assert json_loads(changes.cursor) == {"artist": T0, "album": T2, "song": T2}
+    assert json_loads(changes.cursor) == {"artist": T0, "album_imported": T2, "song": T2}
+
+
+@pytest.mark.asyncio
+async def test_touched_album_reports_its_songs_as_restored(provider: OpenSonicProvider) -> None:
+    """A file moved back keeps its old mtime, so only its album's importedAt tells."""
+    library = _Library(
+        album=[_album("a1", T2), _album("a2", T0)],
+        song=[
+            _item("s1", T0, album_id="a1"),
+            _item("s2", T0, missing=True, album_id="a1"),
+            _item("s3", T0, album_id="a2"),
+        ],
+    )
+    _serve(provider, library)
+
+    changes = await provider.get_library_changes(_cursor(artist=T0, album_imported=T1, song=T1))
+
+    assert changes is not None
+    assert changes.complete
+    assert changes.changed == {MediaType.ALBUM: {"a1"}}
+    assert changes.restored == {MediaType.TRACK: {"s1"}}
+    assert ("song?album_id=a2", "0") not in library.requests
+
+
+@pytest.mark.asyncio
+async def test_pre_imported_at_cursor_asks_for_a_full_sync(provider: OpenSonicProvider) -> None:
+    """A cursor that tracked albums by updatedAt can't date album changes, so a full sync runs."""
+    _serve(provider, _Library(album=[_album("a1", T1)], song=[_item("s1", T1)]))
+
+    changes = await provider.get_library_changes(_cursor(artist=T0, album=T1, song=T1))
+
+    assert changes is not None
+    assert not changes.complete
+    assert json_loads(changes.cursor) == {"artist": T0, "album_imported": T1, "song": T1}
 
 
 @pytest.mark.asyncio
@@ -93,7 +143,7 @@ async def test_unchanged_library_keeps_its_cursor(provider: OpenSonicProvider) -
     """No changes report nothing and keep the cursor, also for an empty resource."""
     library = _Library(song=[_item("s1", T1)])
     _serve(provider, library)
-    cursor = _cursor(artist=T0, album=T0, song=T1)
+    cursor = _cursor(artist=T0, album_imported=T0, song=T1)
 
     changes = await provider.get_library_changes(cursor)
 
@@ -115,7 +165,7 @@ async def test_changes_page_until_the_cursor(
     _serve(provider, library)
 
     changes = await provider.get_library_changes(
-        _cursor(artist=T0, album=T0, song="2026-10-17T11:00:01Z")
+        _cursor(artist=T0, album_imported=T0, song="2026-10-17T11:00:01Z")
     )
 
     assert changes is not None
@@ -134,16 +184,16 @@ async def test_too_many_changes_ask_for_a_full_sync(
     """More changes than the limit make a full sync cheaper, with the cursor still moved on."""
     monkeypatch.setattr(sonic_provider, "_ND_MAX_CHANGES", 2)
     library = _Library(
-        album=[_item("a1", T2)],
+        album=[_album("a1", T2)],
         song=[_item("s1", T2), _item("s2", T2)],
     )
     _serve(provider, library)
 
-    changes = await provider.get_library_changes(_cursor(artist=T0, album=T0, song=T0))
+    changes = await provider.get_library_changes(_cursor(artist=T0, album_imported=T0, song=T0))
 
     assert changes is not None
     assert not changes.complete
-    assert json_loads(changes.cursor) == {"artist": T0, "album": T2, "song": T2}
+    assert json_loads(changes.cursor) == {"artist": T0, "album_imported": T2, "song": T2}
 
 
 @pytest.mark.asyncio

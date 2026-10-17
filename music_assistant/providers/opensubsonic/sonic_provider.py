@@ -112,11 +112,14 @@ _ND_ALBUM_PAGE_SIZE = 500
 _ND_CHANGES_PAGE_SIZE = 500
 # More changed items than this since the last sync are taken in by a full sync instead.
 _ND_MAX_CHANGES = 2000
-# The native API resources library changes are read from, in the order they are synced.
+# The native API resources library changes are read from, in the order they are synced: the
+# field that dates a change and the cursor key it is tracked under. A song's updatedAt is its
+# file's mtime, so a file that comes back (moved, re-imported) keeps an old one, while an
+# album's importedAt is the time Navidrome last touched the album, which such a file bumps.
 _ND_CHANGES_RESOURCES = (
-    ("artist", MediaType.ARTIST),
-    ("album", MediaType.ALBUM),
-    ("song", MediaType.TRACK),
+    ("artist", "updatedAt", "artist", MediaType.ARTIST),
+    ("album", "importedAt", "album_imported", MediaType.ALBUM),
+    ("song", "updatedAt", "song", MediaType.TRACK),
 )
 
 Param = ParamSpec("Param")
@@ -637,12 +640,12 @@ class OpenSonicProvider(MusicProvider):
         changes = LibraryChanges(cursor="")
         newest: dict[str, str] = {}
         remaining = _ND_MAX_CHANGES
-        for resource, media_type in _ND_CHANGES_RESOURCES:
-            result = await self._nd_changed_items(resource, since.get(resource), remaining)
+        for resource, sort_field, key, media_type in _ND_CHANGES_RESOURCES:
+            result = await self._nd_changed_items(resource, sort_field, since.get(key), remaining)
             if result is None:
                 return None
             if result[0] is not None:
-                newest[resource] = result[0]
+                newest[key] = result[0]
             if (items := result[1]) is None:
                 changes.complete = False
                 remaining = 0
@@ -652,6 +655,12 @@ class OpenSonicProvider(MusicProvider):
                 # a deleted file stays in Navidrome's database, flagged missing
                 target = changes.removed if item.get("missing") else changes.changed
                 target.setdefault(media_type, set()).add(str(item["id"]))
+        if changes.complete:
+            # a touched album may have regained tracks whose own change time is old
+            for album_id in sorted(changes.changed.get(MediaType.ALBUM, ())):
+                if (song_ids := await self._nd_album_song_ids(album_id)) is None:
+                    return None
+                changes.restored.setdefault(MediaType.TRACK, set()).update(song_ids)
         changes.cursor = json_dumps(newest)
         return changes
 
@@ -1269,8 +1278,37 @@ class OpenSonicProvider(MusicProvider):
                 return extras
             start += _ND_ALBUM_PAGE_SIZE
 
+    async def _nd_album_song_ids(self, album_id: str) -> set[str] | None:
+        """
+        Return the id's of the songs of an album that are not missing.
+
+        Returns None when the server has no Navidrome native API.
+
+        :param album_id: The Navidrome album id.
+        """
+        song_ids: set[str] = set()
+        start = 0
+        while True:
+            page = await self._nd_get(
+                "/api/song",
+                {
+                    "album_id": album_id,
+                    "missing": "false",
+                    "_sort": "id",
+                    "_order": "ASC",
+                    "_start": str(start),
+                    "_end": str(start + _ND_CHANGES_PAGE_SIZE),
+                },
+            )
+            if page is None:
+                return None
+            song_ids.update(str(song["id"]) for song in page)
+            if len(page) < _ND_CHANGES_PAGE_SIZE:
+                return song_ids
+            start += _ND_CHANGES_PAGE_SIZE
+
     async def _nd_changed_items(
-        self, resource: str, since: str | None, limit: int
+        self, resource: str, sort_field: str, since: str | None, limit: int
     ) -> tuple[str | None, list[dict[str, Any]] | None] | None:
         """
         Return the newest change time of a native API resource and its items changed since.
@@ -1279,6 +1317,7 @@ class OpenSonicProvider(MusicProvider):
         None when the server has no Navidrome native API.
 
         :param resource: The native API resource, e.g. ``song``.
+        :param sort_field: The item field that dates a change, e.g. ``updatedAt``.
         :param since: The change time of the newest item seen before.
         :param limit: The most changed items to return.
         """
@@ -1290,7 +1329,7 @@ class OpenSonicProvider(MusicProvider):
             page = await self._nd_get(
                 f"/api/{resource}",
                 {
-                    "_sort": "updatedAt",
+                    "_sort": sort_field,
                     "_order": "DESC",
                     "_start": str(start),
                     "_end": str(start + _ND_CHANGES_PAGE_SIZE),
@@ -1299,11 +1338,11 @@ class OpenSonicProvider(MusicProvider):
             if page is None:
                 return None
             if newest is None and page:
-                newest = page[0]["updatedAt"]
+                newest = page[0][sort_field]
             if since_time is None:
                 return newest, None
             for item in page:
-                if _nd_time(item["updatedAt"]) <= since_time:
+                if _nd_time(item[sort_field]) <= since_time:
                     return newest or since, items
                 if len(items) >= limit:
                     return newest, None

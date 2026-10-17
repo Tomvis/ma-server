@@ -187,8 +187,11 @@ async def _sync_changes(
     provider: _FakeFileProvider,
     changed: dict[MediaType, set[str]] | None = None,
     removed: dict[MediaType, set[str]] | None = None,
+    restored: dict[MediaType, set[str]] | None = None,
 ) -> None:
-    changes = LibraryChanges(cursor="c", changed=changed or {}, removed=removed or {})
+    changes = LibraryChanges(
+        cursor="c", changed=changed or {}, removed=removed or {}, restored=restored or {}
+    )
     await provider.sync_library_changes(changes, _ALL)
 
 
@@ -290,6 +293,27 @@ async def test_removed_track_leaves_the_library(
 
     assert await _library_track(mass, "t2") is None
     assert await _library_track(mass, "t1") is not None
+
+
+async def test_restored_track_is_added_back_and_present_ones_left_alone(
+    mass: MusicAssistant, provider: _FakeFileProvider
+) -> None:
+    """A file moved back without a change of its own returns; its album's other tracks stay."""
+    await _start_library(provider)
+    await _sync_changes(provider, removed={MediaType.TRACK: {"t2"}})
+    assert await _library_track(mass, "t2") is None
+
+    with patch.object(
+        mass.music.tracks,
+        "update_item_in_library",
+        AsyncMock(wraps=mass.music.tracks.update_item_in_library),
+    ) as update:
+        await _sync_changes(provider, restored={MediaType.TRACK: {"t1", "t2"}})
+
+    track = await _library_track(mass, "t2")
+    assert track is not None
+    assert all(x.in_library for x in track.provider_mappings)
+    assert update.call_count == 0
 
 
 async def test_replaced_file_only_drops_the_old_mapping(
