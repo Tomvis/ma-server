@@ -178,6 +178,9 @@ from music_assistant.helpers.util import parse_optional_bool, parse_title_and_ve
 from music_assistant.models.core_controller import CoreController
 from music_assistant.models.media_capabilities import MediaCatalogMixin
 from music_assistant.models.music_provider import (
+    CACHE_CATEGORY_LIBRARY_CHANGES,
+    LIBRARY_CHANGES_CURSOR_KEY,
+    LIBRARY_CHANGES_MEDIA_TYPES,
     LIBRARY_FEATURE_BY_MEDIA_TYPE,
     MusicProvider,
     NothingToSync,
@@ -432,6 +435,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         self._sync_lock = asyncio.Lock()
         # a sync ran that MUSIC_SYNC_COMPLETED has not announced yet
         self._sync_completion_pending = False
+        # provider instances asked for a changes sync since their running one started
+        self._changes_sync_requested: set[str] = set()
         self.manifest.name = "Music controller"
         self.manifest.description = (
             "Music Assistant's core controller which manages all music from all providers."
@@ -618,6 +623,58 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                             priority=True,
                         )
                     )
+        return tasks
+
+    @api_command("music/sync_changed", required_scope=Scope.LIBRARY_MANAGE)
+    async def start_changes_sync(self, providers: list[str] | None = None) -> list[BackgroundTask]:
+        """
+        Start syncing what changed on (all or selected) musicproviders since their last sync.
+
+        Artists, albums and tracks are synced from the changes the provider reports, which
+        also brings in edits that keep an item's id. A provider that can not report its
+        changes gets a full sync instead, as do the other media types.
+
+        providers: only sync these provider instances. None for all.
+        """
+        music_providers = [
+            cast("MusicProvider", x)
+            for x in self.mass.providers
+            if x.type == ProviderType.MUSIC and (providers is None or x.instance_id in providers)
+        ]
+        tasks: list[BackgroundTask] = []
+        for provider in music_providers:
+            media_types = [
+                media_type
+                for media_type in LIBRARY_CHANGES_MEDIA_TYPES
+                if self.library_supported(provider, media_type)
+                and await self.mass.config.get_provider_config_value(
+                    provider.instance_id, f"library_sync_{media_type}s"
+                )
+            ]
+            if not media_types:
+                continue
+            # a changes sync that is running already read its changes, so it runs once more
+            self._changes_sync_requested.add(provider.instance_id)
+            tasks.append(
+                self.mass.tasks.run_background_task(
+                    task_id=f"music_sync_changes_{provider.instance_id}",
+                    name=f"Sync {provider.name} changes",
+                    handler=self._create_provider_changes_sync_handler(provider, media_types),
+                    user_id=(user.user_id if (user := get_current_user()) else None),
+                    metadata={
+                        "task_domain": "music_sync",
+                        "provider_domain": provider.domain,
+                        "provider_instance": provider.instance_id,
+                        "provider_name": provider.name,
+                    },
+                    allow_retry=True,
+                    priority=True,
+                )
+            )
+        other_media_types = [x for x in MediaType.ALL if x not in LIBRARY_CHANGES_MEDIA_TYPES]
+        tasks += await self.start_sync(
+            other_media_types, [provider.instance_id for provider in music_providers]
+        )
         return tasks
 
     @property
@@ -3564,6 +3621,58 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                     )
 
         return run_sync
+
+    def _create_provider_changes_sync_handler(
+        self, provider: MusicProvider, media_types: list[MediaType]
+    ) -> Callable[[], Awaitable[None]]:
+        """Create the coroutine used for a managed provider changes sync task."""
+
+        async def run_changes_sync() -> None:
+            while provider.instance_id in self._changes_sync_requested:
+                self._changes_sync_requested.discard(provider.instance_id)
+                await self._sync_provider_changes(provider, media_types)
+
+        return run_changes_sync
+
+    async def _sync_provider_changes(
+        self, provider: MusicProvider, media_types: list[MediaType]
+    ) -> None:
+        """Sync what changed on the provider since its last sync, or all of it if unknown."""
+        cursor = await self.mass.cache.get(
+            key=LIBRARY_CHANGES_CURSOR_KEY,
+            provider=provider.instance_id,
+            category=CACHE_CATEGORY_LIBRARY_CHANGES,
+        )
+        changes = await provider.get_library_changes(cursor)
+        if changes is None or not changes.complete:
+            update_current_task_progress_text("Changes unknown, running a full sync")
+            for media_type in media_types:
+                await self._create_provider_sync_handler(provider, media_type)()
+        else:
+            try:
+                async with self._sync_lock:
+                    await provider.sync_library_changes(changes, media_types)
+            finally:
+                self._sync_completion_pending = True
+                self.mass.call_later(
+                    0,
+                    self._handle_sync_completion_check,
+                    task_id=MUSIC_SYNC_COMPLETION_CHECK_TASK_ID,
+                )
+            self.logger.debug(
+                "Synced changes of %s: %s changed, %s removed",
+                provider.name,
+                sum(len(x) for x in changes.changed.values()),
+                sum(len(x) for x in changes.removed.values()),
+            )
+        if changes is not None:
+            await self.mass.cache.set(
+                key=LIBRARY_CHANGES_CURSOR_KEY,
+                data=changes.cursor,
+                provider=provider.instance_id,
+                category=CACHE_CATEGORY_LIBRARY_CHANGES,
+                persistent=True,
+            )
 
     def _get_sync_task_id(self, provider: MusicProvider | str, media_type: MediaType) -> str:
         """Return deterministic task id for a provider sync."""

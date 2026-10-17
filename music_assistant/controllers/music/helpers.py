@@ -168,10 +168,20 @@ def provider_mappings_for_update(
     if not overwrite:
         return {*update, *stored}
     updated_instances = {mapping.provider_instance for mapping in update}
-    return {
-        *update,
-        *(mapping for mapping in stored if mapping.provider_instance not in updated_instances),
+    # the stored rows are replaced, so a mapping that does not know its library state (a
+    # copy made for a sibling instance) would otherwise drop the item from that library
+    stored_in_library = {
+        (mapping.provider_instance, mapping.item_id): mapping.in_library for mapping in stored
     }
+    result: set[ProviderMapping] = set()
+    for mapping in update:
+        in_library = stored_in_library.get((mapping.provider_instance, mapping.item_id))
+        if mapping.in_library is None and in_library is not None:
+            result.add(replace(mapping, in_library=in_library))
+        else:
+            result.add(mapping)
+    result.update(x for x in stored if x.provider_instance not in updated_instances)
+    return result
 
 
 def preferred_thumb(

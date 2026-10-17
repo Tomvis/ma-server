@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
@@ -60,8 +61,9 @@ from music_assistant.constants import (
     UNKNOWN_ARTIST,
 )
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.json import json_dumps, json_loads
 from music_assistant.helpers.podcast_parsers import rank_episodes_by_date
-from music_assistant.models.music_provider import MusicProvider
+from music_assistant.models.music_provider import LibraryChanges, MusicProvider
 
 from .parsers import (
     EP_CHAN_SEP,
@@ -106,6 +108,16 @@ CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
 # Albums per page when reading DR and release-group ids from Navidrome's native API.
 _ND_ALBUM_PAGE_SIZE = 500
+# Items per page when reading library changes from Navidrome's native API.
+_ND_CHANGES_PAGE_SIZE = 500
+# More changed items than this since the last sync are taken in by a full sync instead.
+_ND_MAX_CHANGES = 2000
+# The native API resources library changes are read from, in the order they are synced.
+_ND_CHANGES_RESOURCES = (
+    ("artist", MediaType.ARTIST),
+    ("album", MediaType.ALBUM),
+    ("song", MediaType.TRACK),
+)
 
 Param = ParamSpec("Param")
 RetType = TypeVar("RetType")
@@ -129,6 +141,19 @@ def _nd_album_extras(nd_album: dict[str, Any]) -> tuple[float | None, str | None
     if rgid is not None and not is_valid_uuid(rgid):
         rgid = None
     return dr, rgid
+
+
+def _nd_time(value: str) -> tuple[datetime, int]:
+    """
+    Return a Navidrome timestamp as (whole seconds, nanoseconds), so that timestamps compare.
+
+    Navidrome writes nanoseconds, which datetime would truncate to microseconds.
+
+    :param value: An RFC 3339 timestamp of Navidrome's native API.
+    """
+    match = re.search(r"\.(\d+)", value)
+    nanoseconds = int(match.group(1).ljust(9, "0")[:9]) if match else 0
+    return datetime.fromisoformat(value).replace(microsecond=0), nanoseconds
 
 
 def _apply_nd_album_extras(album: Album, extras: tuple[float | None, str | None]) -> None:
@@ -596,6 +621,39 @@ class OpenSonicProvider(MusicProvider):
                 song_offset=offset,
                 song_count=count,
             )
+
+    async def get_library_changes(self, cursor: str | None) -> LibraryChanges | None:
+        """
+        Return the library items that changed on the server since the given cursor.
+
+        Only Navidrome reports its changes, through its native API.
+
+        :param cursor: The cursor of the previously applied changes, None if there are none.
+        """
+        since: dict[str, str] = {}
+        if cursor:
+            with suppress(ValueError):
+                since = json_loads(cursor)
+        changes = LibraryChanges(cursor="")
+        newest: dict[str, str] = {}
+        remaining = _ND_MAX_CHANGES
+        for resource, media_type in _ND_CHANGES_RESOURCES:
+            result = await self._nd_changed_items(resource, since.get(resource), remaining)
+            if result is None:
+                return None
+            if result[0] is not None:
+                newest[resource] = result[0]
+            if (items := result[1]) is None:
+                changes.complete = False
+                remaining = 0
+                continue
+            remaining -= len(items)
+            for item in items:
+                # a deleted file stays in Navidrome's database, flagged missing
+                target = changes.removed if item.get("missing") else changes.changed
+                target.setdefault(media_type, set()).add(str(item["id"]))
+        changes.cursor = json_dumps(newest)
+        return changes
 
     @use_cache(3600 * 3)  # cache for 3 hours
     async def get_album(self, prov_album_id: str) -> Album:
@@ -1211,6 +1269,49 @@ class OpenSonicProvider(MusicProvider):
                 return extras
             start += _ND_ALBUM_PAGE_SIZE
 
+    async def _nd_changed_items(
+        self, resource: str, since: str | None, limit: int
+    ) -> tuple[str | None, list[dict[str, Any]] | None] | None:
+        """
+        Return the newest change time of a native API resource and its items changed since.
+
+        The items are None when no since is given or more than limit items changed. Returns
+        None when the server has no Navidrome native API.
+
+        :param resource: The native API resource, e.g. ``song``.
+        :param since: The change time of the newest item seen before.
+        :param limit: The most changed items to return.
+        """
+        since_time = _nd_time(since) if since else None
+        newest: str | None = None
+        items: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            page = await self._nd_get(
+                f"/api/{resource}",
+                {
+                    "_sort": "updatedAt",
+                    "_order": "DESC",
+                    "_start": str(start),
+                    "_end": str(start + _ND_CHANGES_PAGE_SIZE),
+                },
+            )
+            if page is None:
+                return None
+            if newest is None and page:
+                newest = page[0]["updatedAt"]
+            if since_time is None:
+                return newest, None
+            for item in page:
+                if _nd_time(item["updatedAt"]) <= since_time:
+                    return newest or since, items
+                if len(items) >= limit:
+                    return newest, None
+                items.append(item)
+            if len(page) < _ND_CHANGES_PAGE_SIZE:
+                return newest or since, items
+            start += _ND_CHANGES_PAGE_SIZE
+
     async def _nd_get(self, path: str, params: dict[str, str] | None = None) -> Any:
         """
         Return the JSON answer of a GET on Navidrome's native API.
@@ -1233,8 +1334,10 @@ class OpenSonicProvider(MusicProvider):
         if self._nd_base_url is None:
             base_url = str(self.get_setup_value(CONF_BASE_URL)).rstrip("/")
             port = self.get_setup_value(CONF_PORT)
-            path = str(self.get_setup_value(CONF_PATH) or "").strip("/")
-            self._nd_base_url = f"{base_url}:{port or 443}" + (f"/{path}" if path else "")
+            server_path = str(self.get_setup_value(CONF_PATH) or "").strip("/")
+            self._nd_base_url = f"{base_url}:{port or 443}" + (
+                f"/{server_path}" if server_path else ""
+            )
         session = self.mass.http_session
         for _attempt in range(2):
             if self._nd_token is None:
