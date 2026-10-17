@@ -57,7 +57,7 @@ def _make_db() -> sqlite3.Connection:
     # DR values now live at metadata.dynamic_range (the canonical, measured value).
     # critical_reception holds only review-derived data (AMG/TPS sources + amg_dr).
     rows = [
-        # 1: AMG 4.5 + Album of the Year + YMIO/Lost in Time columns + DR 16 (excellent)
+        # 1: AMG 4.5 + Album of the Year + YMIO column + DR 16 (excellent)
         (
             1,
             {
@@ -70,14 +70,13 @@ def _make_db() -> sqlite3.Connection:
                             "accolades": [
                                 "Album of the Year (2024)",
                                 "YMIO",
-                                "Lost in Time",
                             ],
                         },
                     ],
                 },
             },
         ),
-        # 2: TPS 8.5 + dated Record of the Month + DR 11 (good)
+        # 2: TPS 8.5 + dated Honorable Mention + Lost in Time + DR 11 (good)
         (
             2,
             {
@@ -87,7 +86,7 @@ def _make_db() -> sqlite3.Connection:
                         {
                             "source": "TPS",
                             "rating": 8.5,
-                            "accolades": ["Record of the Month (Mar 2024)"],
+                            "accolades": ["Honorable Mention (2024)", "Lost in Time"],
                         }
                     ],
                 },
@@ -103,7 +102,7 @@ def _make_db() -> sqlite3.Connection:
                 },
             },
         ),
-        # 4: TPS 9.2 + undated Record of the Month + DR 8 (fair)
+        # 4: TPS 9.2 + undated Honorable Mention + RFU + DR 8 (fair)
         (
             4,
             {
@@ -113,7 +112,7 @@ def _make_db() -> sqlite3.Connection:
                         {
                             "source": "TPS",
                             "rating": 9.2,
-                            "accolades": ["Record of the Month"],
+                            "accolades": ["Honorable Mention", "RFU"],
                         }
                     ],
                 },
@@ -238,12 +237,12 @@ def test_dated_award_kinds_match_by_prefix() -> None:
     """
     Dated awards inline their date, so the kind prefix-matches every variant.
 
-    The old AOTM/record_of_the_month split is gone: both album 2 (dated) and album 4
-    (undated) carry "Record of the Month…" and match the single record_of_the_month kind.
+    Album 2 (dated) and album 4 (undated) both carry "Honorable Mention…" and match the
+    single honorable_mention kind.
     """
     con = _make_db()
     assert _exec_with_filters(con, amg_accolades=["aoty"]) == [1]
-    assert _exec_with_filters(con, tps_accolades=["record_of_the_month"]) == [2, 4]
+    assert _exec_with_filters(con, tps_accolades=["honorable_mention"]) == [2, 4]
 
 
 def test_accolade_filter_matches_exact_review_column() -> None:
@@ -256,7 +255,8 @@ def test_accolade_filter_matches_exact_review_column() -> None:
 def test_accolade_filter_matches_value_with_spaces() -> None:
     """A multi-word column like 'Lost in Time' (kind 'lit') matches its stored string."""
     con = _make_db()
-    assert _exec_with_filters(con, amg_accolades=["lit"]) == [1]
+    assert _exec_with_filters(con, tps_accolades=["lit"]) == [2]
+    assert _exec_with_filters(con, tps_accolades=["rfu"]) == [4]
 
 
 def test_accolades_combine_with_or_within_source() -> None:
@@ -266,10 +266,11 @@ def test_accolades_combine_with_or_within_source() -> None:
 
 
 def test_accolade_filter_is_source_scoped() -> None:
-    """AMG-only columns must not match via the TPS source (albums 2 and 4 are TPS)."""
+    """A column matches only under the source that carries it (albums 2 and 4 are TPS)."""
     con = _make_db()
     assert _exec_with_filters(con, tps_accolades=["tymhm"]) == []
     assert _exec_with_filters(con, tps_accolades=["ymio"]) == []
+    assert _exec_with_filters(con, amg_accolades=["lit", "rfu"]) == []
 
 
 def test_empty_accolade_list_emits_nothing() -> None:
