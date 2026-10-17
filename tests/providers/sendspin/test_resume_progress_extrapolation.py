@@ -80,7 +80,10 @@ def test_metadata_builder_clamps_progress_to_duration() -> None:
     )
     media = _media(170, updated_ago=60.0)
     media.duration = 180
-    metadata = SendspinPlayer._build_current_media_metadata(player, media, None, is_playing=True)
+    # Fork: the trackfields builder takes the queue as well.
+    metadata = SendspinPlayer._build_current_media_metadata(
+        player, media, None, None, is_playing=True
+    )
 
     assert metadata.track_progress == 180_000
 
