@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from music_assistant.controllers.music.media.base import (
         AudiobookSyncDetails,
         LibraryItemSyncDetails,
+        MediaControllerBase,
         PodcastSyncDetails,
         TrackSyncDetails,
     )
@@ -1430,9 +1431,9 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             except Exception as err:
                 self._handle_sync_item_failure(media_type, item_id, err)
 
-    async def _update_changed_library_item(
-        self, media_type: MediaType, db_id: int, prov_item: MediaItemType
-    ) -> MediaItemType:
+    async def _update_changed_library_item[ItemT: MediaItemType](
+        self, media_type: MediaType, db_id: int, prov_item: ItemT
+    ) -> ItemT:
         """
         Replace what this provider stored for a library item with its changed provider item.
 
@@ -1440,7 +1441,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         :param db_id: Library id of the item.
         :param prov_item: The changed item as the provider delivers it.
         """
-        controller = self.mass.music.get_controller(media_type)
+        controller = cast("MediaControllerBase[ItemT]", self.mass.music.get_controller(media_type))
         stored = await controller.get_library_item(db_id)
         for prov_map in prov_item.provider_mappings:
             prov_map.in_library = True
@@ -1455,10 +1456,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         # the item comes from the files themselves, so it may also drop an album edition
         token = AUTHORITATIVE_REFRESH.set(None if self.is_streaming_provider else prov_item)
         try:
-            return cast(
-                "MediaItemType",
-                await controller.update_item_in_library(db_id, prov_item, overwrite=True),
-            )
+            return await controller.update_item_in_library(db_id, prov_item, overwrite=True)
         finally:
             AUTHORITATIVE_REFRESH.reset(token)
 

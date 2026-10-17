@@ -29,7 +29,8 @@ class _Library:
         self.resources = {"artist": [], "album": [], "song": [], **resources}
         self.requests: list[tuple[str, str]] = []
 
-    async def get(self, path: str, params: dict[str, str]) -> list[dict[str, Any]]:
+    async def get(self, path: str, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        assert params is not None
         assert params["_sort"] == "updatedAt"
         assert params["_order"] == "DESC"
         resource = path.removeprefix("/api/")
