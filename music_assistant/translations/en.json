@@ -1719,6 +1719,8 @@
   "provider.lidarr.config_entries.intro.label": "Connect Music Assistant to Lidarr. 'Add to Lidarr' adds the album's artist (if missing) to the acting user's root folder with that folder's default profiles, then monitors and searches only that album.",
   "provider.lidarr.config_entries.root_folder_user.description": "Where artists {0} adds to Lidarr are stored. Artists already in Lidarr stay where they are.",
   "provider.lidarr.config_entries.root_folder_user.label": "Root folder for {0}",
+  "provider.lidarr.config_entries.song_pick_url.description": "beets-lidarr song pick service used by 'Add to Lidarr' on a track, e.g. http://10.0.0.101:9394",
+  "provider.lidarr.config_entries.song_pick_url.label": "Song pick service URL",
   "provider.lidarr.config_entries.test_connection.action_label": "Test connection",
   "provider.lidarr.config_entries.test_connection.label": "Test connection",
   "provider.lidarr.config_entries.test_error_label.label": "Couldn't reach Lidarr.",
