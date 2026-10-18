@@ -596,3 +596,129 @@ async def test_add_track_refuses_an_album(mass_minimal: MusicAssistant) -> None:
         pytest.raises(InvalidDataError, match="only accepts tracks"),
     ):
         await provider.add_track("tidal--x://album/77")
+
+
+VA_MBID = "89ad4ac3-39f7-470e-963a-56509c546377"
+
+
+def _va_track_and_album(
+    *, album_artist_mbid: str | None = VA_MBID, track_artist_mbid: str | None = "opeth-mbid"
+) -> tuple[Track, Album]:
+    track, album = _track_and_album()
+    album.artists = UniqueList(
+        [
+            ItemMapping(
+                item_id="1",
+                provider="tidal--x",
+                name="Various Artists",
+                media_type=MediaType.ARTIST,
+                external_ids={(ExternalID.MB_ARTIST, album_artist_mbid)}
+                if album_artist_mbid
+                else set(),
+            )
+        ]
+    )
+    track.artists = UniqueList(
+        [
+            ItemMapping(
+                item_id="9",
+                provider="tidal--x",
+                name="Opeth",
+                media_type=MediaType.ARTIST,
+                external_ids={(ExternalID.MB_ARTIST, track_artist_mbid)}
+                if track_artist_mbid
+                else set(),
+            )
+        ]
+    )
+    return track, album
+
+
+async def _add_va_track(
+    mass: MusicAssistant, track: Track, album: Album, provider: LidarrProvider | None = None
+) -> dict[str, object]:
+    provider = provider or await _load_provider(
+        mass, values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"}
+    )
+    music = MagicMock()
+    music.get_item_by_uri = AsyncMock(return_value=track)
+    music.albums.get = AsyncMock(return_value=album)
+    pick = AsyncMock(return_value={"status": "wanted"})
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="tom"),
+        ),
+        patch.object(mass, "music", music, create=True),
+        patch("music_assistant.providers.lidarr.provider.want_song", pick),
+    ):
+        await provider.add_track("tidal--x://track/5")
+    assert pick.await_args is not None
+    return cast("dict[str, object]", pick.await_args.args[2])
+
+
+async def test_add_track_on_a_various_artists_album_sends_the_track_artist(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A compilation track wants the song for its own artist, with no album hint."""
+    track, album = _va_track_and_album()
+    sent = await _add_va_track(mass_minimal, track, album)
+    assert (sent["artist_mbid"], sent["artist_name"], sent["album_rg_mbid"]) == (
+        "opeth-mbid",
+        "Opeth",
+        None,
+    )
+
+
+async def test_add_track_va_by_name_resolves_the_track_artist_mbid(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """VA recognised by name; a track artist without an MBID is resolved by name."""
+    track, album = _va_track_and_album(album_artist_mbid=None, track_artist_mbid=None)
+    album.artists[0].name = "various artists"
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
+    )
+    by_name = AsyncMock(return_value="resolved-mbid")
+    provider._artist_mbid_by_name = by_name  # type: ignore[method-assign]
+    sent = await _add_va_track(mass_minimal, track, album, provider)
+    by_name.assert_awaited_once_with("Opeth")
+    assert (sent["artist_mbid"], sent["artist_name"], sent["album_rg_mbid"]) == (
+        "resolved-mbid",
+        "Opeth",
+        None,
+    )
+
+
+async def test_add_track_va_resolved_late_still_sends_the_track_artist(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """An album artist that only resolves to the VA MBID (no VA name) is VA too."""
+    track, album = _va_track_and_album(album_artist_mbid=None)
+    album.artists[0].name = "Diverse Interpreten"
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
+    )
+    provider._resolve_mbids = AsyncMock(return_value=(VA_MBID, "rg-mbid"))  # type: ignore[method-assign]
+    sent = await _add_va_track(mass_minimal, track, album, provider)
+    assert (sent["artist_mbid"], sent["artist_name"], sent["album_rg_mbid"]) == (
+        "opeth-mbid",
+        "Opeth",
+        None,
+    )
+
+
+async def test_add_track_va_without_a_resolvable_track_artist_fails(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """No MBID for the track artist: a clear error, never the VA artist."""
+    track, album = _va_track_and_album(track_artist_mbid=None)
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
+    )
+    provider._artist_mbid_by_name = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    with pytest.raises(LidarrError, match="Opeth"):
+        await _add_va_track(mass_minimal, track, album, provider)

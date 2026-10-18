@@ -21,7 +21,11 @@ from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
 from music_assistant_models.enums import ConfigEntryType, ExternalID, MediaType
 from music_assistant_models.errors import InvalidDataError
 
-from music_assistant.constants import CONF_PROVIDERS
+from music_assistant.constants import (
+    CONF_PROVIDERS,
+    VARIOUS_ARTISTS_MBID,
+    VARIOUS_ARTISTS_NAME,
+)
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.models.plugin import PluginProvider
@@ -42,7 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.media_items import Album, Track
+    from music_assistant_models.media_items import Album, Artist, ItemMapping, Track
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -274,7 +278,21 @@ class LidarrProvider(PluginProvider):
         if track.album is None:
             raise InvalidDataError(f"Track {track.name!r} isn't on an album Lidarr could fetch")
         album = await self.mass.music.albums.get(track.album.item_id, track.album.provider)
-        album_req = await self._album_request(album, album.uri or item)
+        # A Various Artists album names no artist Lidarr can want a song for: the song
+        # service gets the track's own artist and no album hint (VA groups never qualify).
+        album_req = (
+            None
+            if _is_various_artists(album.artists[0] if album.artists else None)
+            else await self._album_request(album, album.uri or item)
+        )
+        if album_req is not None and album_req.artist_mbid == VARIOUS_ARTISTS_MBID:
+            album_req = None
+        if album_req is None:
+            artist_name, artist_mbid = await self._track_artist(track)
+            album_name, release_group_mbid = album.name, None
+        else:
+            artist_name, artist_mbid = album_req.artist_name, album_req.artist_mbid
+            album_name, release_group_mbid = album_req.album_name, album_req.release_group_mbid
         isrc = next(
             (value for kind, value in sorted(track.external_ids) if kind == ExternalID.ISRC),
             None,
@@ -284,17 +302,17 @@ class LidarrProvider(PluginProvider):
             str(self.config.get_value(CONF_SONG_PICK_URL) or DEFAULT_SONG_PICK_URL),
             {
                 "root_folder": root_folder,
-                "artist_mbid": album_req.artist_mbid,
-                "artist_name": album_req.artist_name,
+                "artist_mbid": artist_mbid,
+                "artist_name": artist_name,
                 "track_name": track.name,
                 "recording_mbid": track.get_external_id(ExternalID.MB_RECORDING),
                 "isrc": isrc,
-                "album_rg_mbid": album_req.release_group_mbid,
+                "album_rg_mbid": release_group_mbid,
             },
         )
         return {
-            "artist_name": reply.get("artist_name") or album_req.artist_name,
-            "album_name": reply.get("album_name") or album_req.album_name,
+            "artist_name": reply.get("artist_name") or artist_name,
+            "album_name": reply.get("album_name") or album_name,
             "track_name": reply.get("track_name") or track.name,
             "artist_added": bool(reply.get("artist_added")),
             "already_wanted": reply.get("status") in ("owned", "already_wanted"),
@@ -348,6 +366,21 @@ class LidarrProvider(PluginProvider):
             release_group_mbid=release_group_mbid,
             release_mbid=album.get_external_id(ExternalID.MB_ALBUM),
         )
+
+    async def _track_artist(self, track: Track) -> tuple[str, str]:
+        """Return (name, MusicBrainz ID) of the track's first artist, for a VA album."""
+        first = track.artists[0] if track.artists else None
+        if first is None or not first.name:
+            raise InvalidDataError(f"Track {track.name!r} on a Various Artists album has no artist")
+        mbid = first.get_external_id(ExternalID.MB_ARTIST) or await self._artist_mbid_by_name(
+            first.name
+        )
+        if not mbid or mbid == VARIOUS_ARTISTS_MBID:
+            raise LidarrError(
+                f"Couldn't determine a MusicBrainz artist ID for {first.name!r}, which "
+                "Lidarr needs to want this song. Try refreshing the track's metadata first."
+            )
+        return first.name, mbid
 
     async def _usernames(self) -> list[str]:
         """List MA usernames; empty (no per-user entries) if the lookup is refused."""
@@ -529,3 +562,12 @@ class LidarrProvider(PluginProvider):
         :param default: Value to return when the key is not present in setup_data.
         """
         return self.mass.config.get_provider_setup_value(self.instance_id, key, default)
+
+
+def _is_various_artists(artist: Artist | ItemMapping | None) -> bool:
+    """Whether an album artist is MusicBrainz's Various Artists (by MBID or by name)."""
+    if artist is None:
+        return False
+    if artist.get_external_id(ExternalID.MB_ARTIST) == VARIOUS_ARTISTS_MBID:
+        return True
+    return (artist.name or "").strip().casefold() == VARIOUS_ARTISTS_NAME.casefold()
