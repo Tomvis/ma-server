@@ -1474,6 +1474,14 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         stored = await controller.get_library_item(db_id)
         for prov_map in prov_item.provider_mappings:
             prov_map.in_library = True
+        # the library item can merge several of this provider's items (one recording on two
+        # albums): the overwrite only replaces the changed one, the others leave by removal
+        changed_ids = {x.item_id for x in prov_item.provider_mappings}
+        prov_item.provider_mappings.update(
+            x
+            for x in stored.provider_mappings
+            if x.provider_instance == self.instance_id and x.item_id not in changed_ids
+        )
         prov_item.metadata = _authoritative_metadata(
             stored.metadata, prov_item.metadata, {self.instance_id, self.domain}
         )

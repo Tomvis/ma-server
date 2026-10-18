@@ -334,6 +334,26 @@ async def test_replaced_file_only_drops_the_old_mapping(
     assert {x.item_id for x in replaced.provider_mappings} == {"t2-new"}
 
 
+async def test_changed_track_keeps_the_providers_other_copies(
+    mass: MusicAssistant, provider: _FakeFileProvider
+) -> None:
+    """One recording on two albums is one library track; a change to one keeps the other."""
+    await _start_library(provider)
+    track = await _library_track(mass, "t1")
+    assert track is not None
+    other_album = _album("alb-2", "Compilation")
+    provider.library_albums.append(other_album)
+    provider.library_tracks.append(_track("t1-comp", 1, other_album))
+    await mass.music.tracks.add_provider_mappings(track.item_id, [_mapping("t1-comp")])
+    provider.library_tracks[0] = _track("t1", 1, provider.library_albums[0], name="Retagged")
+
+    await _sync_changes(provider, changed={MediaType.TRACK: {"t1"}})
+
+    changed = await mass.music.tracks.get_library_item(track.item_id)
+    assert changed.name == "Retagged"
+    assert {x.item_id for x in changed.provider_mappings} == {"t1", "t1-comp"}
+
+
 async def test_removals_wait_for_deletions_to_be_enabled(
     mass: MusicAssistant, provider: _FakeFileProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
