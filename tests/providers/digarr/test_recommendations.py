@@ -268,3 +268,13 @@ async def test_track_recommendations_are_skipped(provider: DigarrProvider) -> No
     assert "track-artist-mbid" not in provider._mbid_artist_ids
     with as_user("tom"):
         assert list(await provider.get_recommendation_items(ROW_ID)) == [resolved]
+
+
+async def test_track_flood_cannot_empty_the_row(provider: DigarrProvider) -> None:
+    """Even if the client hands back tracks outscoring every artist, artists still show."""
+    tracks = [replace(make_rec(rec_id=100 + i, score=0.99), kind="track") for i in range(20)]
+    resolved = Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(return_value=[*tracks, make_rec(rec_id=1, score=0.6)])
+    with patch("music_assistant.providers.digarr.resolve_artist", AsyncMock(return_value=resolved)):
+        await provider._refresh()
+    assert provider._items == [resolved]

@@ -58,6 +58,7 @@ SAMPLE = {
 async def test_get_pending_parses_the_real_response_shape(session: FakeSession) -> None:
     """Recommendations map onto the dataclass, including the nested artist."""
     session.queue(FakeResponse(200, SAMPLE))
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "dgr_x_y", session)
 
     recs = await client.get_pending(limit=15)
@@ -75,6 +76,7 @@ async def test_get_pending_parses_the_real_response_shape(session: FakeSession) 
 async def test_get_pending_sends_the_api_key_as_a_bearer(session: FakeSession) -> None:
     """The key travels in the Authorization header, never in the query string."""
     session.queue(FakeResponse(200, {"items": [], "total": 0}))
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "dgr_x_y", session)
 
     await client.get_pending(limit=15)
@@ -88,13 +90,43 @@ async def test_get_pending_sends_the_api_key_as_a_bearer(session: FakeSession) -
 async def test_get_pending_requests_the_documented_query(session: FakeSession) -> None:
     """Highest-scoring pending first, limited to the caller's buffer."""
     session.queue(FakeResponse(200, {"items": [], "total": 0}))
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "k", session)
 
     await client.get_pending(limit=15)
 
     _method, url, kwargs = session.calls[0]
     assert url == f"{BASE}/api/v1/recommendations"
-    assert kwargs["params"] == {"status": "pending", "sort": "score_desc", "limit": "15"}
+    assert kwargs["params"] == {
+        "status": "pending",
+        "sort": "score_desc",
+        "limit": "15",
+        "kind": "artist",
+    }
+
+
+async def test_get_pending_requests_artists_and_albums_and_merges_by_score(
+    session: FakeSession,
+) -> None:
+    """Tracks never fill the window: one request per kind, merged by score, top N."""
+
+    def item(rec_id: int, kind: str, score: float) -> dict[str, object]:
+        return {
+            "id": rec_id,
+            "kind": kind,
+            "score": score,
+            "status": "pending",
+            "artist": {"id": rec_id, "name": f"A{rec_id}", "mbid": f"mbid-{rec_id}"},
+        }
+
+    session.queue(FakeResponse(200, {"items": [item(1, "artist", 0.9), item(2, "artist", 0.5)]}))
+    session.queue(FakeResponse(200, {"items": [item(3, "album", 0.7)]}))
+    client = DigarrClient(BASE, "k", session)
+
+    recs = await client.get_pending(limit=2)
+
+    assert [c[2]["params"]["kind"] for c in session.calls] == ["artist", "album"]
+    assert [r.id for r in recs] == [1, 3]
 
 
 async def test_skips_records_with_no_mbid(session: FakeSession) -> None:
@@ -116,6 +148,7 @@ async def test_skips_records_with_no_mbid(session: FakeSession) -> None:
             },
         )
     )
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "k", session)
 
     assert await client.get_pending(limit=15) == []
@@ -153,6 +186,7 @@ async def test_missing_recommendation_id_is_skipped_not_fatal(
             },
         )
     )
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "k", session)
 
     with caplog.at_level(logging.WARNING):
@@ -188,6 +222,7 @@ async def test_missing_artist_id_is_skipped_not_fatal(session: FakeSession) -> N
             },
         )
     )
+    session.queue(FakeResponse(200, {"items": [], "total": 0}))
     client = DigarrClient(BASE, "k", session)
 
     recs = await client.get_pending(limit=15)

@@ -12,6 +12,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+PENDING_KINDS = ("artist", "album")
+
+
 class DigarrError(Exception):
     """Any failure talking to digarr."""
 
@@ -48,12 +51,32 @@ class DigarrClient:
         self._session = session
 
     async def get_pending(self, limit: int) -> list[DigarrRecommendation]:
-        """Fetch the highest-scoring pending recommendations."""
-        payload = await self._request(
-            "GET",
-            "/api/v1/recommendations",
-            params={"status": "pending", "sort": "score_desc", "limit": str(limit)},
-        )
+        """
+        Fetch the highest-scoring pending artist and album recommendations.
+
+        Requested per kind (not unfiltered) so a flood of track recommendations can
+        never fill the ``limit`` window and starve the row; the per-kind results are
+        merged by score and trimmed to ``limit``.
+        """
+        merged: dict[int, DigarrRecommendation] = {}
+        for kind in PENDING_KINDS:
+            payload = await self._request(
+                "GET",
+                "/api/v1/recommendations",
+                params={
+                    "status": "pending",
+                    "sort": "score_desc",
+                    "limit": str(limit),
+                    "kind": kind,
+                },
+            )
+            for rec in self._parse_items(payload):
+                merged.setdefault(rec.id, rec)
+        ranked = sorted(merged.values(), key=lambda rec: rec.score, reverse=True)
+        return ranked[:limit]
+
+    def _parse_items(self, payload: Any) -> list[DigarrRecommendation]:
+        """Flatten one recommendations page, dropping records that cannot be used."""
         results: list[DigarrRecommendation] = []
         for raw in payload.get("items", []):
             artist = raw.get("artist") or {}
