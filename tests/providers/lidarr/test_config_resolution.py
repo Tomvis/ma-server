@@ -570,7 +570,7 @@ async def test_add_track_without_isrc_sends_null(mass_minimal: MusicAssistant) -
     ):
         result = await provider.add_track("tidal--x://track/5")
     assert pick.await_args is not None
-    assert pick.await_args.args[1] == "http://10.0.0.101:9394"
+    assert pick.await_args.args[1] == "http://songpick:9394"
     assert pick.await_args.args[2]["isrc"] is None
     assert result["already_wanted"] is False
 
