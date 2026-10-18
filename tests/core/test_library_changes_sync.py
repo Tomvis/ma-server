@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from music_assistant_models.config_entries import ProviderConfig
 from music_assistant_models.enums import ImageType, MediaType, ProviderFeature, ProviderType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    MediaNotFoundError,
+    ProviderUnavailableError,
+)
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -352,6 +356,36 @@ async def test_changed_track_keeps_the_providers_other_copies(
     changed = await mass.music.tracks.get_library_item(track.item_id)
     assert changed.name == "Retagged"
     assert {x.item_id for x in changed.provider_mappings} == {"t1", "t1-comp"}
+
+
+async def test_sync_items_applies_the_given_items_as_changed(
+    mass: MusicAssistant, provider: _FakeFileProvider
+) -> None:
+    """Items named explicitly replace what is stored, like a reported change, and only those."""
+    album = await _start_library(provider)
+    provider.library_tracks = [
+        _track("t1", 1, album, name="Retagged 1"),
+        _track("t2", 2, album, name="Retagged 2"),
+    ]
+    with patch.object(mass.tasks, "run_background_task") as run_task:
+        await mass.music.sync_items(_INSTANCE, MediaType.TRACK, ["t1"])
+    await run_task.call_args.kwargs["handler"]()
+
+    first = await _library_track(mass, "t1")
+    second = await _library_track(mass, "t2")
+    assert first is not None
+    assert first.name == "Retagged 1"
+    assert second is not None
+    assert second.name == "Song 2"
+
+
+@pytest.mark.usefixtures("provider")
+async def test_sync_items_rejects_what_a_changes_sync_can_not_apply(mass: MusicAssistant) -> None:
+    """Only artists, albums and tracks of a known music provider can be synced by id."""
+    with pytest.raises(InvalidDataError):
+        await mass.music.sync_items(_INSTANCE, MediaType.PLAYLIST, ["p1"])
+    with pytest.raises(ProviderUnavailableError):
+        await mass.music.sync_items("nope--1", MediaType.TRACK, ["t1"])
 
 
 async def test_removals_wait_for_deletions_to_be_enabled(
