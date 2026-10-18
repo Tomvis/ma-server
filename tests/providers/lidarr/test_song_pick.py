@@ -102,5 +102,5 @@ async def test_timeout_becomes_lidarr_error(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_timeout_covers_a_new_artist() -> None:
-    """Lidarr can need ~5 min to add a brand-new artist (ruling R6)."""
-    assert song_pick.REQUEST_TIMEOUT == 330
+    """New artist plus a profile switch's settle wait is ~480 s before MB/DRDB (R12)."""
+    assert song_pick.REQUEST_TIMEOUT == 600

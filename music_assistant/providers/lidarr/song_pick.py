@@ -16,9 +16,10 @@ from music_assistant.providers.lidarr.client import LidarrError
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
-# Seconds. A brand-new artist can take ~5 min in Lidarr (add + metadata refresh), and
-# the service answers only once that finished.
-REQUEST_TIMEOUT = 330
+# Seconds. The service answers only once Lidarr finished: a brand-new artist (~180 s
+# settle) plus a metadata-profile switch (refresh, album poll, settle wait) is ~480 s,
+# before MusicBrainz and the live DRDB lookup.
+REQUEST_TIMEOUT = 600
 
 
 async def want_song(session: ClientSession, base_url: str, body: dict[str, Any]) -> dict[str, Any]:
