@@ -27,7 +27,8 @@
   },
   "media": {
     "recommendations": {
-      "up_next": { "name": "digarr — Up Next" }
+      "up_next": { "name": "digarr — Up Next" },
+      "up_next_songs": { "name": "digarr — Songs" }
     }
   }
 }

@@ -21,7 +21,7 @@ from music_assistant_models.auth import Scope
 from music_assistant_models.background_task import TaskSchedule
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
-from music_assistant_models.enums import ConfigEntryType, ExternalID, ProviderFeature
+from music_assistant_models.enums import ConfigEntryType, ExternalID, MediaType, ProviderFeature
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
 from music_assistant_models.media_items import RecommendationFolder, UniqueList
 
@@ -43,9 +43,11 @@ from music_assistant.providers.digarr.constants import (
     REFRESH_TASK_ID,
     RESOLUTION_BUFFER,
     ROW_ID,
+    ROW_ID_SONGS,
     ROW_ITEM_TARGET,
+    TRACK_APPROVE_TIMEOUT,
 )
-from music_assistant.providers.digarr.parsers import resolve_artist
+from music_assistant.providers.digarr.parsers import resolve_artist, resolve_track
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -54,6 +56,7 @@ if TYPE_CHECKING:
         BrowseFolder,
         ItemMapping,
         MediaItemType,
+        Track,
     )
     from music_assistant_models.provider import ProviderManifest
 
@@ -65,7 +68,7 @@ SUPPORTED_FEATURES: set[ProviderFeature] = {
 }
 
 
-def mbid_of(item: Artist | ItemMapping) -> str | None:
+def mbid_of(item: Artist | Track | ItemMapping) -> str | None:
     """
     Return an item's MusicBrainz artist id, if it has one.
 
@@ -196,6 +199,10 @@ class DigarrProvider(PluginProvider):
         # keys on digarr's artist id, not the recommendation id or the MusicBrainz id.
         self._artist_ids: dict[str, int] = {}
         self._mbid_artist_ids: dict[str, int] = {}
+        # The songs row. Track uris share _rec_ids with artist uris (they never collide);
+        # a rotated track uri falls back to its MusicBrainz recording id instead.
+        self._track_items: list[Track] = []
+        self._recording_rec_ids: dict[str, int] = {}
         # Initialized here (not in handle_async_init) so loaded_in_mass can append to it
         # even if it is ever invoked before handle_async_init has run.
         self._unregister_handles: list[Callable[[], None]] = []
@@ -581,7 +588,7 @@ class DigarrProvider(PluginProvider):
         """
         if not self._viewer_is_bound_user():
             return []
-        return [
+        rows = [
             RecommendationFolder(
                 item_id=ROW_ID,
                 provider=self.instance_id,
@@ -590,6 +597,19 @@ class DigarrProvider(PluginProvider):
                 icon="mdi-radar",
             )
         ]
+        # Unlike the artist row, an empty songs row is hidden: most users never
+        # configure a song target, and a permanently empty second row is noise.
+        if self._track_items:
+            rows.append(
+                RecommendationFolder(
+                    item_id=ROW_ID_SONGS,
+                    provider=self.instance_id,
+                    name="digarr — Songs",
+                    translation_key=ROW_ID_SONGS,
+                    icon="mdi-music-note-plus",
+                )
+            )
+        return rows
 
     async def get_recommendation_items(
         self, item_id: str
@@ -612,18 +632,23 @@ class DigarrProvider(PluginProvider):
 
         :param item_id: The item_id of the row, as returned by get_recommendations.
         """
-        if not self._viewer_is_bound_user() or item_id != ROW_ID:
+        if not self._viewer_is_bound_user():
             return UniqueList()
-        return UniqueList(self._items)
+        if item_id == ROW_ID:
+            return UniqueList(self._items)
+        if item_id == ROW_ID_SONGS:
+            return UniqueList(self._track_items)
+        return UniqueList()
 
-    def recommendation_id_for(self, uri: str, item: Artist | ItemMapping) -> int | None:
+    def recommendation_id_for(self, uri: str, item: Artist | Track | ItemMapping) -> int | None:
         """
         Map a resolved item back to the digarr recommendation id it came from.
 
         Tries the uri recorded at the last successful refresh first, then falls
-        back to the item's MusicBrainz artist id for a uri that has since
-        rotated (e.g. a streaming provider reissuing an id). Never falls back to
-        a name match: approving the wrong artist triggers a real Lidarr download.
+        back to the item's MusicBrainz artist id (or, for a track, its recording
+        id) for a uri that has since rotated (e.g. a streaming provider reissuing
+        an id). Never falls back to a name match: approving the wrong item
+        triggers a real Lidarr download.
 
         :param uri: The resolved item's uri.
         :param item: The resolved item itself, used for its MusicBrainz id as a
@@ -631,6 +656,10 @@ class DigarrProvider(PluginProvider):
         """
         if (rec_id := self._rec_ids.get(uri)) is not None:
             return rec_id
+        if item.media_type == MediaType.TRACK:
+            if (recording := item.get_external_id(ExternalID.MB_RECORDING)) is not None:
+                return self._recording_rec_ids.get(recording)
+            return None
         if (mbid := mbid_of(item)) is not None:
             return self._mbid_rec_ids.get(mbid)
         return None
@@ -641,7 +670,9 @@ class DigarrProvider(PluginProvider):
 
         Sends no target options: omitting them lets digarr pick the calling
         user's own Lidarr target from the API key alone, which is the correct
-        per-user behaviour and the whole point of per-user keys.
+        per-user behaviour and the whole point of per-user keys. A song goes to
+        digarr's song target (songpick), which can take minutes; the result's
+        status is "duplicate" when the song turns out to be owned already.
 
         :param item: The resolved item's MA uri, as sent by the frontend action.
         """
@@ -671,9 +702,13 @@ class DigarrProvider(PluginProvider):
         either. Never passes ``remove_lidarr_artist``: blocking only stops
         future recommendations, it does not reverse an approve.
 
+        A song is refused: rejecting one song must never block its whole artist.
+
         :param item: The resolved item's MA uri, as sent by the frontend action.
         """
         resolved, rec_id = await self._resolve_recommendation(item)
+        if resolved.media_type == MediaType.TRACK:
+            raise InvalidDataError(f"{item} is a song; reject it instead of blocking")
         artist_id = self._artist_id_for(item, resolved)
         if artist_id is None:
             raise InvalidDataError(f"{item} is not a tracked digarr recommendation")
@@ -690,7 +725,8 @@ class DigarrProvider(PluginProvider):
         reverse of an approve. digarr's Lidarr removal defaults to False
         server-side and is opt-in deliberately, because ``status: "pending"`` is
         also how digarr's own UI restores a rejected recommendation -- so
-        approve/reject/block must never pass it.
+        approve/reject/block must never pass it. Never passed for a song either:
+        its artist may hold other music in Lidarr, and songpick's want stays.
 
         :param item: The resolved item's MA uri, as sent by the frontend action.
         """
@@ -822,11 +858,16 @@ class DigarrProvider(PluginProvider):
             artist_ids[artist.uri] = rec.artist_id
             mbid_artist_ids[rec.artist_mbid] = rec.artist_id
 
+        track_items, track_rec_ids, recording_rec_ids = await self._refresh_tracks()
+        rec_ids.update(track_rec_ids)
+
         self._items = items
         self._rec_ids = rec_ids
         self._mbid_rec_ids = mbid_rec_ids
         self._artist_ids = artist_ids
         self._mbid_artist_ids = mbid_artist_ids
+        self._track_items = track_items
+        self._recording_rec_ids = recording_rec_ids
 
         message = (
             "digarr: refresh fetched %s pending recommendation(s): %s resolved into the "
@@ -845,6 +886,58 @@ class DigarrProvider(PluginProvider):
         self.logger.info(message, *args)
 
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
+
+    async def _refresh_tracks(
+        self,
+    ) -> tuple[list[Track], dict[str, int], dict[str, int]]:
+        """
+        Build the songs row's next generation: items, uri -> rec id, recording -> rec id.
+
+        Fetched separately from artists so a song-side failure (e.g. a digarr without
+        track support answering 400) keeps the previous songs and never costs the
+        artist row its refresh.
+        """
+        try:
+            candidates = [
+                rec
+                for rec in await self._client.get_pending_tracks(limit=RESOLUTION_BUFFER)
+                if rec.score >= self._min_score
+            ]
+        except DigarrError as err:
+            self.logger.warning("digarr: could not fetch pending song recommendations: %s", err)
+            previous = {
+                track.uri: self._rec_ids[track.uri]
+                for track in self._track_items
+                if track.uri in self._rec_ids
+            }
+            return self._track_items, previous, self._recording_rec_ids
+
+        resolved = await asyncio.gather(
+            *[resolve_track(rec, self.mass, self.instance_id) for rec in candidates]
+        )
+        items: list[Track] = []
+        rec_ids: dict[str, int] = {}
+        recording_rec_ids: dict[str, int] = {}
+        unresolved: list[str] = []
+        for rec, track in zip(candidates, resolved, strict=True):
+            if track is None:
+                unresolved.append(f"{rec.artist_name} - {rec.track_title}")
+                continue
+            if len(items) >= self._row_size:
+                continue
+            items.append(track)
+            rec_ids[track.uri] = rec.id
+            if rec.recording_mbid:
+                recording_rec_ids[rec.recording_mbid] = rec.id
+        if candidates:
+            self.logger.info(
+                "digarr: refresh fetched %s pending song(s): %s in the row, %s unresolved%s",
+                len(candidates),
+                len(items),
+                len(unresolved),
+                f": {', '.join(unresolved[:10])}" if unresolved else "",
+            )
+        return items, rec_ids, recording_rec_ids
 
     def _adopt_command_handles(self, handles: list[Callable[[], None]]) -> None:
         """
@@ -872,7 +965,7 @@ class DigarrProvider(PluginProvider):
         user = get_current_user()
         return user is not None and user.username == self._ma_user
 
-    async def _resolve_recommendation(self, uri: str) -> tuple[Artist | ItemMapping, int]:
+    async def _resolve_recommendation(self, uri: str) -> tuple[Artist | Track | ItemMapping, int]:
         """
         Resolve an MA uri to the digarr recommendation id it maps to, gated to the bound user.
 
@@ -920,12 +1013,21 @@ class DigarrProvider(PluginProvider):
         :param remove_lidarr_artist: Forwarded to ``set_status`` only when True.
         """
         item, rec_id = await self._resolve_recommendation(uri)
-        kwargs: dict[str, bool] = {"remove_lidarr_artist": True} if remove_lidarr_artist else {}
+        is_track = item.media_type == MediaType.TRACK
+        kwargs: dict[str, Any] = {}
+        if remove_lidarr_artist and not is_track:
+            kwargs["remove_lidarr_artist"] = True
+        if is_track and status == "approved":
+            kwargs["timeout"] = TRACK_APPROVE_TIMEOUT
         result = await self._client.set_status(rec_id, status, **kwargs)
         await self._refresh()
+        if result.get("status") == "add_failed":
+            # digarr records the failure on the rec and answers 200; the caller's
+            # toast must still show it, with songpick's own reason.
+            raise DigarrError(result.get("lidarrError") or f"digarr could not add {item.name}")
         return self._build_result(item, status, result)
 
-    def _artist_id_for(self, uri: str, item: Artist | ItemMapping) -> int | None:
+    def _artist_id_for(self, uri: str, item: Artist | Track | ItemMapping) -> int | None:
         """
         Map a resolved item back to digarr's internal artist id for its recommendation.
 
@@ -946,7 +1048,7 @@ class DigarrProvider(PluginProvider):
 
     @staticmethod
     def _build_result(
-        item: Artist | ItemMapping, status: str, result: dict[str, Any]
+        item: Artist | Track | ItemMapping, status: str, result: dict[str, Any]
     ) -> dict[str, Any]:
         """
         Map a client response to the frontend's approve/reject/block/undo result shape.

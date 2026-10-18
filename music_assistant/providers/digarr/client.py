@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from aiohttp import ClientTimeout
+
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
@@ -39,6 +41,11 @@ class DigarrRecommendation:
     ai_reasoning: str | None
     release_group_mbid: str | None
     release_group_title: str | None
+    # Set on kind == "track" only.
+    recording_mbid: str | None = None
+    track_title: str | None = None
+    track_album: str | None = None
+    cover_release_mbid: str | None = None
 
 
 class DigarrClient:
@@ -60,23 +67,30 @@ class DigarrClient:
         """
         merged: dict[int, DigarrRecommendation] = {}
         for kind in PENDING_KINDS:
-            payload = await self._request(
-                "GET",
-                "/api/v1/recommendations",
-                params={
-                    "status": "pending",
-                    "sort": "score_desc",
-                    "limit": str(limit),
-                    "kind": kind,
-                },
-            )
-            for rec in self._parse_items(payload):
+            for rec in await self._get_pending_kind(kind, limit):
                 merged.setdefault(rec.id, rec)
         ranked = sorted(merged.values(), key=lambda rec: rec.score, reverse=True)
         return ranked[:limit]
 
+    async def get_pending_tracks(self, limit: int) -> list[DigarrRecommendation]:
+        """
+        Fetch the highest-scoring pending song recommendations.
+
+        :param limit: Maximum number of recommendations to return.
+        """
+        return [
+            rec
+            for rec in await self._get_pending_kind("track", limit)
+            # Without a title there is nothing to search a provider for.
+            if rec.kind == "track" and rec.track_title
+        ]
+
     async def set_status(
-        self, rec_id: int, status: str, remove_lidarr_artist: bool = False
+        self,
+        rec_id: int,
+        status: str,
+        remove_lidarr_artist: bool = False,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """
         Change a recommendation's status.
@@ -96,11 +110,15 @@ class DigarrClient:
         :param status: The new status, e.g. "approved", "rejected", or "pending".
         :param remove_lidarr_artist: Set only when reverting an approve that already
             added a Lidarr artist and the artist should be removed with it.
+        :param timeout: Total request timeout in seconds, overriding the session default.
         """
         payload: dict[str, Any] = {"status": status}
         if remove_lidarr_artist:
             payload["removeLidarrArtist"] = True
-        result = await self._request("PATCH", f"/api/v1/recommendations/{rec_id}", json=payload)
+        kwargs: dict[str, Any] = {"json": payload}
+        if timeout is not None:
+            kwargs["timeout"] = ClientTimeout(total=timeout)
+        result = await self._request("PATCH", f"/api/v1/recommendations/{rec_id}", **kwargs)
         return result or {}
 
     async def block_artist(self, artist_id: int) -> None:
@@ -155,6 +173,19 @@ class DigarrClient:
         except Exception as err:
             raise DigarrError(f"Could not reach digarr at {self._base}: {err}") from err
 
+    async def _get_pending_kind(self, kind: str, limit: int) -> list[DigarrRecommendation]:
+        payload = await self._request(
+            "GET",
+            "/api/v1/recommendations",
+            params={
+                "status": "pending",
+                "sort": "score_desc",
+                "limit": str(limit),
+                "kind": kind,
+            },
+        )
+        return self._parse_items(payload)
+
     def _parse_items(self, payload: Any) -> list[DigarrRecommendation]:
         """Flatten one recommendations page, dropping records that cannot be used."""
         results: list[DigarrRecommendation] = []
@@ -192,6 +223,10 @@ class DigarrClient:
                     ai_reasoning=raw.get("aiReasoning"),
                     release_group_mbid=raw.get("recommendedReleaseGroupId"),
                     release_group_title=raw.get("recommendedReleaseGroupTitle"),
+                    recording_mbid=raw.get("recommendedRecordingMbid"),
+                    track_title=raw.get("recommendedTrackTitle"),
+                    track_album=raw.get("recommendedTrackAlbum"),
+                    cover_release_mbid=raw.get("recommendedCoverReleaseMbid"),
                 )
             )
         return results

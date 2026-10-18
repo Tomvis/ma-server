@@ -5,12 +5,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ExternalID, ProviderFeature
+from music_assistant_models.enums import ExternalID, MediaType, ProviderFeature
 from music_assistant_models.errors import ProviderUnavailableError
-from music_assistant_models.media_items import Artist
+from music_assistant_models.media_items import Artist, ItemMapping, Track
 
 from music_assistant.providers.digarr.client import DigarrRecommendation
-from music_assistant.providers.digarr.parsers import resolve_artist
+from music_assistant.providers.digarr.parsers import resolve_artist, resolve_track
 
 MBID = "c14b4180-dc87-481e-b17a-64e4150f90f6"
 
@@ -133,3 +133,83 @@ async def test_a_provider_error_does_not_sink_the_whole_resolution(mass: MagicMo
 
     assert resolved is not None
     assert resolved.provider == "ytmusic"
+
+
+def make_track_rec(**overrides) -> DigarrRecommendation:
+    """Build a track recommendation with sensible defaults."""
+    fields = {
+        "kind": "track",
+        "recording_mbid": "rec-mbid",
+        "track_title": "Windowpane",
+        "track_album": "Damnation",
+    }
+    fields.update(overrides)
+    return make_rec(**fields)
+
+
+def make_track(item_id: str, name: str, artist: str, provider: str = "ytmusic") -> Track:
+    """
+    Build a streaming track credited to one artist.
+
+    :param item_id: The track's provider item id.
+    :param name: The track title.
+    :param artist: The credited artist's name.
+    :param provider: The provider the track comes from.
+    """
+    track = Track(item_id=item_id, provider=provider, name=name, provider_mappings=set())
+    track.artists.append(
+        ItemMapping(media_type=MediaType.ARTIST, item_id="a", provider=provider, name=artist)
+    )
+    return track
+
+
+@pytest.fixture
+def track_mass() -> MagicMock:
+    """Return a mass double whose track library and providers both miss by default."""
+    mass = MagicMock()
+    mass.music.tracks.get_library_item_by_external_ids = AsyncMock(return_value=None)
+    mass.music.tracks.search = AsyncMock(return_value=[])
+    provider = make_provider("ytmusic--1")
+    provider.supported_features = {ProviderFeature.LIBRARY_TRACKS}
+    mass.music.providers = [provider]
+    return mass
+
+
+async def test_track_looks_up_the_library_by_recording_mbid(track_mass: MagicMock) -> None:
+    """The recording MBID is the library key, so an owned copy wins over streaming."""
+    owned = Track(item_id="9", provider="library", name="Windowpane", provider_mappings=set())
+    track_mass.music.tracks.get_library_item_by_external_ids = AsyncMock(return_value=owned)
+
+    resolved = await resolve_track(make_track_rec(), track_mass, "digarr--x")
+
+    assert resolved is owned
+    (external_ids,), _ = track_mass.music.tracks.get_library_item_by_external_ids.call_args
+    assert (ExternalID.MB_RECORDING, "rec-mbid") in external_ids
+    track_mass.music.tracks.search.assert_not_called()
+
+
+async def test_track_searches_artist_and_title(track_mass: MagicMock) -> None:
+    """Not owned: search "Artist - Title" on a streaming provider."""
+    hit = make_track("y1", "Windowpane", "Opeth")
+    track_mass.music.tracks.search = AsyncMock(return_value=[hit])
+
+    resolved = await resolve_track(make_track_rec(), track_mass, "digarr--x")
+
+    assert resolved is hit
+    (query, _instance), _ = track_mass.music.tracks.search.call_args
+    assert query == "Opeth - Windowpane"
+
+
+async def test_track_rejects_the_same_title_by_another_artist(track_mass: MagicMock) -> None:
+    """A cover or a namesake song must not stand in for the recommendation."""
+    track_mass.music.tracks.search = AsyncMock(
+        return_value=[make_track("y1", "Windowpane", "Some Cover Band")]
+    )
+
+    assert await resolve_track(make_track_rec(), track_mass, "digarr--x") is None
+
+
+async def test_track_without_a_title_is_not_resolved(track_mass: MagicMock) -> None:
+    """Nothing to search for: no card rather than a guess."""
+    assert await resolve_track(make_track_rec(track_title=None), track_mass, "digarr--x") is None
+    track_mass.music.tracks.search.assert_not_called()

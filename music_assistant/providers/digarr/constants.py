@@ -19,6 +19,7 @@ DEFAULT_URL: Final[str] = "http://digarr:3000"
 # The row's identity. Per-user Discover row preferences (order, hidden) key on the
 # row's derived uri, built from instance_id and this item_id.
 ROW_ID: Final[str] = "up_next"
+ROW_ID_SONGS: Final[str] = "up_next_songs"
 
 # A Discover row is a glance. digarr's own UI remains the full backlog surface.
 ROW_ITEM_TARGET: Final[int] = 10
@@ -32,6 +33,9 @@ SEARCH_CONCURRENCY_LIMIT: Final[int] = 5
 PROVIDER_SEARCH_LIMIT: Final[int] = 2
 # Number of library search hits scanned when checking for an existing copy.
 LIBRARY_MATCH_SCAN_LIMIT: Final[int] = 5
+
+# A song approve blocks on songpick, which waits on Lidarr (digarr allows it 15 min).
+TRACK_APPROVE_TIMEOUT: Final[int] = 16 * 60
 
 CACHE_CATEGORY_RESOLVED_ITEMS: Final[int] = 1
 CACHE_EXPIRATION_SECONDS: Final[int] = 60 * 60 * 24 * 90  # 90 days

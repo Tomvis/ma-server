@@ -306,3 +306,79 @@ async def test_block_artist_sends_the_internal_id(session: FakeSession) -> None:
     assert method == "POST"
     assert url == f"{BASE}/api/v1/artist-blocks"
     assert kwargs["json"] == {"artistId": 101}
+
+
+async def test_get_pending_tracks_requests_tracks_and_parses_the_song(
+    session: FakeSession,
+) -> None:
+    """Track recs are a separate request, carrying the recording and its album."""
+    session.queue(
+        FakeResponse(
+            200,
+            {
+                "items": [
+                    {
+                        "id": 21,
+                        "kind": "track",
+                        "score": 0.9,
+                        "status": "pending",
+                        "recommendedRecordingMbid": "rec-mbid",
+                        "recommendedTrackTitle": "Windowpane",
+                        "recommendedTrackAlbum": "Damnation",
+                        "recommendedCoverReleaseMbid": "rel-mbid",
+                        "artist": {"id": 101, "name": "Opeth", "mbid": "artist-mbid"},
+                    }
+                ]
+            },
+        )
+    )
+    client = DigarrClient(BASE, "k", session)
+
+    recs = await client.get_pending_tracks(limit=15)
+
+    assert session.calls[0][2]["params"] == {
+        "status": "pending",
+        "sort": "score_desc",
+        "limit": "15",
+        "kind": "track",
+    }
+    assert len(recs) == 1
+    assert recs[0].kind == "track"
+    assert recs[0].recording_mbid == "rec-mbid"
+    assert recs[0].track_title == "Windowpane"
+    assert recs[0].track_album == "Damnation"
+    assert recs[0].cover_release_mbid == "rel-mbid"
+
+
+async def test_get_pending_tracks_drops_a_track_with_no_title(session: FakeSession) -> None:
+    """A track rec with no title cannot be searched for, so it never becomes a card."""
+    session.queue(
+        FakeResponse(
+            200,
+            {
+                "items": [
+                    {
+                        "id": 21,
+                        "kind": "track",
+                        "score": 0.9,
+                        "status": "pending",
+                        "artist": {"id": 101, "name": "Opeth", "mbid": "artist-mbid"},
+                    }
+                ]
+            },
+        )
+    )
+    client = DigarrClient(BASE, "k", session)
+
+    assert await client.get_pending_tracks(limit=15) == []
+
+
+async def test_set_status_can_wait_longer_than_the_session_default(session: FakeSession) -> None:
+    """A song approve waits on songpick, which outlasts aiohttp's 300 s default."""
+    session.queue(FakeResponse(200, {"status": "approved"}))
+    client = DigarrClient(BASE, "k", session)
+
+    await client.set_status(21, "approved", timeout=1000)
+
+    _method, _url, kwargs = session.calls[0]
+    assert kwargs["timeout"].total == 1000

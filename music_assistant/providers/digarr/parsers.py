@@ -76,6 +76,41 @@ async def resolve_artist(
     )
 
 
+async def resolve_track(
+    rec: DigarrRecommendation,
+    mass: MusicAssistant,
+    provider_instance_to_skip: str,
+) -> Track | None:
+    """
+    Resolve a digarr song recommendation to a library or streaming-provider Track.
+
+    Matches on the recording MBID in the library first, then searches streaming
+    providers for "Artist - Title", accepting only a hit credited to the same artist.
+
+    :param rec: The digarr track recommendation to resolve.
+    :param mass: MusicAssistant instance for accessing library and providers.
+    :param provider_instance_to_skip: Provider instance to skip (ourselves).
+    """
+    if not rec.track_title:
+        return None
+    external_ids: set[tuple[ExternalID, str]] = set()
+    if rec.recording_mbid:
+        external_ids.add((ExternalID.MB_RECORDING, rec.recording_mbid))
+    item_mapping = ItemMapping(
+        media_type=MediaType.TRACK,
+        item_id="temp",
+        provider=DOMAIN,
+        name=f"{rec.artist_name} - {rec.track_title}",
+        external_ids=external_ids,
+    )
+    return cast(
+        "Track | None",
+        await _resolve_item(
+            item_mapping, mass, provider_instance_to_skip, artist_name=rec.artist_name
+        ),
+    )
+
+
 def _is_matching_result(
     item_mapping: ItemMapping, result: Artist | Album | Track, artist_name: str | None
 ) -> bool:

@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from music_assistant_models.media_items import Artist
+from music_assistant_models.enums import ExternalID
+from music_assistant_models.media_items import Artist, Track
 
 from music_assistant.providers.digarr import DigarrProvider
 from music_assistant.providers.digarr.client import DigarrError, DigarrRecommendation
-from music_assistant.providers.digarr.constants import EVENT_RECOMMENDATIONS_UPDATED, ROW_ID
+from music_assistant.providers.digarr.constants import (
+    EVENT_RECOMMENDATIONS_UPDATED,
+    ROW_ID,
+    ROW_ID_SONGS,
+)
 
 from .conftest import as_user
 
@@ -252,24 +257,6 @@ async def test_recommendation_id_is_none_when_nothing_matches(
     assert provider.recommendation_id_for(artist.uri, artist) is None
 
 
-async def test_track_recommendations_are_skipped(provider: DigarrProvider) -> None:
-    """Track recs never reach resolution, the row items or the id caches."""
-    track = replace(make_rec(rec_id=7), kind="track", artist_mbid="track-artist-mbid")
-    artist = make_rec(rec_id=8)
-    resolved = Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())
-    provider._client.get_pending = AsyncMock(return_value=[track, artist])
-    resolve = AsyncMock(return_value=resolved)
-    with patch("music_assistant.providers.digarr.resolve_artist", resolve):
-        await provider._refresh()
-
-    assert resolve.await_count == 1
-    assert provider._rec_ids == {resolved.uri: 8}
-    assert provider._mbid_rec_ids == {MBID: 8}
-    assert "track-artist-mbid" not in provider._mbid_artist_ids
-    with as_user("tom"):
-        assert list(await provider.get_recommendation_items(ROW_ID)) == [resolved]
-
-
 async def test_track_flood_cannot_empty_the_row(provider: DigarrProvider) -> None:
     """Even if the client hands back tracks outscoring every artist, artists still show."""
     tracks = [replace(make_rec(rec_id=100 + i, score=0.99), kind="track") for i in range(20)]
@@ -278,3 +265,112 @@ async def test_track_flood_cannot_empty_the_row(provider: DigarrProvider) -> Non
     with patch("music_assistant.providers.digarr.resolve_artist", AsyncMock(return_value=resolved)):
         await provider._refresh()
     assert provider._items == [resolved]
+
+
+def make_track_rec(rec_id: int = 7, score: float = 1.0) -> DigarrRecommendation:
+    """Build a pending track recommendation for an artist other than make_rec's."""
+    return replace(
+        make_rec(rec_id=rec_id, score=score),
+        kind="track",
+        artist_id=202,
+        artist_mbid="track-artist-mbid",
+        recording_mbid="rec-mbid",
+        track_title="Windowpane",
+    )
+
+
+def make_track(item_id: str = "yt1") -> Track:
+    """Build a resolved streaming track."""
+    return Track(item_id=item_id, provider="ytmusic", name="Windowpane", provider_mappings=set())
+
+
+async def test_track_recommendations_fill_the_songs_row(provider: DigarrProvider) -> None:
+    """Track recs resolve into their own row and never touch the artist row or ids."""
+    artist = Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())
+    track = make_track()
+    provider._client.get_pending = AsyncMock(return_value=[make_rec(rec_id=8)])
+    provider._client.get_pending_tracks = AsyncMock(return_value=[make_track_rec(rec_id=7)])
+    with (
+        patch("music_assistant.providers.digarr.resolve_artist", AsyncMock(return_value=artist)),
+        patch("music_assistant.providers.digarr.resolve_track", AsyncMock(return_value=track)),
+    ):
+        await provider._refresh()
+
+    assert provider._rec_ids == {artist.uri: 8, track.uri: 7}
+    assert provider._mbid_rec_ids == {MBID: 8}
+    assert provider._recording_rec_ids == {"rec-mbid": 7}
+    assert "track-artist-mbid" not in provider._mbid_artist_ids
+    assert track.uri not in provider._artist_ids
+    with as_user("tom"):
+        rows = await provider.get_recommendations()
+        assert [row.item_id for row in rows] == [ROW_ID, ROW_ID_SONGS]
+        assert list(await provider.get_recommendation_items(ROW_ID)) == [artist]
+        assert list(await provider.get_recommendation_items(ROW_ID_SONGS)) == [track]
+
+
+async def test_songs_row_is_hidden_until_it_has_songs(provider: DigarrProvider) -> None:
+    """A user with no song recs gets no empty second row."""
+    with as_user("tom"):
+        assert [row.item_id for row in await provider.get_recommendations()] == [ROW_ID]
+
+
+async def test_songs_row_is_hidden_from_every_other_user(provider: DigarrProvider) -> None:
+    """The songs row and its items are gated exactly like the artist row."""
+    provider._track_items = [make_track()]
+    with as_user("lera"):
+        assert await provider.get_recommendations() == []
+        assert await provider.get_recommendation_items(ROW_ID_SONGS) == []
+
+
+async def test_a_failed_track_fetch_keeps_the_previous_songs(provider: DigarrProvider) -> None:
+    """Artists still refresh, and the last good songs stay, when only tracks fail."""
+    old = make_track("old")
+    provider._track_items = [old]
+    provider._rec_ids = {old.uri: 5}
+    provider._recording_rec_ids = {"old-rec": 5}
+    artist = Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(return_value=[make_rec(rec_id=8)])
+    provider._client.get_pending_tracks = AsyncMock(side_effect=DigarrError("400"))
+    with patch("music_assistant.providers.digarr.resolve_artist", AsyncMock(return_value=artist)):
+        await provider._refresh()
+
+    assert provider._items == [artist]
+    assert provider._track_items == [old]
+    assert provider._rec_ids == {artist.uri: 8, old.uri: 5}
+    assert provider._recording_rec_ids == {"old-rec": 5}
+
+
+async def test_songs_row_has_its_own_size_cap(provider: DigarrProvider) -> None:
+    """Songs never take slots from artists, and are capped by the same row size."""
+    provider._row_size = 1
+    provider._client.get_pending = AsyncMock(return_value=[])
+    provider._client.get_pending_tracks = AsyncMock(
+        return_value=[make_track_rec(rec_id=1), make_track_rec(rec_id=2)]
+    )
+    resolve = AsyncMock(side_effect=[make_track("a"), make_track("b")])
+    with patch("music_assistant.providers.digarr.resolve_track", resolve):
+        await provider._refresh()
+    assert [t.item_id for t in provider._track_items] == ["a"]
+
+
+async def test_song_min_score_filters_low_confidence_tracks(provider: DigarrProvider) -> None:
+    """The score floor applies to songs too."""
+    provider._min_score = 0.9
+    provider._client.get_pending = AsyncMock(return_value=[])
+    provider._client.get_pending_tracks = AsyncMock(
+        return_value=[make_track_rec(rec_id=1, score=0.5), make_track_rec(rec_id=2, score=1.0)]
+    )
+    resolve = AsyncMock(return_value=make_track())
+    with patch("music_assistant.providers.digarr.resolve_track", resolve):
+        await provider._refresh()
+    assert resolve.await_count == 1
+
+
+async def test_track_recommendation_id_falls_back_to_the_recording_mbid(
+    provider: DigarrProvider,
+) -> None:
+    """A rotated track uri still maps back via its MusicBrainz recording id."""
+    track = make_track("rotated")
+    track.external_ids.add((ExternalID.MB_RECORDING, "rec-mbid"))
+    provider._recording_rec_ids = {"rec-mbid": 7}
+    assert provider.recommendation_id_for(track.uri, track) == 7

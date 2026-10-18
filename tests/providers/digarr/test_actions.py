@@ -7,9 +7,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from music_assistant_models.auth import Scope
 from music_assistant_models.errors import InsufficientPermissions, InvalidDataError
-from music_assistant_models.media_items import Artist
+from music_assistant_models.media_items import Artist, Track
 
 from music_assistant.providers.digarr.client import DigarrError
+from music_assistant.providers.digarr.constants import TRACK_APPROVE_TIMEOUT
 
 from .conftest import as_user
 
@@ -223,3 +224,82 @@ async def test_does_not_warn_when_ma_user_matches_a_known_account(provider) -> N
     await provider.loaded_in_mass()
 
     provider.logger.warning.assert_not_called()
+
+
+def track_provider(provider) -> Track:
+    """Point the provider at one tracked song recommendation (rec id 7) and return it."""
+    track = Track(item_id="yt1", provider="ytmusic", name="Windowpane", provider_mappings=set())
+    provider.mass.music.get_item_by_uri = AsyncMock(return_value=track)
+    provider._rec_ids = {track.uri: 7}
+    provider._track_items = [track]
+    provider._refresh = AsyncMock()
+    return track
+
+
+async def test_approve_a_song_waits_for_songpick(provider) -> None:
+    """A song approve gets the long timeout; artist approves keep the default."""
+    track = track_provider(provider)
+    provider._client.set_status = AsyncMock(return_value={"status": "approved"})
+
+    result = await provider.approve(track.uri)
+
+    provider._client.set_status.assert_awaited_once_with(
+        7, "approved", timeout=TRACK_APPROVE_TIMEOUT
+    )
+    assert result["status"] == "approved"
+    assert result["artist"] == "Windowpane"
+
+
+async def test_approve_an_owned_song_reports_duplicate(provider) -> None:
+    """Songpick finding the song owned is a result, not an error."""
+    track = track_provider(provider)
+    provider._client.set_status = AsyncMock(return_value={"status": "duplicate"})
+
+    result = await provider.approve(track.uri)
+
+    assert result["status"] == "duplicate"
+
+
+async def test_a_failed_song_add_raises_songpicks_reason(provider) -> None:
+    """add_failed surfaces as an error toast carrying songpick's own text."""
+    track = track_provider(provider)
+    provider._client.set_status = AsyncMock(
+        return_value={"status": "add_failed", "lidarrError": "no studio album has this song"}
+    )
+
+    with pytest.raises(DigarrError, match="no studio album has this song"):
+        await provider.approve(track.uri)
+    provider._refresh.assert_awaited_once()
+
+
+async def test_undo_a_song_never_asks_to_remove_the_artist(provider) -> None:
+    """Undoing a song is a status flip; the artist may hold other music in Lidarr."""
+    track = track_provider(provider)
+    provider._client.set_status = AsyncMock(return_value={"status": "pending"})
+
+    await provider.undo(track.uri)
+
+    provider._client.set_status.assert_awaited_once_with(7, "pending")
+
+
+async def test_reject_a_song_sets_rejected(provider) -> None:
+    """Rejecting a song is a plain status change."""
+    track = track_provider(provider)
+    provider._client.set_status = AsyncMock(return_value={"status": "rejected"})
+
+    await provider.reject(track.uri)
+
+    provider._client.set_status.assert_awaited_once_with(7, "rejected")
+
+
+async def test_block_refuses_a_song(provider) -> None:
+    """Rejecting one song must never block its whole artist."""
+    track = track_provider(provider)
+    provider._artist_ids = {track.uri: 202}
+    provider._client.set_status = AsyncMock()
+    provider._client.block_artist = AsyncMock()
+
+    with pytest.raises(InvalidDataError):
+        await provider.block(track.uri)
+    provider._client.block_artist.assert_not_awaited()
+    provider._client.set_status.assert_not_awaited()

@@ -1349,6 +1349,7 @@
   "provider.digarr.config_entries.url.label": "digarr URL",
   "provider.digarr.manifest.description": "Surfaces your digarr recommendations on Discover, so you can hear an artist before approving it into Lidarr.",
   "provider.digarr.media.recommendations.up_next.name": "digarr — Up Next",
+  "provider.digarr.media.recommendations.up_next_songs.name": "digarr — Songs",
   "provider.digitally_incorporated.config_entries.enabled_networks.description": "Select which networks to enable",
   "provider.digitally_incorporated.config_entries.enabled_networks.label": "Enabled Networks",
   "provider.digitally_incorporated.config_entries.listen_key.description": "Your premium listen key. Get this from your account settings.",

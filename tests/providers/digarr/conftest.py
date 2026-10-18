@@ -6,7 +6,7 @@ import json as jsonlib
 from collections.abc import Generator
 from contextlib import AbstractContextManager
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.enums import ProviderType
@@ -155,6 +155,7 @@ def provider() -> Generator[DigarrProvider]:
     prov = DigarrProvider(mass, manifest, config, SUPPORTED_FEATURES)
     prov._items = []
     prov._rec_ids = {}
+    prov._client.get_pending_tracks = AsyncMock(return_value=[])  # type: ignore[method-assign]
     with as_user("tom"):
         yield prov
 
