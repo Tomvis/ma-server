@@ -3,7 +3,7 @@ Lidarr Plugin Provider implementation.
 
 "Add to Lidarr" sends an album straight to Lidarr's API (see ``lidarr_add``). It used
 to hand albums to music-rater, which retired its Lidarr subsystem (MEDIA-1). On a track
-it wants just that track of its album (MUSIC-76).
+it asks the song-pick service (``song_pick``, MUSIC-115) to want the song in its best edition.
 
 Each add goes into the acting Music Assistant user's own Lidarr root folder, mapped
 per user on the options page; the artist gets that root folder's default profiles.
@@ -30,15 +30,13 @@ from music_assistant.providers.lidarr.constants import (
     CONF_ACTION_TEST,
     CONF_API_KEY,
     CONF_ROOT_FOLDER_PREFIX,
+    CONF_SONG_PICK_URL,
     CONF_URL,
     CONF_VERIFY_SSL,
+    DEFAULT_SONG_PICK_URL,
 )
-from music_assistant.providers.lidarr.lidarr_add import (
-    AlbumRequest,
-    TrackRequest,
-    add_album,
-    add_track,
-)
+from music_assistant.providers.lidarr.lidarr_add import AlbumRequest, add_album
+from music_assistant.providers.lidarr.song_pick import want_song
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -124,6 +122,12 @@ class LidarrProvider(PluginProvider):
             ),
             ConfigEntry(key=CONF_API_KEY, type=ConfigEntryType.SECURE_STRING, required=False),
             *user_entries,
+            ConfigEntry(
+                key=CONF_SONG_PICK_URL,
+                type=ConfigEntryType.STRING,
+                required=False,
+                default_value=DEFAULT_SONG_PICK_URL,
+            ),
             ConfigEntry(
                 key=CONF_VERIFY_SSL,
                 type=ConfigEntryType.BOOLEAN,
@@ -254,7 +258,7 @@ class LidarrProvider(PluginProvider):
 
     async def add_track(self, item: str) -> dict[str, Any]:
         """
-        Want one track (an MA URI) in Lidarr, adding its artist and album as needed.
+        Want one track (an MA URI) in Lidarr via the song-pick service, which chooses the edition.
 
         Returns the frontend's LidarrAddTrackResult shape.
         """
@@ -270,19 +274,32 @@ class LidarrProvider(PluginProvider):
         if track.album is None:
             raise InvalidDataError(f"Track {track.name!r} isn't on an album Lidarr could fetch")
         album = await self.mass.music.albums.get(track.album.item_id, track.album.provider)
-        result = await add_track(
-            self._client,
-            TrackRequest(
-                album=await self._album_request(album, album.uri or item),
-                track_name=track.name,
-                recording_mbid=track.get_external_id(ExternalID.MB_RECORDING),
-                disc_number=track.disc_number or None,
-                track_number=track.track_number or None,
-            ),
-            root_folder=root_folder,
-            logger=self.logger,
+        album_req = await self._album_request(album, album.uri or item)
+        isrc = next(
+            (value for kind, value in sorted(track.external_ids) if kind == ExternalID.ISRC),
+            None,
         )
-        return {**result, "lidarr_instance": self._host_port() or self.name}
+        reply = await want_song(
+            self.mass.http_session,
+            str(self.config.get_value(CONF_SONG_PICK_URL) or DEFAULT_SONG_PICK_URL),
+            {
+                "root_folder": root_folder,
+                "artist_mbid": album_req.artist_mbid,
+                "artist_name": album_req.artist_name,
+                "track_name": track.name,
+                "recording_mbid": track.get_external_id(ExternalID.MB_RECORDING),
+                "isrc": isrc,
+                "album_rg_mbid": album_req.release_group_mbid,
+            },
+        )
+        return {
+            "artist_name": reply.get("artist_name") or album_req.artist_name,
+            "album_name": reply.get("album_name") or album_req.album_name,
+            "track_name": reply.get("track_name") or track.name,
+            "artist_added": bool(reply.get("artist_added")),
+            "already_wanted": reply.get("status") in ("owned", "already_wanted"),
+            "lidarr_instance": self._host_port() or self.name,
+        }
 
     # ----- helpers -----
 

@@ -29,10 +29,10 @@ from music_assistant.providers.lidarr.client import LidarrError
 from music_assistant.providers.lidarr.constants import (
     CONF_API_KEY,
     CONF_ROOT_FOLDER_PREFIX,
+    CONF_SONG_PICK_URL,
     CONF_URL,
     CONF_VERIFY_SSL,
 )
-from music_assistant.providers.lidarr.lidarr_add import AlbumRequest, TrackRequest
 from music_assistant.providers.lidarr.provider import LidarrProvider
 
 if TYPE_CHECKING:
@@ -494,8 +494,63 @@ def _track_and_album() -> tuple[Track, Album]:
     return track, album
 
 
-async def test_add_track_wants_the_track_on_its_full_album(mass_minimal: MusicAssistant) -> None:
-    """The track's album is fetched in full and sent with the track's identifiers."""
+async def test_add_track_delegates_to_song_pick(mass_minimal: MusicAssistant) -> None:
+    """The track's album is fetched in full; the service gets the track's identifiers."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={
+            CONF_URL: "http://lidarr",
+            CONF_SONG_PICK_URL: "http://pick:9394",
+            f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom",
+        },
+    )
+    track, album = _track_and_album()
+    track.external_ids.update({(ExternalID.ISRC, "ISRC1")})
+    music = MagicMock()
+    music.get_item_by_uri = AsyncMock(return_value=track)
+    music.albums.get = AsyncMock(return_value=album)
+    reply = {
+        "status": "owned",
+        "artist_name": "Opeth",
+        "album_name": "Blackwater Park (DR12)",
+        "track_name": "Bleak",
+        "artist_added": True,
+    }
+    pick = AsyncMock(return_value=reply)
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="tom"),
+        ),
+        patch.object(mass_minimal, "music", music, create=True),
+        patch("music_assistant.providers.lidarr.provider.want_song", pick),
+    ):
+        result = await provider.add_track("tidal--x://track/5")
+
+    music.albums.get.assert_awaited_once_with("77", "tidal--x")
+    assert pick.await_args is not None
+    assert pick.await_args.args[1] == "http://pick:9394"
+    assert pick.await_args.args[2] == {
+        "root_folder": "/music/tom",
+        "artist_mbid": "opeth-mbid",
+        "artist_name": "Opeth",
+        "track_name": "Bleak",
+        "recording_mbid": "rec-mbid",
+        "isrc": "ISRC1",
+        "album_rg_mbid": "rg-mbid",
+    }
+    assert result == {
+        "artist_name": "Opeth",
+        "album_name": "Blackwater Park (DR12)",
+        "track_name": "Bleak",
+        "artist_added": True,
+        "already_wanted": True,
+        "lidarr_instance": "lidarr",
+    }
+
+
+async def test_add_track_without_isrc_sends_null(mass_minimal: MusicAssistant) -> None:
+    """No ISRC external id -> isrc None; default service URL when unconfigured."""
     provider = await _load_provider(
         mass_minimal,
         values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}tom": "/music/tom"},
@@ -504,35 +559,20 @@ async def test_add_track_wants_the_track_on_its_full_album(mass_minimal: MusicAs
     music = MagicMock()
     music.get_item_by_uri = AsyncMock(return_value=track)
     music.albums.get = AsyncMock(return_value=album)
-    flow = AsyncMock(return_value={"track_name": "Bleak"})
+    pick = AsyncMock(return_value={"status": "wanted", "track_name": "Bleak"})
     with (
         patch(
             "music_assistant.providers.lidarr.provider.get_current_user",
             return_value=MagicMock(username="tom"),
         ),
         patch.object(mass_minimal, "music", music, create=True),
-        patch("music_assistant.providers.lidarr.provider.add_track", flow),
+        patch("music_assistant.providers.lidarr.provider.want_song", pick),
     ):
         result = await provider.add_track("tidal--x://track/5")
-
-    music.albums.get.assert_awaited_once_with("77", "tidal--x")
-    assert flow.await_args is not None
-    request = flow.await_args.args[1]
-    assert request == TrackRequest(
-        album=AlbumRequest(
-            artist_mbid="opeth-mbid",
-            artist_name="Opeth",
-            album_name="Blackwater Park",
-            release_group_mbid="rg-mbid",
-            release_mbid=None,
-        ),
-        track_name="Bleak",
-        recording_mbid="rec-mbid",
-        disc_number=1,
-        track_number=2,
-    )
-    assert flow.await_args.kwargs["root_folder"] == "/music/tom"
-    assert result == {"track_name": "Bleak", "lidarr_instance": "lidarr"}
+    assert pick.await_args is not None
+    assert pick.await_args.args[1] == "http://10.0.0.101:9394"
+    assert pick.await_args.args[2]["isrc"] is None
+    assert result["already_wanted"] is False
 
 
 async def test_add_track_refuses_an_album(mass_minimal: MusicAssistant) -> None:

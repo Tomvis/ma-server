@@ -15,6 +15,10 @@
       "label": "Root folder for {0}",
       "description": "Where artists {0} adds to Lidarr are stored. Artists already in Lidarr stay where they are."
     },
+    "song_pick_url": {
+      "label": "Song pick service URL",
+      "description": "beets-lidarr song pick service used by 'Add to Lidarr' on a track, e.g. http://10.0.0.101:9394"
+    },
     "verify_ssl": {
       "label": "Verify SSL"
     },
