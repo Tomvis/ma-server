@@ -790,7 +790,9 @@ class DigarrProvider(PluginProvider):
             candidates = [
                 rec
                 for rec in await self._client.get_pending(limit=RESOLUTION_BUFFER)
-                if rec.score >= self._min_score
+                # Track recommendations carry the track's artist but are not artist
+                # cards; skip them until the row can render tracks (MUSIC-114).
+                if rec.kind != "track" and rec.score >= self._min_score
             ]
         except DigarrError as err:
             self.logger.warning("digarr: could not fetch pending recommendations: %s", err)

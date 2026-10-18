@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from music_assistant_models.media_items import Artist
@@ -249,3 +250,21 @@ async def test_recommendation_id_is_none_when_nothing_matches(
         provider_mappings=set(),
     )
     assert provider.recommendation_id_for(artist.uri, artist) is None
+
+
+async def test_track_recommendations_are_skipped(provider: DigarrProvider) -> None:
+    """Track recs never reach resolution, the row items or the id caches."""
+    track = replace(make_rec(rec_id=7), kind="track", artist_mbid="track-artist-mbid")
+    artist = make_rec(rec_id=8)
+    resolved = Artist(item_id="y", provider="ytmusic", name="Opeth", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(return_value=[track, artist])
+    resolve = AsyncMock(return_value=resolved)
+    with patch("music_assistant.providers.digarr.resolve_artist", resolve):
+        await provider._refresh()
+
+    assert resolve.await_count == 1
+    assert provider._rec_ids == {resolved.uri: 8}
+    assert provider._mbid_rec_ids == {MBID: 8}
+    assert "track-artist-mbid" not in provider._mbid_artist_ids
+    with as_user("tom"):
+        assert list(await provider.get_recommendation_items(ROW_ID)) == [resolved]
