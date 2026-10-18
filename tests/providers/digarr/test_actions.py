@@ -303,3 +303,37 @@ async def test_block_refuses_a_song(provider) -> None:
         await provider.block(track.uri)
     provider._client.block_artist.assert_not_awaited()
     provider._client.set_status.assert_not_awaited()
+
+
+async def test_undo_still_resolves_after_the_approve_refresh_dropped_it(provider) -> None:
+    """The approve refresh drops the now-approved rec; the toast's Undo must still find it."""
+    track = track_provider(provider)
+
+    async def refresh_without_it() -> None:
+        provider._rec_ids = {}
+        provider._recording_rec_ids = {}
+
+    provider._refresh = AsyncMock(side_effect=refresh_without_it)
+    provider._client.set_status = AsyncMock(return_value={"status": "approved"})
+    await provider.approve(track.uri)
+
+    provider._client.set_status = AsyncMock(return_value={"status": "pending"})
+    await provider.undo(track.uri)
+
+    provider._client.set_status.assert_awaited_once_with(7, "pending")
+
+
+async def test_an_acted_rec_cannot_be_approved_again(provider) -> None:
+    """Only undo may use the acted fallback: a second approve must not re-send the song."""
+    track = track_provider(provider)
+
+    async def refresh_without_it() -> None:
+        provider._rec_ids = {}
+
+    provider._refresh = AsyncMock(side_effect=refresh_without_it)
+    provider._client.set_status = AsyncMock(return_value={"status": "approved"})
+    await provider.approve(track.uri)
+
+    with pytest.raises(InvalidDataError):
+        await provider.approve(track.uri)
+    provider._client.set_status.assert_awaited_once()

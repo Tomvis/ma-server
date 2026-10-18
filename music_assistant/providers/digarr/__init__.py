@@ -29,6 +29,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import get_cu
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.digarr.client import DigarrClient, DigarrError
 from music_assistant.providers.digarr.constants import (
+    APPROVED_REC_MEMORY,
     CACHE_CATEGORY_RESOLVED_ITEMS,
     CONF_ACTION_CLEAR_CACHE,
     CONF_ACTION_TEST,
@@ -203,6 +204,9 @@ class DigarrProvider(PluginProvider):
         # a rotated track uri falls back to its MusicBrainz recording id instead.
         self._track_items: list[Track] = []
         self._recording_rec_ids: dict[str, int] = {}
+        # uri -> rec id of recently approved recs. The post-approve refresh drops them
+        # from the pending maps above, so only undo looks here.
+        self._approved_rec_ids: dict[str, int] = {}
         # Initialized here (not in handle_async_init) so loaded_in_mass can append to it
         # even if it is ever invoked before handle_async_init has run.
         self._unregister_handles: list[Callable[[], None]] = []
@@ -730,7 +734,7 @@ class DigarrProvider(PluginProvider):
 
         :param item: The resolved item's MA uri, as sent by the frontend action.
         """
-        return await self._act(item, "pending", remove_lidarr_artist=True)
+        return await self._act(item, "pending", remove_lidarr_artist=True, allow_approved=True)
 
     def _config_or_setup_value(self, key: str, default: ConfigValueType = None) -> ConfigValueType:
         """
@@ -965,7 +969,9 @@ class DigarrProvider(PluginProvider):
         user = get_current_user()
         return user is not None and user.username == self._ma_user
 
-    async def _resolve_recommendation(self, uri: str) -> tuple[Artist | Track | ItemMapping, int]:
+    async def _resolve_recommendation(
+        self, uri: str, *, allow_approved: bool = False
+    ) -> tuple[Artist | Track | ItemMapping, int]:
         """
         Resolve an MA uri to the digarr recommendation id it maps to, gated to the bound user.
 
@@ -982,6 +988,8 @@ class DigarrProvider(PluginProvider):
         a real download, not a cosmetic mistake.
 
         :param uri: The resolved item's MA uri, as sent by the frontend action.
+        :param allow_approved: Also resolve a rec approved from this instance since
+            it left the pending row (undo only).
         """
         if not self._viewer_is_bound_user():
             raise InsufficientPermissions(
@@ -989,12 +997,19 @@ class DigarrProvider(PluginProvider):
             )
         item = await self.mass.music.get_item_by_uri(uri)
         rec_id = self.recommendation_id_for(uri, item)
+        if rec_id is None and allow_approved:
+            rec_id = self._approved_rec_ids.get(uri)
         if rec_id is None:
             raise InvalidDataError(f"{uri} is not a tracked digarr recommendation")
         return item, rec_id
 
     async def _act(
-        self, uri: str, status: str, *, remove_lidarr_artist: bool = False
+        self,
+        uri: str,
+        status: str,
+        *,
+        remove_lidarr_artist: bool = False,
+        allow_approved: bool = False,
     ) -> dict[str, Any]:
         """
         Apply a status change to the recommendation ``uri`` maps to, then refresh the row.
@@ -1011,8 +1026,9 @@ class DigarrProvider(PluginProvider):
         :param uri: The resolved item's MA uri, as sent by the frontend action.
         :param status: The new digarr status: "approved", "rejected", or "pending".
         :param remove_lidarr_artist: Forwarded to ``set_status`` only when True.
+        :param allow_approved: Resolve a rec approved earlier from this instance too.
         """
-        item, rec_id = await self._resolve_recommendation(uri)
+        item, rec_id = await self._resolve_recommendation(uri, allow_approved=allow_approved)
         is_track = item.media_type == MediaType.TRACK
         kwargs: dict[str, Any] = {}
         if remove_lidarr_artist and not is_track:
@@ -1020,6 +1036,12 @@ class DigarrProvider(PluginProvider):
         if is_track and status == "approved":
             kwargs["timeout"] = TRACK_APPROVE_TIMEOUT
         result = await self._client.set_status(rec_id, status, **kwargs)
+        self._approved_rec_ids.pop(uri, None)
+        if result.get("status", status) == "approved":
+            self._approved_rec_ids[uri] = rec_id
+            # Undo is only offered on a short-lived toast; keep the map small.
+            while len(self._approved_rec_ids) > APPROVED_REC_MEMORY:
+                del self._approved_rec_ids[next(iter(self._approved_rec_ids))]
         await self._refresh()
         if result.get("status") == "add_failed":
             # digarr records the failure on the rec and answers 200; the caller's

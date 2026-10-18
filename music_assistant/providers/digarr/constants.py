@@ -36,6 +36,8 @@ LIBRARY_MATCH_SCAN_LIMIT: Final[int] = 5
 
 # A song approve blocks on songpick, which waits on Lidarr (digarr allows it 15 min).
 TRACK_APPROVE_TIMEOUT: Final[int] = 16 * 60
+# Recently approved recs kept resolvable for the success toast's Undo.
+APPROVED_REC_MEMORY: Final[int] = 50
 
 CACHE_CATEGORY_RESOLVED_ITEMS: Final[int] = 1
 CACHE_EXPIRATION_SECONDS: Final[int] = 60 * 60 * 24 * 90  # 90 days
