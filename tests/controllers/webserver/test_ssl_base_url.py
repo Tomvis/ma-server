@@ -31,8 +31,16 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module")
 def self_signed_cert() -> tuple[str, str]:
     """Return a self-signed certificate and its private key, as PEM content."""
+    return _make_self_signed_cert(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+
+
+def _make_self_signed_cert(subject: x509.Name) -> tuple[str, str]:
+    """
+    Return a self-signed certificate for the given subject and its private key, as PEM content.
+
+    :param subject: Subject (and issuer) name of the certificate.
+    """
     private_key = ec.generate_private_key(ec.SECP256R1())
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     now = utc()
     cert = (
         x509.CertificateBuilder()
@@ -170,6 +178,30 @@ async def test_verify_ssl_action_reports_the_certificate_info(
     assert "Subject: CN=localhost" in result.message
     # computed details, so there is nothing to look up in a strings.json
     assert result.translation_key is None
+
+
+async def test_verify_ssl_action_reports_a_multi_part_subject_in_openssl3_form(
+    mock_mass: MagicMock, tmp_path: Path
+) -> None:
+    """The subject reads the same whichever openssl build is on the PATH."""
+    certificate, private_key = _make_self_signed_cert(
+        x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "IL"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Home Lab"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+            ]
+        )
+    )
+    webserver, _ = await _setup_webserver(
+        mock_mass, tmp_path, certificate=certificate, private_key=private_key
+    )
+
+    result = await webserver.handle_config_action(CONF_ACTION_VERIFY_SSL)
+
+    assert isinstance(result, ConfigActionResult)
+    assert result.message is not None
+    assert "Subject: C=IL, O=Home Lab, CN=localhost" in result.message
 
 
 async def test_verify_ssl_action_raises_for_an_unusable_certificate(

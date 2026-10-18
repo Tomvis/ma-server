@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import aiofiles
+from cryptography import x509
 
 from music_assistant.helpers.process import get_subprocess_env
 
@@ -284,12 +285,12 @@ async def _get_certificate_details(cert_path: str) -> SSLCertificateInfo:
 
     # Parse certificate info
     expiry = ""
-    subject = ""
     for line in result.stdout.strip().split("\n"):
         if line.startswith("notAfter="):
             expiry = line.replace("notAfter=", "")
-        elif line.startswith("subject="):
-            subject = line.replace("subject=", "")
+
+    # read the subject ourselves: LibreSSL prints it in the legacy "/K=V/K=V" form
+    subject = await asyncio.to_thread(_read_certificate_subject, cert_path)
 
     # Check expiry status
     expiry_check = await asyncio.to_thread(
@@ -323,6 +324,16 @@ async def _get_certificate_details(cert_path: str) -> SSLCertificateInfo:
         is_expired=is_expired,
         is_expiring_soon=is_expiring_soon,
     )
+
+
+def _read_certificate_subject(cert_path: str) -> str:
+    """
+    Return the certificate subject in the form OpenSSL 3 prints it (e.g. "C=IL, O=Org, CN=host").
+
+    :param cert_path: Path to the certificate file.
+    """
+    cert = x509.load_pem_x509_certificate(Path(cert_path).read_bytes())
+    return ", ".join(f"{attr.rfc4514_attribute_name}={attr.value!s}" for attr in cert.subject)
 
 
 def _format_ssl_error(e: ssl.SSLError) -> str:
