@@ -69,7 +69,7 @@ SUPPORTED_FEATURES: set[ProviderFeature] = {
 }
 
 
-def mbid_of(item: MediaItemType | ItemMapping) -> str | None:
+def mbid_of(item: MediaItemType | ItemMapping | BrowseFolder) -> str | None:
     """
     Return an item's MusicBrainz artist id, if it has one.
 
@@ -644,7 +644,9 @@ class DigarrProvider(PluginProvider):
             return UniqueList(self._track_items)
         return UniqueList()
 
-    def recommendation_id_for(self, uri: str, item: MediaItemType | ItemMapping) -> int | None:
+    def recommendation_id_for(
+        self, uri: str, item: MediaItemType | ItemMapping | BrowseFolder
+    ) -> int | None:
         """
         Map a resolved item back to the digarr recommendation id it came from.
 
@@ -971,7 +973,7 @@ class DigarrProvider(PluginProvider):
 
     async def _resolve_recommendation(
         self, uri: str, *, allow_approved: bool = False
-    ) -> tuple[MediaItemType | ItemMapping, int]:
+    ) -> tuple[MediaItemType | ItemMapping | BrowseFolder, int]:
         """
         Resolve an MA uri to the digarr recommendation id it maps to, gated to the bound user.
 
@@ -1049,7 +1051,9 @@ class DigarrProvider(PluginProvider):
             raise DigarrError(result.get("lidarrError") or f"digarr could not add {item.name}")
         return self._build_result(item, status, result)
 
-    def _artist_id_for(self, uri: str, item: MediaItemType | ItemMapping) -> int | None:
+    def _artist_id_for(
+        self, uri: str, item: MediaItemType | ItemMapping | BrowseFolder
+    ) -> int | None:
         """
         Map a resolved item back to digarr's internal artist id for its recommendation.
 
@@ -1070,7 +1074,7 @@ class DigarrProvider(PluginProvider):
 
     @staticmethod
     def _build_result(
-        item: MediaItemType | ItemMapping, status: str, result: dict[str, Any]
+        item: MediaItemType | ItemMapping | BrowseFolder, status: str, result: dict[str, Any]
     ) -> dict[str, Any]:
         """
         Map a client response to the frontend's approve/reject/block/undo result shape.
