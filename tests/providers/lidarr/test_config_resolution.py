@@ -379,7 +379,7 @@ async def test_add_album_uses_the_acting_users_root_folder(mass_minimal: MusicAs
         "music_assistant.providers.lidarr.provider.get_current_user",
         return_value=MagicMock(username="lera"),
     ):
-        assert provider._root_folder_for_current_user() == "/music/lera"
+        assert provider._root_folder_for_current_user() == ("lera", "/music/lera")
 
 
 async def test_add_album_refuses_a_user_without_a_mapping(mass_minimal: MusicAssistant) -> None:
@@ -722,3 +722,68 @@ async def test_add_track_va_without_a_resolvable_track_artist_fails(
     provider._artist_mbid_by_name = AsyncMock(return_value=None)  # type: ignore[method-assign]
     with pytest.raises(LidarrError, match="Opeth"):
         await _add_va_track(mass_minimal, track, album, provider)
+
+
+async def test_add_track_logs_the_acting_user(
+    mass_minimal: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every add names who asked for it (MUSIC-125: attribution of adds)."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}lera": "/music/lera"},
+    )
+    track, album = _track_and_album()
+    music = MagicMock()
+    music.get_item_by_uri = AsyncMock(return_value=track)
+    music.albums.get = AsyncMock(return_value=album)
+    pick = AsyncMock(return_value={"status": "wanted", "album_name": "Blackwater Park"})
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="lera"),
+        ),
+        patch.object(mass_minimal, "music", music, create=True),
+        patch("music_assistant.providers.lidarr.provider.want_song", pick),
+        caplog.at_level("INFO"),
+    ):
+        await provider.add_track("tidal--x://track/5")
+
+    assert "Lidarr add_track by lera: 'Opeth' - 'Bleak' (Blackwater Park) -> wanted" in (
+        caplog.text
+    )
+
+
+async def test_add_album_logs_the_acting_user(
+    mass_minimal: MusicAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every add names who asked for it (MUSIC-125: attribution of adds)."""
+    provider = await _load_provider(
+        mass_minimal,
+        values={CONF_URL: "http://lidarr", f"{CONF_ROOT_FOLDER_PREFIX}lera": "/music/lera"},
+    )
+    _, album = _track_and_album()
+    music = MagicMock()
+    music.get_item_by_uri = AsyncMock(return_value=album)
+    added = AsyncMock(
+        return_value={
+            "artist_name": "Opeth",
+            "album_name": "Blackwater Park",
+            "artist_added": False,
+            "album_monitored": True,
+            "already_monitored": False,
+        }
+    )
+    with (
+        patch(
+            "music_assistant.providers.lidarr.provider.get_current_user",
+            return_value=MagicMock(username="lera"),
+        ),
+        patch.object(mass_minimal, "music", music, create=True),
+        patch("music_assistant.providers.lidarr.provider.add_album", added),
+        caplog.at_level("INFO"),
+    ):
+        await provider.add_album("tidal--x://album/77")
+
+    assert added.await_args is not None
+    assert added.await_args.kwargs["root_folder"] == "/music/lera"
+    assert "Lidarr add_album by lera: 'Opeth' - 'Blackwater Park' -> monitored" in caplog.text

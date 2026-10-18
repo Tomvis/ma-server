@@ -246,7 +246,7 @@ class LidarrProvider(PluginProvider):
 
         Returns the frontend's LidarrAddAlbumResult shape.
         """
-        root_folder = self._root_folder_for_current_user()
+        username, root_folder = self._root_folder_for_current_user()
         media_item = await self.mass.music.get_item_by_uri(item)
         if media_item.media_type != MediaType.ALBUM:
             raise InvalidDataError(
@@ -258,6 +258,14 @@ class LidarrProvider(PluginProvider):
             root_folder=root_folder,
             logger=self.logger,
         )
+        self.logger.info(
+            "Lidarr add_album by %s: %r - %r -> %s%s",
+            username,
+            result["artist_name"],
+            result["album_name"],
+            "already monitored" if result["already_monitored"] else "monitored",
+            " (new artist)" if result["artist_added"] else "",
+        )
         return {**result, "lidarr_instance": self._host_port() or self.name}
 
     async def add_track(self, item: str) -> dict[str, Any]:
@@ -266,7 +274,7 @@ class LidarrProvider(PluginProvider):
 
         Returns the frontend's LidarrAddTrackResult shape.
         """
-        root_folder = self._root_folder_for_current_user()
+        username, root_folder = self._root_folder_for_current_user()
         media_item = await self.mass.music.get_item_by_uri(item)
         if media_item.media_type != MediaType.TRACK:
             raise InvalidDataError(
@@ -310,6 +318,15 @@ class LidarrProvider(PluginProvider):
                 "album_rg_mbid": release_group_mbid,
             },
         )
+        self.logger.info(
+            "Lidarr add_track by %s: %r - %r (%s) -> %s%s",
+            username,
+            reply.get("artist_name") or artist_name,
+            reply.get("track_name") or track.name,
+            reply.get("album_name") or album_name,
+            reply.get("status"),
+            " (new artist)" if reply.get("artist_added") else "",
+        )
         return {
             "artist_name": reply.get("artist_name") or artist_name,
             "album_name": reply.get("album_name") or album_name,
@@ -321,8 +338,8 @@ class LidarrProvider(PluginProvider):
 
     # ----- helpers -----
 
-    def _root_folder_for_current_user(self) -> str:
-        """Return the acting user's mapped Lidarr root folder, or raise a fixable error."""
+    def _root_folder_for_current_user(self) -> tuple[str, str]:
+        """Return (acting username, their mapped Lidarr root folder), or raise a fixable error."""
         user = get_current_user()
         if user is None:
             raise LidarrError("'Add to Lidarr' needs a signed-in Music Assistant user")
@@ -336,7 +353,7 @@ class LidarrProvider(PluginProvider):
                 f"No Lidarr root folder is set for {user.username!r}; pick one on the "
                 "Lidarr provider's options page."
             )
-        return str(root)
+        return user.username, str(root)
 
     async def _album_request(self, album: Album, item: str) -> AlbumRequest:
         """
