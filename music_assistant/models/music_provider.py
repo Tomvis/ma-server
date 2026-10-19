@@ -7,6 +7,7 @@ import logging
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -1472,6 +1473,10 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         """
         controller = cast("MediaControllerBase[ItemT]", self.mass.music.get_controller(media_type))
         stored = await controller.get_library_item(db_id)
+        # a copy with its own mapping set: the provider may hand out (and later refresh the
+        # library from) this very object, which must not gain the stored siblings below
+        prov_item = copy(prov_item)
+        prov_item.provider_mappings = set(prov_item.provider_mappings)
         for prov_map in prov_item.provider_mappings:
             prov_map.in_library = True
         # the library item can merge several of this provider's items (one recording on two
