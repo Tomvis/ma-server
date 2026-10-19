@@ -310,6 +310,7 @@ class GenreController(MediaControllerBase[Genre]):
         sort_field: SortField | None = None,
         sort_direction: SortDirection | None = None,
         summary: bool = True,
+        random_seed: int | None = None,
         **kwargs: Any,
     ) -> list[Genre]:
         """
@@ -339,7 +340,8 @@ class GenreController(MediaControllerBase[Genre]):
         # Genres are library-only items without provider_mappings, so ignore
         # the provider filter (the frontend always sends provider="library").
         extra_params: dict[str, Any] = {}
-        extra_parts: list[str] = []
+        # Random sampling reads the raw table, so excluded rows must be removed before LIMIT.
+        extra_parts: list[str] = [f"{self.db_table}.is_excluded = 0"]
         self._apply_genre_visibility_filter(
             extra_parts,
             extra_params,
@@ -359,6 +361,7 @@ class GenreController(MediaControllerBase[Genre]):
             extra_query_parts=extra_parts,
             played_only=played_only,
             summary=summary,
+            random_seed=random_seed,
         )
         if kwargs.get("_localized_fallback", True) and search and not items:
             # retry with the canonical name behind a localized query, so genres are findable
@@ -376,6 +379,7 @@ class GenreController(MediaControllerBase[Genre]):
                 media_type=media_type,
                 content_type=content_type,
                 summary=summary,
+                random_seed=random_seed,
             )
         return items
 
@@ -443,6 +447,7 @@ class GenreController(MediaControllerBase[Genre]):
         sort_field: SortField | None = None,
         sort_direction: SortDirection | None = None,
         search: str | None = None,
+        random_seed: int | None = None,
     ) -> list[Track]:
         """
         Return the tracks mapped to a genre, searched, sorted and paged.
@@ -450,6 +455,7 @@ class GenreController(MediaControllerBase[Genre]):
         :param item_id: The genre's library item ID.
         :param limit: Maximum number of tracks to return; 0 returns them all.
         :param offset: Number of tracks to skip.
+        :param random_seed: Keep random ordering stable across pages with the same seed.
         :param order_by: Deprecated legacy sort key.
         :param sort_field: Sort field, the sort name when omitted.
         :param sort_direction: Sort direction, the field's default when omitted.
@@ -467,6 +473,7 @@ class GenreController(MediaControllerBase[Genre]):
             sort_field=sort_field,
             sort_direction=sort_direction,
             search=search,
+            random_seed=random_seed,
         )
 
     async def albums(
@@ -479,6 +486,7 @@ class GenreController(MediaControllerBase[Genre]):
         sort_field: SortField | None = None,
         sort_direction: SortDirection | None = None,
         search: str | None = None,
+        random_seed: int | None = None,
     ) -> list[Album]:
         """
         Return the albums mapped to a genre, searched, sorted and paged.
@@ -486,6 +494,7 @@ class GenreController(MediaControllerBase[Genre]):
         :param item_id: The genre's library item ID.
         :param limit: Maximum number of albums to return; 0 returns them all.
         :param offset: Number of albums to skip.
+        :param random_seed: Keep random ordering stable across pages with the same seed.
         :param order_by: Deprecated legacy sort key.
         :param sort_field: Sort field, the sort name when omitted.
         :param sort_direction: Sort direction, the field's default when omitted.
@@ -503,6 +512,7 @@ class GenreController(MediaControllerBase[Genre]):
             sort_field=sort_field,
             sort_direction=sort_direction,
             search=search,
+            random_seed=random_seed,
         )
 
     async def mapped_media(
@@ -516,6 +526,7 @@ class GenreController(MediaControllerBase[Genre]):
         *,
         sort_field: SortField | None = None,
         sort_direction: SortDirection | None = None,
+        random_seed: int | None = None,
     ) -> tuple[list[Track], list[Album], list[Artist]]:
         """
         Return tracks, albums, and artists mapped to a genre.
@@ -523,6 +534,7 @@ class GenreController(MediaControllerBase[Genre]):
         :param item: The genre to fetch mapped media for.
         :param limit: Default limit applied to all media types (0 = unlimited).
         :param offset: Offset for pagination.
+        :param random_seed: Keep random ordering stable across pages with the same seed.
         :param track_limit: Override limit for tracks (defaults to limit).
         :param album_limit: Override limit for albums (defaults to limit).
         :param artist_limit: Override limit for artists (defaults to limit).
@@ -541,6 +553,7 @@ class GenreController(MediaControllerBase[Genre]):
                 offset,
                 sort_field=sort_field,
                 sort_direction=sort_direction,
+                random_seed=random_seed,
             ),
             self._mapped_items(
                 self.mass.music.albums,
@@ -549,6 +562,7 @@ class GenreController(MediaControllerBase[Genre]):
                 offset,
                 sort_field=sort_field,
                 sort_direction=sort_direction,
+                random_seed=random_seed,
             ),
             self._mapped_items(
                 self.mass.music.artists,
@@ -557,6 +571,7 @@ class GenreController(MediaControllerBase[Genre]):
                 offset,
                 sort_field=sort_field,
                 sort_direction=sort_direction,
+                random_seed=random_seed,
             ),
         )
         return tracks, albums, artists
@@ -1353,6 +1368,7 @@ class GenreController(MediaControllerBase[Genre]):
         sort_field: SortField | None = None,
         sort_direction: SortDirection | None = None,
         search: str | None = None,
+        random_seed: int | None = None,
     ) -> list[ItemCls]:
         """Return the library items of one media type that are mapped to a genre."""
         if controller.media_type == MediaType.ARTIST and sort_field == SortField.ARTIST_NAME:
@@ -1390,6 +1406,7 @@ class GenreController(MediaControllerBase[Genre]):
             offset=offset,
             sort_field=sort_field,
             sort_direction=sort_direction,
+            random_seed=random_seed,
         )
 
     @staticmethod
