@@ -21,6 +21,7 @@ from music_assistant.providers.audiomuse_ai.constants import (
     CONF_BASE_URL,
     CONF_ENABLE_DISCOVER_ROW,
     CONF_MEDIA_PROVIDER,
+    CONF_SERVER,
 )
 from music_assistant.providers.audiomuse_ai.provider import AudioMuseAiPlugin
 
@@ -128,6 +129,43 @@ class TestHandleAsyncInit:
         monkeypatch.setattr(provider_module, "AudioMuseClient", MagicMock(return_value=client))
         with pytest.raises(LoginFailed):
             await prov.handle_async_init()
+
+    async def test_configured_server_reaches_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The AudioMuse-AI server from setup is handed to the client."""
+        prov = _provider()
+        prov._client = None
+        cast("Any", prov.mass.config.get).return_value = {
+            CONF_MEDIA_PROVIDER: MEDIA_PROVIDER,
+            CONF_BASE_URL: "http://audiomuse:8000",
+            CONF_SERVER: "srv-lera",
+        }
+        client = _mock_client(health=AsyncMock(return_value=True), check_auth=AsyncMock())
+        client_cls = MagicMock(return_value=client)
+        monkeypatch.setattr(provider_module, "AudioMuseClient", client_cls)
+        await prov.handle_async_init()
+        assert client_cls.call_args.kwargs["server"] == "srv-lera"
+
+
+class TestMultipleInstances:
+    """One instance per media provider (e.g. one per user's own server)."""
+
+    async def test_second_instance_shares_api_commands(self) -> None:
+        """A second instance loads although the first already registered the API commands."""
+        prov = _provider()
+        cast("Any", prov.mass).register_api_command = MagicMock(
+            side_effect=RuntimeError("Command audiomuse_ai/similar is already registered")
+        )
+        cast("Any", prov.mass).command_handlers = {
+            "audiomuse_ai/similar": object(),
+            "audiomuse_ai/status": object(),
+        }
+        await prov.loaded_in_mass()
+        cast("Any", prov.mass).register_api_command.assert_not_called()
+        assert prov._unregister_handles == []
+
+    def test_ranks_ahead_of_other_similarity_plugins(self) -> None:
+        """AudioMuse-AI answers Similar Tracks before plugins on the default priority."""
+        assert AudioMuseAiPlugin.priority < 50
 
 
 class TestSeedItemId:

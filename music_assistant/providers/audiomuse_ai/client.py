@@ -44,6 +44,7 @@ class AudioMuseClient:
         base_url: str,
         token: str | None,
         logger: Logger,
+        server: str | None = None,
     ) -> None:
         """
         Initialize the client.
@@ -52,11 +53,13 @@ class AudioMuseClient:
         :param base_url: AudioMuse-AI server root, e.g. ``http://host:8000``.
         :param token: Optional API token sent as a ``Bearer`` header.
         :param logger: Provider logger.
+        :param server: Optional AudioMuse-AI server (id or name) to query instead of its default.
         """
         self._session = session
         self._base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
         self._timeout = ClientTimeout(total=REQUEST_TIMEOUT)
+        self._server = server
         self.logger = logger
 
     async def health(self) -> bool:
@@ -149,6 +152,12 @@ class AudioMuseClient:
         :param json_body: Optional JSON request body.
         """
         url = f"{self._base_url}{path}"
+        if self._server:
+            # AudioMuse-AI reads the server from the JSON body on POST, the query string otherwise
+            if json_body is not None:
+                json_body = {**json_body, "server": self._server}
+            else:
+                params = {**(params or {}), "server": self._server}
         try:
             async with self._session.request(
                 method,

@@ -52,9 +52,10 @@ def _client(
     exc: Exception | None = None,
     token: str | None = None,
     base_url: str = "http://audiomuse:8000/",
+    server: str | None = None,
 ) -> tuple[AudioMuseClient, _FakeSession]:
     session = _FakeSession(response=response, exc=exc)
-    client = AudioMuseClient(cast("Any", session), base_url, token, MagicMock())
+    client = AudioMuseClient(cast("Any", session), base_url, token, MagicMock(), server=server)
     return client, session
 
 
@@ -89,6 +90,26 @@ class TestRequestShaping:
         assert (method, url) == ("POST", "http://audiomuse:8000/api/clap/search")
         assert kwargs["json"] == {"query": "dreamy synths", "limit": 7}
         assert result == [{"item_id": "a"}]
+
+    async def test_server_added_to_query_params(self) -> None:
+        """A configured AudioMuse-AI server is sent as the 'server' query param on GET."""
+        client, session = _client(_FakeResponse(json_data=[]), server="srv-lera")
+        await client.similar_tracks("ms-1", 5)
+        assert session.calls[0][2]["params"] == {"item_id": "ms-1", "n": 5, "server": "srv-lera"}
+
+    async def test_server_added_to_json_body(self) -> None:
+        """A configured AudioMuse-AI server is sent in the JSON body on POST."""
+        client, session = _client(_FakeResponse(json_data={"results": []}), server="srv-lera")
+        await client.lyrics_search("rain", 3)
+        kwargs = session.calls[0][2]
+        assert kwargs["json"] == {"query": "rain", "limit": 3, "server": "srv-lera"}
+        assert kwargs["params"] is None
+
+    async def test_no_server_leaves_requests_untouched(self) -> None:
+        """Without a server, requests go to AudioMuse-AI's default server unchanged."""
+        client, session = _client(_FakeResponse(json_data={}))
+        await client.clap_stats()
+        assert session.calls[0][2]["params"] is None
 
 
 class TestErrorHandling:

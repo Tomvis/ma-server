@@ -36,8 +36,10 @@ from music_assistant.providers.audiomuse_ai.constants import (
     CONF_ENABLE_TEXT_SEARCH,
     CONF_LABEL_STATUS,
     CONF_MEDIA_PROVIDER,
+    CONF_SERVER,
     DEFAULT_SIMILAR_LIMIT,
     ITEM_ID_PREFIXES,
+    PLUGIN_PRIORITY,
     RECOMMEND_ITEM_LIMIT,
     RECOMMEND_PER_SEED_LIMIT,
     RECOMMEND_SEED_COUNT,
@@ -45,7 +47,7 @@ from music_assistant.providers.audiomuse_ai.constants import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Coroutine
 
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.enums import ProviderFeature
@@ -62,6 +64,8 @@ if TYPE_CHECKING:
 
 class AudioMuseAiPlugin(PluginProvider):
     """Plugin backing Similar Tracks, a discover row, and search via AudioMuse-AI."""
+
+    priority = PLUGIN_PRIORITY
 
     def __init__(
         self,
@@ -91,8 +95,13 @@ class AudioMuseAiPlugin(PluginProvider):
             msg = "No Music Assistant media provider selected for id mapping"
             raise SetupFailedError(msg)
         token = self.get_setup_value(CONF_API_TOKEN)
+        server = str(self.get_setup_value(CONF_SERVER) or "").strip()
         self._client = AudioMuseClient(
-            self.mass.http_session, base_url, str(token) if token else None, self.logger
+            self.mass.http_session,
+            base_url,
+            str(token) if token else None,
+            self.logger,
+            server=server or None,
         )
         if not await self._client.health():
             msg = f"Could not reach AudioMuse-AI server at {base_url}"
@@ -133,23 +142,18 @@ class AudioMuseAiPlugin(PluginProvider):
 
     async def loaded_in_mass(self) -> None:
         """Register the plugin's API commands."""
-        self._unregister_handles.append(
-            self.mass.register_api_command(
-                "audiomuse_ai/similar", self._handle_similar, required_scope=Scope.LIBRARY_READ
-            )
-        )
-        self._unregister_handles.append(
-            self.mass.register_api_command(
-                "audiomuse_ai/status", self._handle_status, required_scope=Scope.LIBRARY_READ
-            )
-        )
+        commands: list[tuple[str, Callable[..., Coroutine[Any, Any, dict[str, Any]]]]] = [
+            ("audiomuse_ai/similar", self._handle_similar),
+            ("audiomuse_ai/status", self._handle_status),
+        ]
         if bool(self.config.get_value(CONF_ENABLE_TEXT_SEARCH)):
+            commands.append(("audiomuse_ai/search", self._handle_text_search))
+        for command, handler in commands:
+            # with several instances (one per media provider) the first one loaded serves these
+            if command in self.mass.command_handlers:
+                continue
             self._unregister_handles.append(
-                self.mass.register_api_command(
-                    "audiomuse_ai/search",
-                    self._handle_text_search,
-                    required_scope=Scope.LIBRARY_READ,
-                )
+                self.mass.register_api_command(command, handler, required_scope=Scope.LIBRARY_READ)
             )
 
     async def unload(self, is_removed: bool = False) -> None:

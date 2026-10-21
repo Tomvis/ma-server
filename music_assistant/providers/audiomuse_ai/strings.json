@@ -12,6 +12,10 @@
       "label": "Media provider to map against",
       "description": "The Music Assistant provider that points at the same media server AudioMuse-AI analyzed. Track ids are matched through this provider."
     },
+    "server": {
+      "label": "AudioMuse-AI server",
+      "description": "Id or name of the AudioMuse-AI server to query, when it analyses several media servers or users. Leave empty for its default server. Add one instance per media provider to cover each."
+    },
     "enable_text_search": {
       "label": "Enable free-text search",
       "description": "Expose AudioMuse-AI's CLAP + lyrics search as a search provider."

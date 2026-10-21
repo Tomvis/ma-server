@@ -8,7 +8,7 @@
   "requirements": [],
   "credits": ["[AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI)"],
   "documentation": "https://github.com/NeptuneHub/AudioMuse-AI",
-  "multi_instance": false,
+  "multi_instance": true,
   "builtin": false,
   "icon": "robot-happy"
 }

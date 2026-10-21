@@ -12,6 +12,9 @@ CONF_API_TOKEN = "api_token"  # noqa: S105 - config key
 # Instance id of the Music Assistant provider whose item ids match the media
 # server AudioMuse-AI was pointed at — the bridge between the two id spaces.
 CONF_MEDIA_PROVIDER = "media_provider"
+# AudioMuse-AI server (id or name) to query, for an AudioMuse-AI analysing several media
+# servers or users; empty uses its default server.
+CONF_SERVER = "server"
 CONF_ENABLE_TEXT_SEARCH = "enable_text_search"
 CONF_ENABLE_DISCOVER_ROW = "enable_discover_row"
 CONF_LABEL_STATUS = "status_label"
@@ -22,6 +25,9 @@ LIBRARY_DOMAIN = "library"
 
 # Prefix Music Assistant adds to the media-server id AudioMuse-AI stores, per provider domain.
 ITEM_ID_PREFIXES = {"plex": "/library/metadata/"}
+
+# Ranks this plugin's Similar Tracks ahead of plugins on the default priority (50).
+PLUGIN_PRIORITY = 40
 
 # HTTP request timeout (seconds) for every AudioMuse-AI call.
 REQUEST_TIMEOUT = 30

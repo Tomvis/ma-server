@@ -9,6 +9,7 @@ from music_assistant.providers.audiomuse_ai.constants import (
     CONF_API_TOKEN,
     CONF_BASE_URL,
     CONF_MEDIA_PROVIDER,
+    CONF_SERVER,
 )
 from music_assistant.providers.audiomuse_ai.setup_flow import run_setup
 
@@ -35,3 +36,17 @@ async def test_offers_music_providers_and_finishes_with_submitted_values() -> No
     options = entries[CONF_MEDIA_PROVIDER].options
     assert [(option.title, option.value) for option in options] == [("Jellyfin", "jellyfin--test")]
     session.finish.assert_awaited_once_with(submitted)
+
+
+async def test_offers_optional_audiomuse_server() -> None:
+    """The AudioMuse-AI server entry is offered and may be left empty."""
+    session = MagicMock()
+    session.context.setup_data = {}
+    session.mass.get_providers.return_value = []
+    session.form = AsyncMock(return_value={})
+    session.finish = AsyncMock(return_value={"instance_id": "audiomuse_ai--test"})
+
+    await run_setup(session)
+
+    entries = {entry.key: entry for entry in session.form.await_args.args[0]}
+    assert entries[CONF_SERVER].required is False

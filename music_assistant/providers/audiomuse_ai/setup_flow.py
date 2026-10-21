@@ -12,6 +12,7 @@ from music_assistant.providers.audiomuse_ai.constants import (
     CONF_API_TOKEN,
     CONF_BASE_URL,
     CONF_MEDIA_PROVIDER,
+    CONF_SERVER,
     LIBRARY_DOMAIN,
 )
 
@@ -48,6 +49,12 @@ async def run_setup(session: SetupSession) -> None:
                 required=True,
                 options=provider_options,
                 value=setup_data.get(CONF_MEDIA_PROVIDER),
+            ),
+            ConfigEntry(
+                key=CONF_SERVER,
+                type=ConfigEntryType.STRING,
+                required=False,
+                value=setup_data.get(CONF_SERVER),
             ),
         ]
         submitted = await session.form(entries, step_id="user", errors=errors, last_step=True)
