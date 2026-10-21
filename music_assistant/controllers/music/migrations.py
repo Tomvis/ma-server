@@ -1621,14 +1621,6 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
     await mass.cache.clear()
 
 
-async def _table_columns(database: DatabaseConnection, table_name: str) -> set[str]:
-    """Return the column names of a table, or an empty set when it does not exist."""
-    return {
-        row["name"]
-        for row in await database.get_rows_from_query(f"PRAGMA table_info({table_name})", limit=0)
-    }
-
-
 async def _table_exists(database: DatabaseConnection, table_name: str) -> bool:
     """Check whether a table exists."""
     return bool(await _table_columns(database, table_name))
