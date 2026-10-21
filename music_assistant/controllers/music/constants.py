@@ -68,7 +68,11 @@ CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 # 70: upstream took 69 (more misplaced aliases off the default classical genre), gated at
 # "prev_version <= 68". This branch was already stamped 69, so it is widened to "<= 69"
 # and the version moved to 70.
-DB_SCHEMA_VERSION: Final[int] = 70
+#
+# 71: upstream took 70 (Apple Music radio stations move from playlists to radios), gated
+# at "prev_version <= 69". This branch was already stamped 70, so it is widened to "<= 70"
+# and the version moved to 71.
+DB_SCHEMA_VERSION: Final[int] = 71
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60

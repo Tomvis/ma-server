@@ -17,6 +17,8 @@ from music_assistant.controllers.music.constants import (
     RECOMMENDATIONS_ITEMS_TIMEOUT,
     RECOMMENDATIONS_ROWS_TIMEOUT,
 )
+from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
+from music_assistant.helpers.provider_access import visible_items
 from music_assistant.providers.recommendations import LibraryRecommendationsProvider
 
 if TYPE_CHECKING:
@@ -95,6 +97,8 @@ class RecommendationsController:
                     items = await cast("RecommendationsMixin", prov).get_recommendation_items(
                         item_id
                     )
+                    # a plugin or metadata row can list items on any music source
+                    items = UniqueList(visible_items(self.mass, items, get_current_user()))
             # deliberately outside the items timeout: enrichment is a nicety, and must
             # never be able to cost us items we have already fetched
             return await self._attach_library_album_badges(items)
