@@ -1803,6 +1803,51 @@ async def test_migration_splits_playlog_and_adds_is_endless_on_a_fork_database_s
     assert "is_endless" in await _table_columns(database, "radios")
 
 
+async def test_migration_replaces_play_history_indexes(database: DatabaseConnection) -> None:
+    """Schema 70 replaces the two play-history indexes with its covering index."""
+    await database.execute(
+        f"""CREATE TABLE {DB_TABLE_PLAY_HISTORY}(
+            userid TEXT, timestamp REAL, media_type TEXT, provider TEXT, item_id TEXT
+        )"""
+    )
+    await database.execute(
+        f"CREATE INDEX {DB_TABLE_PLAY_HISTORY}_user_timestamp_idx "
+        f"ON {DB_TABLE_PLAY_HISTORY}(userid,timestamp)"
+    )
+    await database.execute(
+        f"CREATE INDEX {DB_TABLE_PLAY_HISTORY}_user_media_timestamp_idx "
+        f"ON {DB_TABLE_PLAY_HISTORY}(userid,media_type,timestamp)"
+    )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    for _ in range(2):
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=69,
+            create_tables=AsyncMock(),
+        )
+
+    indexes = await database.get_rows_from_query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :table",
+        {"table": DB_TABLE_PLAY_HISTORY},
+    )
+    assert {row["name"] for row in indexes} == {f"{DB_TABLE_PLAY_HISTORY}_user_timestamp_cov_idx"}
+    columns = await database.get_rows_from_query(
+        f"PRAGMA index_info({DB_TABLE_PLAY_HISTORY}_user_timestamp_cov_idx)", limit=0
+    )
+    assert [row["name"] for row in columns] == [
+        "userid",
+        "timestamp",
+        "media_type",
+        "provider",
+        "item_id",
+    ]
+
+
 async def test_migration_drops_the_token_from_audiobookshelf_image_urls(
     database: DatabaseConnection,
 ) -> None:
@@ -2060,3 +2105,35 @@ async def test_migration_moves_apple_music_stations_on_a_fork_database_stamped_7
 
     radios = await database.get_rows_from_query("SELECT name FROM radios", limit=0)
     assert [row["name"] for row in radios] == ["Chill Station"]
+
+
+async def test_migration_replaces_play_history_indexes_on_a_fork_database_stamped_71(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 71 by this branch still gets upstream's 71 step.
+
+    Upstream gates the play-history index swap at "prev_version <= 70", but this branch was
+    already stamped 71, so it is widened to "<= 71" (and DB_SCHEMA_VERSION moved to 72).
+    Revert the gate and this test fails.
+    """
+    await database.execute(
+        f"""CREATE TABLE {DB_TABLE_PLAY_HISTORY}(
+            userid TEXT, timestamp REAL, media_type TEXT, provider TEXT, item_id TEXT
+        )"""
+    )
+    await database.execute(
+        f"CREATE INDEX {DB_TABLE_PLAY_HISTORY}_user_timestamp_idx "
+        f"ON {DB_TABLE_PLAY_HISTORY}(userid,timestamp)"
+    )
+    await database.commit()
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=71, create_tables=AsyncMock())
+
+    indexes = await database.get_rows_from_query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :table",
+        {"table": DB_TABLE_PLAY_HISTORY},
+    )
+    assert {row["name"] for row in indexes} == {f"{DB_TABLE_PLAY_HISTORY}_user_timestamp_cov_idx"}

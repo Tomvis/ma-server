@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -9,17 +10,18 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from async_upnp_client.exceptions import UpnpActionError
 from music_assistant_models.config_entries import MULTI_VALUE_SPLITTER
-from music_assistant_models.enums import IdentifierType, PlaybackState, PlayerFeature
+from music_assistant_models.enums import IdentifierType, PlaybackState, PlayerFeature, RepeatMode
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player import PlayerMedia
 
 from music_assistant.constants import CONF_FLOW_MODE, CONF_SAMPLE_RATES
 from music_assistant.providers.raumfeld.constants import PLAYER_CONFIG_ENTRIES
-from music_assistant.providers.raumfeld.helpers import library_uri
+from music_assistant.providers.raumfeld.helpers import library_uri, play_mode_for
 from music_assistant.providers.raumfeld.player import (
     ADVANCE_WATCH_ATTEMPTS,
     IDLE_POLL_INTERVAL,
     PLAYING_POLL_INTERVAL,
+    ZONE_CREATE_ATTEMPTS,
     RaumfeldPlayer,
     _map_transport_state,
     _near_track_end,
@@ -37,6 +39,8 @@ def _flow_player() -> RaumfeldPlayer:
     player = RaumfeldPlayer.__new__(RaumfeldPlayer)
     player._attr_elapsed_time = None
     player._attr_elapsed_time_last_updated = None
+    player._attr_group_members = []
+    player._advance_task_id = "raumfeld_advance_test"
     player._external_source = None
     player._attr_supported_features = set()
     player._library_sources = {}
@@ -248,6 +252,7 @@ def _follower(leader_state: PlaybackState) -> RaumfeldPlayer:
     player = RaumfeldPlayer.__new__(RaumfeldPlayer)
     player.room = "Bank"
     player._player_id = "raumfeld_follower"
+    player._attr_group_members = []
     player._attr_supported_features = set()
     player._attr_playback_state = PlaybackState.PLAYING
     player._attr_poll_interval = PLAYING_POLL_INTERVAL
@@ -308,14 +313,12 @@ async def test_unload_cancels_its_timers() -> None:
     """Unloading cancels the timers mass holds for this player, which would otherwise run."""
     player, mass = _advancing_player()
     player._player_id = "raumfeld_test"
-    player._resync_task_id = "raumfeld_resync_test"
     player._on_unload_callbacks = []
 
     await player.on_unload()
 
     assert {call.args[0] for call in mass.cancel_timer.call_args_list} == {
         "raumfeld_advance_test",
-        "raumfeld_resync_test",
         "external_pause_raumfeld_test",
     }
     assert player._advance_armed is False
@@ -400,6 +403,73 @@ async def test_volume_update_reads_mute_and_keeps_unread_values() -> None:
         upnp.async_get_mute = AsyncMock(return_value=None)
         await player._update_volume(host)
     assert (player._attr_volume_level, player._attr_volume_muted) == (42, True)
+
+
+async def test_no_zone_for_the_room_is_reported() -> None:
+    """A room the host gives no zone raises a clear error instead of playing into nothing."""
+    player = _room_player()
+    host = MagicMock()
+    host.roomlst_to_zoneudn.return_value = None
+    provider = MagicMock()
+    provider.host = host
+    provider.get_zone_for_room.return_value = None
+    player._provider = provider
+    player.logger = MagicMock()
+    with (
+        patch(
+            "music_assistant.providers.raumfeld.player.hassfeld_ws.async_connect_rooms_to_zone",
+            AsyncMock(),
+        ),
+        patch("music_assistant.providers.raumfeld.player.ZONE_WAIT_TIMEOUT", 0),
+        pytest.raises(PlayerCommandFailed, match="no zone for Bar"),
+    ):
+        await player._ensure_playable_zone()
+
+
+async def test_a_group_is_created_as_one_zone() -> None:
+    """A leader without a zone has the host make one with all rooms at once."""
+    player = _room_player()
+    host = MagicMock()
+    host.roomlst_to_udnlst.side_effect = lambda rooms: [f"uuid:{room}" for room in rooms]
+    host.location = "http://192.168.1.41:47365"
+    host.async_add_room_to_zone = AsyncMock()
+    provider = MagicMock()
+    provider.host = host
+    # no zone until the host is asked to create one
+    provider.get_zone_for_room.return_value = None
+    player._provider = provider
+    player.logger = MagicMock()
+
+    async def create(*_args: object, **_kwargs: object) -> None:
+        provider.get_zone_for_room.return_value = ["Bar", "Sofa"]
+
+    with patch("music_assistant.providers.raumfeld.player.hassfeld_ws") as webservice:
+        webservice.async_connect_rooms_to_zone = AsyncMock(side_effect=create)
+        await player._add_rooms_to_zone(["Sofa"])
+    webservice.async_connect_rooms_to_zone.assert_awaited_once_with(
+        player.mass.http_session,
+        "http://192.168.1.41:47365",
+        room_udns=["uuid:Bar", "uuid:Sofa"],
+    )
+    host.async_add_room_to_zone.assert_not_awaited()
+
+
+async def test_rooms_the_host_does_not_add_are_reported() -> None:
+    """A room that never lands in the leader's zone fails the group change, not silently."""
+    player = _room_player()
+    host = MagicMock()
+    host.async_add_room_to_zone = AsyncMock()
+    provider = MagicMock()
+    provider.host = host
+    provider.get_zone_for_room.return_value = ["Bar"]
+    player._provider = provider
+    player.logger = MagicMock()
+    with (
+        patch("music_assistant.providers.raumfeld.player.ZONE_WAIT_TIMEOUT", 0),
+        pytest.raises(PlayerCommandFailed, match="did not add Sofa to the zone of Bar"),
+    ):
+        await player._add_rooms_to_zone(["Sofa"])
+    assert host.async_add_room_to_zone.await_count == ZONE_CREATE_ATTEMPTS
 
 
 def _powered_player(power_state: str | None) -> tuple[RaumfeldPlayer, MagicMock]:
@@ -539,24 +609,6 @@ async def test_power_off_failure_is_reported() -> None:
     assert player._attr_powered is True
 
 
-async def test_no_zone_for_the_room_is_reported() -> None:
-    """A room the host gives no zone raises a clear error instead of playing into nothing."""
-    player = _flow_player()
-    player.room = "Bar"
-    host = MagicMock()
-    host.async_create_zone = AsyncMock()
-    host.roomlst_to_zoneudn.return_value = None
-    provider = MagicMock()
-    provider.host = host
-    provider.get_zone_for_room.return_value = None
-    player._provider = provider
-    with (
-        patch("music_assistant.providers.raumfeld.player.asyncio.sleep", AsyncMock()),
-        pytest.raises(PlayerCommandFailed, match="no zone for Bar"),
-    ):
-        await player._ensure_playable_zone()
-
-
 _SPOTIFY_META: dict[str, str | None] = {
     "title": "Who's That",
     "artist": "The War On Drugs",
@@ -564,6 +616,14 @@ _SPOTIFY_META: dict[str, str | None] = {
     "image_url": "http://i.scdn.co/image/cover",
     "section": "Spotify",
     "item_id": "0/Spotify/Track",
+}
+_ALBUM_META: dict[str, str | None] = {
+    "title": "Shine On You Crazy Diamond",
+    "artist": "Pink Floyd",
+    "album": "Wish You Were Here",
+    "image_url": None,
+    "section": "My Music",
+    "item_id": "0/My Music/Albums/42/1",
 }
 _RADIO_META: dict[str, str | None] = {
     "title": "Sublime",
@@ -1180,10 +1240,13 @@ async def test_the_stop_of_a_handover_leaves_spotify_connect_playing() -> None:
     with (
         patch.object(player, "update_state"),
         patch.object(player, "_transport_action", AsyncMock()) as action,
+        patch.object(player, "_clear_next") as clear_next,
     ):
         await player.stop()
         action.assert_not_awaited()
         assert player._attr_active_source == "spotify"
+        # with flow mode off, the queue's next item goes along with it
+        clear_next.assert_called_once()
         # the next stop is a stop again
         await player.stop()
     action.assert_awaited_once_with(_RENDERER, "Stop")
@@ -1494,6 +1557,8 @@ def _button_player() -> tuple[RaumfeldPlayer, MagicMock]:
     player, host = _external_player()
     with patch.object(RaumfeldPlayer, "update_state"):
         player.set_station_buttons(_BUTTONS)
+    # a read just before playing finds the buttons unchanged
+    cast("MagicMock", player._provider).refresh_station_buttons = AsyncMock()
     return player, host
 
 
@@ -1529,6 +1594,63 @@ async def test_a_station_button_is_played_through_its_library_item() -> None:
     assert player._attr_active_source == "station_button_3"
     assert player._attr_current_media is not None
     assert player._attr_current_media.title == "Shine On"
+
+
+async def test_a_button_given_another_item_plays_the_new_one() -> None:
+    """The buttons are read again before playing, so a reassigned button plays its new item."""
+    player, host = _button_player()
+    host.media_server_udn = "uuid:media-server"
+    host.async_browse_media_server = AsyncMock(return_value="<DIDL-Lite/>")
+
+    async def reassigned(target: RaumfeldPlayer) -> None:
+        target.set_station_buttons([_BUTTONS[0], (3, "0/StationButtons/432", "WYWH 50", True)])
+
+    cast("MagicMock", player._provider).refresh_station_buttons = AsyncMock(side_effect=reassigned)
+    with (
+        patch.object(player, "_ensure_playable_zone", AsyncMock(return_value=["Bar"])),
+        patch.object(player, "_wake_rooms", AsyncMock()),
+        patch.object(player, "_stop_before_switching", AsyncMock()),
+        patch.object(player, "_zone_command", AsyncMock()) as command,
+        patch.object(player, "update_state"),
+    ):
+        await player.select_source("station_button_3")
+    assert command.await_args_list[0].kwargs["CurrentURI"] == library_uri(
+        "uuid:media-server", "0/StationButtons/432", container=True
+    )
+    assert player._attr_current_media is not None
+    assert player._attr_current_media.title == "WYWH 50"
+
+
+async def test_a_button_emptied_meanwhile_is_refused() -> None:
+    """A button that lost its item since the last read plays nothing and says so."""
+    player, _ = _button_player()
+
+    async def emptied(target: RaumfeldPlayer) -> None:
+        target.set_station_buttons([_BUTTONS[0]])
+
+    cast("MagicMock", player._provider).refresh_station_buttons = AsyncMock(side_effect=emptied)
+    with (
+        patch.object(player, "_zone_command", AsyncMock()) as command,
+        patch.object(player, "update_state"),
+        pytest.raises(PlayerCommandFailed, match="nothing assigned"),
+    ):
+        await player.select_source("station_button_3")
+    command.assert_not_awaited()
+
+
+async def test_a_button_whose_item_is_gone_is_not_sent_to_the_zone() -> None:
+    """An item the host cannot describe any more raises instead of loading nothing."""
+    player, host = _button_player()
+    host.media_server_udn = "uuid:media-server"
+    host.async_browse_media_server = AsyncMock(return_value=None)
+    with (
+        patch.object(player, "_ensure_playable_zone", AsyncMock(return_value=["Bar"])),
+        patch.object(player, "_zone_command", AsyncMock()) as command,
+        patch.object(player, "update_state"),
+        pytest.raises(PlayerCommandFailed, match="not available"),
+    ):
+        await player.select_source("station_button_3")
+    command.assert_not_awaited()
 
 
 async def test_an_unknown_source_is_refused() -> None:
@@ -1623,7 +1745,7 @@ async def test_the_poll_recognises_an_album_button_by_what_the_zone_loaded() -> 
         patch.object(RaumfeldPlayer, "update_state"),
     ):
         await player._update_zone_source(position, ["Bar"], player._playback_generation)
-    call.assert_awaited_once_with(_ZONE, "GetMediaInfo")
+    call.assert_any_await(_ZONE, "GetMediaInfo")
     assert player._attr_active_source == "station_button_3"
 
 
@@ -1694,3 +1816,205 @@ async def test_an_album_button_chosen_by_the_user_starts_afresh() -> None:
     assert command.await_args_list[0].kwargs["CurrentURI"] == library_uri(
         "uuid:media-server", "0/My Music/Albums/42", container=True
     )
+
+
+@pytest.mark.parametrize(
+    ("play_mode", "shuffle", "repeat"),
+    [
+        ("NORMAL", False, RepeatMode.OFF),
+        ("SHUFFLE", True, RepeatMode.OFF),
+        ("REPEAT_ALL", False, RepeatMode.ALL),
+        ("RANDOM", True, RepeatMode.ALL),
+        ("REPEAT_ONE", False, RepeatMode.ONE),
+    ],
+)
+def test_an_external_source_shows_its_shuffle_and_repeat(
+    play_mode: str, shuffle: bool, repeat: RepeatMode
+) -> None:
+    """The play mode the host reports shows as the source's shuffle and repeat state."""
+    player, _ = _external_player()
+    player._set_external(
+        _SPOTIFY_META, "Pause,Next,Previous,Repeat,Shuffle", 315, via_room=True, play_mode=play_mode
+    )
+    source = player._attr_source_list[0]
+    assert (source.can_shuffle, source.can_repeat) == (True, True)
+    assert (source.shuffle_enabled, source.repeat_mode) == (shuffle, repeat)
+
+
+def test_a_source_the_host_does_not_let_shuffle_offers_no_shuffle() -> None:
+    """Without Shuffle and Repeat in the allowed actions the source offers neither."""
+    player, _ = _external_player()
+    player._set_external(_RADIO_META, "Stop", None, via_room=False, play_mode="NORMAL")
+    source = player._attr_source_list[0]
+    assert (source.can_shuffle, source.can_repeat) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("current", "command", "expected"),
+    [
+        ("NORMAL", ("shuffle", True), "SHUFFLE"),
+        ("REPEAT_ALL", ("shuffle", True), "RANDOM"),
+        ("RANDOM", ("shuffle", False), "REPEAT_ALL"),
+        # the Raumfeld app turns repeat one into repeat all when shuffle goes on
+        ("REPEAT_ONE", ("shuffle", True), "RANDOM"),
+        ("SHUFFLE", ("repeat", RepeatMode.ALL), "RANDOM"),
+        ("RANDOM", ("repeat", RepeatMode.OFF), "SHUFFLE"),
+        # no mode shuffles and repeats one track
+        ("SHUFFLE", ("repeat", RepeatMode.ONE), "REPEAT_ONE"),
+    ],
+)
+async def test_shuffle_and_repeat_set_the_play_mode(
+    current: str, command: tuple[str, Any], expected: str
+) -> None:
+    """Shuffle and repeat are combined into the one play mode the renderer takes."""
+    player, _ = _external_player()
+    player._set_external(
+        _ALBUM_META,
+        "Pause,Next,Previous,RepeatTrack,Repeat,Shuffle",
+        240,
+        via_room=False,
+        play_mode=current,
+    )
+    name, value = command
+    with (
+        patch.object(player, "_external_command", AsyncMock()) as external,
+        patch.object(player, "update_state"),
+    ):
+        if name == "shuffle":
+            await player.set_shuffle(value)
+        else:
+            await player.set_repeat(value)
+    external.assert_awaited_once_with("SetPlayMode", NewPlayMode=expected)
+    source = player._external_source
+    assert source is not None
+    assert (
+        play_mode_for(bool(source.shuffle_enabled), source.repeat_mode or RepeatMode.OFF)
+        == expected
+    )
+
+
+async def test_repeat_one_moves_on_to_off_where_the_host_does_not_allow_it() -> None:
+    """Spotify Connect lists Repeat but not RepeatTrack: the repeat button skips one."""
+    player, _ = _external_player()
+    player._set_external(
+        _SPOTIFY_META, "Pause,Next,Previous,Repeat,Shuffle", 315, via_room=True, play_mode="RANDOM"
+    )
+    with (
+        patch.object(player, "_external_command", AsyncMock()) as external,
+        patch.object(player, "update_state"),
+    ):
+        await player.set_repeat(RepeatMode.ONE)
+    # off, with shuffle kept
+    external.assert_awaited_once_with("SetPlayMode", NewPlayMode="SHUFFLE")
+    source = player._external_source
+    assert source is not None
+    assert source.repeat_mode == RepeatMode.OFF
+
+
+async def test_the_zone_poll_reads_the_play_mode_of_an_external_source() -> None:
+    """A zone that plays something from the Raumfeld app is asked for its play mode."""
+    player, _ = _external_player()
+    position = {"TrackURI": "http://192.168.1.41:47366/track7.flac", "TrackDuration": "0:04:00"}
+
+    async def transport(_location: str, action: str) -> dict[str, str]:
+        return {
+            "GetCurrentTransportActions": {"Actions": "Pause,Next,Previous,Repeat,Shuffle"},
+            "GetTransportSettings": {"PlayMode": "RANDOM"},
+        }.get(action, {})
+
+    with (
+        patch.object(player, "_call_transport", AsyncMock(side_effect=transport)),
+        patch.object(RaumfeldPlayer, "update_state"),
+    ):
+        await player._update_zone_source(position, ["Bar"], player._playback_generation)
+    source = player._external_source
+    assert source is not None
+    assert (source.shuffle_enabled, source.repeat_mode) == (True, RepeatMode.ALL)
+
+
+async def test_shuffle_and_repeat_at_once_do_not_undo_each_other() -> None:
+    """Two changes arriving together end in the play mode that holds both."""
+    player, _ = _external_player()
+    player._set_external(
+        _ALBUM_META,
+        "Pause,Next,Previous,RepeatTrack,Repeat,Shuffle",
+        240,
+        via_room=False,
+        play_mode="NORMAL",
+    )
+    sent: list[str] = []
+
+    async def slow_command(_action: str, **arguments: str) -> None:
+        # the renderer takes a moment to answer
+        await asyncio.sleep(0)
+        sent.append(arguments["NewPlayMode"])
+
+    with (
+        patch.object(player, "_external_command", AsyncMock(side_effect=slow_command)),
+        patch.object(player, "update_state"),
+    ):
+        await asyncio.gather(player.set_shuffle(True), player.set_repeat(RepeatMode.ALL))
+    assert sent == ["SHUFFLE", "RANDOM"]
+
+
+async def test_a_poll_from_before_a_play_mode_change_is_not_applied() -> None:
+    """A room poll that read the old play mode while the change ran leaves the new one."""
+    player, _ = _external_player()
+    player._set_external(
+        _SPOTIFY_META, "Pause,Next,Previous,Repeat,Shuffle", 315, via_room=True, play_mode="NORMAL"
+    )
+    position_asked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_position(_location: str, _action: str) -> dict[str, str]:
+        position_asked.set()
+        await release.wait()
+        return {"TrackDuration": "0:05:15", "RelTime": "0:00:20"}
+
+    old_state = {
+        "TransportState": "PLAYING",
+        "CurrentTransportActions": "Pause,Next,Previous,Repeat,Shuffle",
+        "CurrentPlayMode": "NORMAL",
+        "AVTransportURIMetaData": _SPOTIFY_TRACK_DIDL,
+    }
+    with (
+        patch.object(player, "_update_volume", AsyncMock()),
+        patch.object(player, "_read_room_state", AsyncMock(return_value=old_state)),
+        patch.object(player, "_call_transport", AsyncMock(side_effect=slow_position)),
+        patch.object(player, "_external_command", AsyncMock()),
+        patch.object(RaumfeldPlayer, "update_state"),
+    ):
+        poll = asyncio.create_task(player._poll_room_playback(MagicMock()))
+        await position_asked.wait()
+        await player.set_shuffle(True)
+        release.set()
+        await poll
+    source = player._external_source
+    assert source is not None
+    assert source.shuffle_enabled is True
+
+
+async def test_a_play_mode_change_after_ma_took_over_is_refused() -> None:
+    """A change that waited while MA's own playback replaced the source sends nothing."""
+    player, _ = _external_player()
+    player._set_external(
+        _ALBUM_META,
+        "Pause,Next,Previous,RepeatTrack,Repeat,Shuffle",
+        240,
+        via_room=False,
+        play_mode="NORMAL",
+    )
+    lock = player._play_mode_guard()
+    await lock.acquire()
+    with (
+        patch.object(player, "_external_command", AsyncMock()) as external,
+        patch.object(player, "update_state"),
+    ):
+        change = asyncio.create_task(player.set_repeat(RepeatMode.ALL))
+        await asyncio.sleep(0)
+        # play_media() starts MA's own stream meanwhile
+        player._clear_external()
+        lock.release()
+        with pytest.raises(PlayerCommandFailed, match="no longer plays"):
+            await change
+    external.assert_not_awaited()

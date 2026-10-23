@@ -72,7 +72,13 @@ CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 # 71: upstream took 70 (Apple Music radio stations move from playlists to radios), gated
 # at "prev_version <= 69". This branch was already stamped 70, so it is widened to "<= 70"
 # and the version moved to 71.
-DB_SCHEMA_VERSION: Final[int] = 71
+#
+# 72: upstream took 71 (play-history indexes replaced by one covering index), gated at
+# "prev_version <= 70". This branch was already stamped 71, so it is widened to "<= 71"
+# and the version moved to 72.
+DB_SCHEMA_VERSION: Final[int] = 72
+# headroom kept free on top of what moving the audio analysis out of library.db writes
+DB_FREE_SPACE_MARGIN: Final[int] = 100 * 1024 * 1024
 
 # tracks longer that this will not be included in radio mode
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
