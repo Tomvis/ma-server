@@ -85,7 +85,7 @@ async def test_claim_is_stored_per_user(provider: HomeThemeProvider) -> None:
     assert await _get(provider, "lera") == state
     assert (await _get(provider))["claim"] is None
     signal = provider.mass.signal_event
-    assert signal.call_args.kwargs["data"] == {"user_id": "id-lera"}  # type: ignore[attr-defined]
+    assert signal.call_args.kwargs["data"] == {"user_id": "id-lera", "setting": "home_theme"}  # type: ignore[attr-defined]
 
 
 async def test_unknown_user_is_none(provider: HomeThemeProvider) -> None:
@@ -144,3 +144,49 @@ async def test_invalid_values_are_refused(
     """Only theme ids, the three modes and well-formed overrides are stored."""
     with pytest.raises(InvalidDataError):
         await provider.set_claim("tom", theme, mode, override)
+
+
+async def _language_claim(prov: HomeThemeProvider, *args: str) -> dict[str, Any]:
+    state = await prov.set_language_claim(*args)
+    assert state is not None
+    return state
+
+
+async def test_language_claim_is_kept_apart_from_the_theme(provider: HomeThemeProvider) -> None:
+    """The home language (HW-190) has its own claim, beside the theme's."""
+    await _claim(provider, "lera", "lagoon", "light")
+    state = await _language_claim(provider, "lera", "ru_RU")
+    assert state == {
+        "user_id": "id-lera",
+        "claim": {"language": "ru_RU", "override": "follow"},
+        "choice": None,
+    }
+    assert await provider.get_language("lera") == state
+    assert (await _get(provider, "lera"))["claim"]["theme"] == "lagoon"
+    signal = provider.mass.signal_event
+    assert signal.call_args.kwargs["data"] == {"user_id": "id-lera", "setting": "home_language"}  # type: ignore[attr-defined]
+    assert await provider.set_language_claim("nobody", "he") is None
+
+
+async def test_language_choice_follows_the_theme_rule(provider: HomeThemeProvider) -> None:
+    """An in-app language survives a global change and yields to a new per-app choice."""
+    await _language_claim(provider, "tom", "en")
+    state = await provider.choose_language("he")
+    assert state["choice"] == {"language": "he", "basis": "follow"}
+    state = await _language_claim(provider, "tom", "ru_RU")
+    assert state["choice"] == {"language": "he", "basis": "follow"}
+    state = await _language_claim(provider, "tom", "ru_RU", "ru")
+    assert state["choice"] is None
+    await provider.choose_language("he")
+    assert (await provider.choose_language(None))["choice"] is None
+
+
+@pytest.mark.parametrize(
+    ("language", "override"), [("Russian", "follow"), ("ru", "x/y"), ("", "follow")]
+)
+async def test_invalid_languages_are_refused(
+    provider: HomeThemeProvider, language: str, override: str
+) -> None:
+    """Only locale codes and home language ids are stored."""
+    with pytest.raises(InvalidDataError):
+        await provider.set_language_claim("tom", language, override)

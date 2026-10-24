@@ -3,7 +3,7 @@
   "domain": "home_theme",
   "stage": "stable",
   "name": "Home theme",
-  "description": "Keeps each person's home theme (from the household's authentik settings) and their own in-app theme choice.",
+  "description": "Keeps each person's home theme and language (from the household's authentik settings) and their own in-app choices.",
   "codeowners": ["@Tomvis"],
   "requirements": [],
   "documentation": "",

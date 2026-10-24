@@ -14,6 +14,10 @@ a different override drops the choice here, so changing the per-app choice in
 authentik (back to "follow" included) always wins, while a change of the global
 choice never undoes an in-app one.
 
+The home language (HW-190) is held the same way under ``home_language/<user_id>``:
+claim ``{"language": "<frontend locale>", "override": "follow" | "<language id>"}``
+and a choice ``{"language", "basis"}``, with the same precedence rule.
+
 Kept in settings.json under ``home_theme/<user_id>`` rather than in the user's
 preferences: clients write preferences back as one whole object, so a tab left
 open would put a stale claim back.
@@ -43,9 +47,11 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 STORAGE_KEY = "home_theme"
+LANGUAGE_STORAGE_KEY = "home_language"
 FOLLOW = "follow"
 MODES = ("automatic", "light", "dark")
 THEME_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+LOCALE = re.compile(r"^[a-z]{2,3}([_-][A-Za-z0-9]{2,8})?$")
 
 
 async def setup(
@@ -73,6 +79,18 @@ def override_value(override: str) -> str:
     return override
 
 
+def language_value(language: str) -> str:
+    """Validate a frontend locale (en, ru_RU, sr_Latn) or a home language id (ru, he)."""
+    if not isinstance(language, str) or not LOCALE.match(language):
+        raise InvalidDataError(f"Invalid language: {language!r}")
+    return language
+
+
+def language_override_value(override: str) -> str:
+    """Validate a per-app language override: "follow" or a home language id."""
+    return override if override == FOLLOW else language_value(override)
+
+
 class HomeThemeProvider(PluginProvider):
     """Builtin provider holding each user's home theme claim and in-app choice."""
 
@@ -87,6 +105,11 @@ class HomeThemeProvider(PluginProvider):
             self.mass.register_api_command("home_theme/choose", self.choose_theme),
             self.mass.register_api_command(
                 "home_theme/claim", self.set_claim, required_scope=Scope.USERS_MANAGE
+            ),
+            self.mass.register_api_command("home_language/get", self.get_language),
+            self.mass.register_api_command("home_language/choose", self.choose_language),
+            self.mass.register_api_command(
+                "home_language/claim", self.set_language_claim, required_scope=Scope.USERS_MANAGE
             ),
         ]
 
@@ -153,6 +176,62 @@ class HomeThemeProvider(PluginProvider):
             stored.pop("choice")
         return self._save(user_id, stored)
 
+    async def get_language(self, username: str | None = None) -> dict[str, Any] | None:
+        """
+        Return a user's language claim and choice: the caller's own, or (users.manage) another's.
+
+        :param username: Another user's username; None is the signed-in user.
+        :return: {"user_id", "claim", "choice"}, or None for an unknown user.
+        """
+        user_id = await self._user_id(username)
+        if user_id is None:
+            return None
+        return self._state(user_id, LANGUAGE_STORAGE_KEY)
+
+    async def choose_language(self, language: str | None = None) -> dict[str, Any]:
+        """
+        Set the signed-in user's in-app language, or clear it ("Follow home language").
+
+        :param language: Frontend locale; None clears the choice.
+        """
+        user_id = await self._user_id(None)
+        assert user_id is not None  # the signed-in user exists
+        stored = self._stored(user_id, LANGUAGE_STORAGE_KEY)
+        if language is None:
+            stored.pop("choice", None)
+        else:
+            claim = stored.get("claim") or {}
+            stored["choice"] = {
+                "language": language_value(language),
+                "basis": claim.get("override", FOLLOW),
+            }
+        return self._save(user_id, stored, LANGUAGE_STORAGE_KEY)
+
+    async def set_language_claim(
+        self, username: str, language: str, override: str = FOLLOW
+    ) -> dict[str, Any] | None:
+        """
+        Store a user's home language as pushed by theme_sync; a new override drops the choice.
+
+        :param username: The user's username.
+        :param language: Effective frontend locale for Music Assistant.
+        :param override: The person's per-app language choice in authentik.
+        :return: The new state, or None for an unknown user.
+        """
+        claim = {
+            "language": language_value(language),
+            "override": language_override_value(override),
+        }
+        user_id = await self._user_id(username)
+        if user_id is None:
+            return None
+        stored = self._stored(user_id, LANGUAGE_STORAGE_KEY)
+        stored["claim"] = claim
+        choice = stored.get("choice")
+        if choice and choice.get("basis") != override:
+            stored.pop("choice")
+        return self._save(user_id, stored, LANGUAGE_STORAGE_KEY)
+
     async def _user_id(self, username: str | None) -> str | None:
         user = get_current_user()
         if user is None:
@@ -164,18 +243,18 @@ class HomeThemeProvider(PluginProvider):
         other = await self.mass.webserver.auth.get_user_by_username(username)
         return str(other.user_id) if other else None
 
-    def _stored(self, user_id: str) -> dict[str, Any]:
-        return dict(self.mass.config.get(f"{STORAGE_KEY}/{user_id}") or {})
+    def _stored(self, user_id: str, key: str = STORAGE_KEY) -> dict[str, Any]:
+        return dict(self.mass.config.get(f"{key}/{user_id}") or {})
 
-    def _state(self, user_id: str) -> dict[str, Any]:
-        stored = self._stored(user_id)
+    def _state(self, user_id: str, key: str = STORAGE_KEY) -> dict[str, Any]:
+        stored = self._stored(user_id, key)
         return {
             "user_id": user_id,
             "claim": stored.get("claim"),
             "choice": stored.get("choice"),
         }
 
-    def _save(self, user_id: str, stored: dict[str, Any]) -> dict[str, Any]:
-        self.mass.config.set(f"{STORAGE_KEY}/{user_id}", stored)
-        self.signal_provider_event({"user_id": user_id})
-        return self._state(user_id)
+    def _save(self, user_id: str, stored: dict[str, Any], key: str = STORAGE_KEY) -> dict[str, Any]:
+        self.mass.config.set(f"{key}/{user_id}", stored)
+        self.signal_provider_event({"user_id": user_id, "setting": key})
+        return self._state(user_id, key)
