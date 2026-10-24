@@ -130,6 +130,7 @@ async def test_touched_album_reports_its_songs_as_restored(provider: OpenSonicPr
     assert changes.complete
     assert changes.changed == {MediaType.ALBUM: {"a1"}}
     assert changes.restored == {MediaType.TRACK: {"s1"}}
+    assert changes.changed_at == {MediaType.TRACK: {"s1": int(_nd_time(T0)[0].timestamp())}}
     assert ("song?album_id=a2", "0") not in library.requests
 
 

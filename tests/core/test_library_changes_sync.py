@@ -192,9 +192,14 @@ async def _sync_changes(
     changed: dict[MediaType, set[str]] | None = None,
     removed: dict[MediaType, set[str]] | None = None,
     restored: dict[MediaType, set[str]] | None = None,
+    changed_at: dict[MediaType, dict[str, int]] | None = None,
 ) -> None:
     changes = LibraryChanges(
-        cursor="c", changed=changed or {}, removed=removed or {}, restored=restored or {}
+        cursor="c",
+        changed=changed or {},
+        removed=removed or {},
+        restored=restored or {},
+        changed_at=changed_at or {},
     )
     await provider.sync_library_changes(changes, _ALL)
 
@@ -318,6 +323,37 @@ async def test_restored_track_is_added_back_and_present_ones_left_alone(
     assert track is not None
     assert all(x.in_library for x in track.provider_mappings)
     assert update.call_count == 0
+
+
+async def test_restored_track_changed_after_the_last_write_is_updated(
+    mass: MusicAssistant, provider: _FakeFileProvider
+) -> None:
+    """A retag the song cursor stepped over still lands through its touched album."""
+    album = await _start_library(provider)
+    provider.library_tracks[0] = _track("t1", 1, album, name="Song 1 (edit)")
+    track = await _library_track(mass, "t1")
+    assert track is not None
+    rows = await mass.music.database.get_rows_from_query(
+        "SELECT timestamp_added, timestamp_modified FROM tracks WHERE item_id = :id",
+        {"id": int(track.item_id)},
+    )
+    written = max(rows[0]["timestamp_added"], rows[0]["timestamp_modified"])
+
+    with patch.object(
+        mass.music.tracks,
+        "update_item_in_library",
+        AsyncMock(wraps=mass.music.tracks.update_item_in_library),
+    ) as update:
+        await _sync_changes(
+            provider,
+            restored={MediaType.TRACK: {"t1", "t2"}},
+            changed_at={MediaType.TRACK: {"t1": written + 60, "t2": written - 60}},
+        )
+
+    assert [x.args[1].item_id for x in update.call_args_list] == ["t1"]
+    track = await _library_track(mass, "t1")
+    assert track is not None
+    assert track.name == "Song 1 (edit)"
 
 
 async def test_replaced_file_only_drops_the_old_mapping(

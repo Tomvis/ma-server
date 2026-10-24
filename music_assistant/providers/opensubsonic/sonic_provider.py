@@ -660,10 +660,12 @@ class OpenSonicProvider(MusicProvider):
                 target.setdefault(media_type, set()).add(str(item["id"]))
         if changes.complete:
             # a touched album may have regained tracks whose own change time is old
+            # and songs whose change was dated before the song cursor when it was scanned
             for album_id in sorted(changes.changed.get(MediaType.ALBUM, ())):
-                if (song_ids := await self._nd_album_song_ids(album_id)) is None:
+                if (songs := await self._nd_album_songs(album_id)) is None:
                     return None
-                changes.restored.setdefault(MediaType.TRACK, set()).update(song_ids)
+                changes.restored.setdefault(MediaType.TRACK, set()).update(songs)
+                changes.changed_at.setdefault(MediaType.TRACK, {}).update(songs)
         changes.cursor = json_dumps(newest)
         return changes
 
@@ -1281,15 +1283,15 @@ class OpenSonicProvider(MusicProvider):
                 return extras
             start += _ND_ALBUM_PAGE_SIZE
 
-    async def _nd_album_song_ids(self, album_id: str) -> set[str] | None:
+    async def _nd_album_songs(self, album_id: str) -> dict[str, int] | None:
         """
-        Return the id's of the songs of an album that are not missing.
+        Return the songs of an album that are not missing, as id -> change time (epoch).
 
         Returns None when the server has no Navidrome native API.
 
         :param album_id: The Navidrome album id.
         """
-        song_ids: set[str] = set()
+        songs: dict[str, int] = {}
         start = 0
         while True:
             page = await self._nd_get(
@@ -1305,9 +1307,11 @@ class OpenSonicProvider(MusicProvider):
             )
             if page is None:
                 return None
-            song_ids.update(str(song["id"]) for song in page)
+            songs.update(
+                (str(song["id"]), int(_nd_time(song["updatedAt"])[0].timestamp())) for song in page
+            )
             if len(page) < _ND_CHANGES_PAGE_SIZE:
-                return song_ids
+                return songs
             start += _ND_CHANGES_PAGE_SIZE
 
     async def _nd_changed_items(

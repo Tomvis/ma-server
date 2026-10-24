@@ -156,7 +156,9 @@ class LibraryChanges:
     :param removed: Provider item id's removed from the provider's library, per media type.
     :param restored: Provider item id's that may be back in the provider's library without
         reporting a change (e.g. a file moved back), per media type. Only the ones the library
-        lacks are added.
+        lacks, or last wrote before the item's changed_at time, are synced.
+    :param changed_at: When the provider last changed a restored item (epoch seconds), per
+        media type.
     """
 
     cursor: str
@@ -164,6 +166,7 @@ class LibraryChanges:
     changed: dict[MediaType, set[str]] = field(default_factory=dict)
     removed: dict[MediaType, set[str]] = field(default_factory=dict)
     restored: dict[MediaType, set[str]] = field(default_factory=dict)
+    changed_at: dict[MediaType, dict[str, int]] = field(default_factory=dict)
 
 
 # the media types a changes sync covers, in the order an item's dependencies are added
@@ -1408,7 +1411,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             changed_ids = changes.changed.get(media_type, set())
             if restored := changes.restored.get(media_type, set()) - changed_ids:
                 changed_ids = changed_ids | await self._ids_missing_from_library(
-                    media_type, restored
+                    media_type, restored, changes.changed_at.get(media_type, {})
                 )
             if changed_ids:
                 await sync_changed[media_type](self._iter_changed_items(media_type, changed_ids))
@@ -1439,16 +1442,24 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 await asyncio.sleep(0)  # yield to eventloop
 
     async def _ids_missing_from_library(
-        self, media_type: MediaType, item_ids: set[str]
+        self, media_type: MediaType, item_ids: set[str], changed_at: dict[str, int]
     ) -> set[str]:
-        """Return the given provider item id's this provider has no library mapping for."""
+        """
+        Return the given provider item id's the library lacks or holds an outdated copy of.
+
+        :param media_type: The media type of the item id's.
+        :param item_ids: The provider item id's to check.
+        :param changed_at: When the provider last changed an item (epoch seconds); a library
+            item last written before that is outdated.
+        """
         missing = set(item_ids)
         controller = self.mass.music.get_controller(media_type)
         ordered = sorted(item_ids)
         for index in range(0, len(ordered), SKIPPED_ITEM_QUERY_LIMIT):
+            chunk = ordered[index : index + SKIPPED_ITEM_QUERY_LIMIT]
             for library_item in await controller.get_library_items_by_prov_id(
                 provider_instance=self.instance_id,
-                provider_item_ids=ordered[index : index + SKIPPED_ITEM_QUERY_LIMIT],
+                provider_item_ids=chunk,
                 limit=SKIPPED_ITEM_QUERY_LIMIT,
             ):
                 missing -= {
@@ -1456,6 +1467,22 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                     for x in library_item.provider_mappings
                     if x.provider_instance == self.instance_id and x.in_library
                 }
+            if not (dated := [x for x in chunk if x in changed_at and x not in missing]):
+                continue
+            params = {f"id{i}": item_id for i, item_id in enumerate(dated)}
+            for row in await self.mass.music.database.get_rows_from_query(
+                "SELECT provider_mappings.provider_item_id, "
+                "MAX(items.timestamp_added, items.timestamp_modified) AS written "
+                f"FROM provider_mappings JOIN {controller.db_table} AS items "
+                "ON items.item_id = provider_mappings.item_id "
+                "WHERE provider_mappings.media_type = :media_type "
+                "AND provider_mappings.provider_instance = :instance "
+                f"AND provider_mappings.provider_item_id IN ({','.join(':' + k for k in params)})",
+                {"media_type": media_type.value, "instance": self.instance_id, **params},
+                limit=0,
+            ):
+                if (row["written"] or 0) < changed_at[row["provider_item_id"]]:
+                    missing.add(row["provider_item_id"])
         return missing
 
     async def _iter_changed_items(
