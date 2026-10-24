@@ -61,6 +61,7 @@ def _read_config(path: str) -> OIDCDeploymentConfig:
         "token_auth_method",
         "name",
         "allow_self_registration",
+        "link_existing_users",
         "backchannel_logout",
         "groups_claim",
         "scopes",
@@ -75,7 +76,12 @@ def _read_config(path: str) -> OIDCDeploymentConfig:
     for key in ("client_secret", "token_auth_method", "name", "groups_claim", "scopes"):
         if key in data and not isinstance(data[key], str):
             raise ValueError(f"OIDC deployment setting {key} must be a string")
-    for key in ("bootstrap_admin", "allow_self_registration", "backchannel_logout"):
+    for key in (
+        "bootstrap_admin",
+        "allow_self_registration",
+        "link_existing_users",
+        "backchannel_logout",
+    ):
         if key in data and not isinstance(data[key], bool):
             raise ValueError(f"OIDC deployment setting {key} must be a boolean")
     base_url = data["base_url"].strip()
@@ -110,6 +116,7 @@ def _read_config(path: str) -> OIDCDeploymentConfig:
             token_auth_method=method,
             name=name.strip(),
             allow_self_registration=registration,
+            link_existing_users=data.get("link_existing_users", False),
             backchannel_logout=data.get("backchannel_logout", False),
             groups_claim=groups_claim,
             scopes=scopes,

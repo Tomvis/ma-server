@@ -86,6 +86,7 @@ from music_assistant.controllers.webserver.helpers.oidc_provider import (
     CONF_OIDC_ENABLED,
     CONF_OIDC_GROUPS_CLAIM,
     CONF_OIDC_ISSUER,
+    CONF_OIDC_LINK_EXISTING_USERS,
     CONF_OIDC_NAME,
     CONF_OIDC_ROLE_MAPPING,
     CONF_OIDC_SCOPES,
@@ -2470,6 +2471,9 @@ class AuthenticationManager:
             ).strip(),
             allow_self_registration=bool(
                 self.webserver.get_config_value(CONF_OIDC_ALLOW_SELF_REGISTRATION, False)
+            ),
+            link_existing_users=bool(
+                self.webserver.get_config_value(CONF_OIDC_LINK_EXISTING_USERS, False)
             ),
             backchannel_logout=bool(
                 self.webserver.get_config_value(CONF_OIDC_BACKCHANNEL_LOGOUT, False)

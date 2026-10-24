@@ -46,6 +46,8 @@ CONF_OIDC_BACKCHANNEL_LOGOUT: Final = "oidc_backchannel_logout"
 CONF_OIDC_GROUPS_CLAIM: Final = "oidc_groups_claim"
 CONF_OIDC_ROLE_MAPPING: Final = "oidc_role_mapping"
 CONF_OIDC_SCOPES: Final = "oidc_scopes"
+# Fork (HW-221): opt-in link of an unlinked OIDC identity to the existing account with its username.
+CONF_OIDC_LINK_EXISTING_USERS: Final = "oidc_link_existing_users"
 OIDC_PROVIDER_ID: Final = "oidc"
 
 
@@ -109,6 +111,14 @@ def oidc_config_entries() -> tuple[ConfigEntry, ...]:
             default_value=False,
             depends_on=CONF_OIDC_ENABLED,
             requires_reload=True,
+        ),
+        ConfigEntry(
+            key=CONF_OIDC_LINK_EXISTING_USERS,
+            type=ConfigEntryType.BOOLEAN,
+            default_value=False,
+            depends_on=CONF_OIDC_ENABLED,
+            requires_reload=True,
+            advanced=True,
         ),
         ConfigEntry(
             key=CONF_OIDC_BACKCHANNEL_LOGOUT,
@@ -178,6 +188,7 @@ class OIDCProviderConfig(LoginProviderConfig):
     token_auth_method: str
     name: str
     allow_self_registration: bool
+    link_existing_users: NotRequired[bool]
     backchannel_logout: NotRequired[bool]
     groups_claim: NotRequired[str]
     role_mapping: NotRequired[dict[str, str]]
@@ -223,6 +234,11 @@ class OIDCLoginProvider(LoginProvider):
     def requires_redirect(self) -> bool:
         """Return True because OIDC signs in at the identity provider."""
         return True
+
+    @property
+    def link_existing_users(self) -> bool:
+        """Return whether a new identity may claim the unlinked account with its username."""
+        return self._oidc_config.get("link_existing_users", False)
 
     @property
     def backchannel_logout_enabled(self) -> bool:
@@ -304,6 +320,16 @@ class OIDCLoginProvider(LoginProvider):
         user = await self.auth_manager.get_user_by_provider_link(
             AuthProviderType.OIDC, identity_id, include_disabled=True
         )
+        # Fork (HW-221): an existing account this new identity claims by username. It is
+        # linked before role mapping (which only updates linked accounts) and unlinked again
+        # when the mapping denies access, so a denied sign-in leaves no link behind.
+        link_to = None if user is not None else await self._linkable_user(claims)
+        linked_now = link_to is not None and link_to.enabled
+        if link_to is not None and linked_now:
+            await self.auth_manager.link_user_to_provider(
+                link_to, AuthProviderType.OIDC, identity_id
+            )
+            user = link_to
         mapped_role: str | None = None
         if self._role_mapping:
             try:
@@ -317,12 +343,20 @@ class OIDCLoginProvider(LoginProvider):
                     await self.auth_manager.oidc_sessions.revoke_identity(
                         self.client.issuer, self.client.client_id, claims["sub"]
                     )
+                if link_to is not None and linked_now:
+                    await self._unlink(link_to, identity_id)
                 raise AuthenticationFailed("OpenID Connect role mapping denied access") from err
+        if user is None and link_to is not None:
+            raise AuthenticationFailed(
+                "User account is disabled", translation_key="user_account_disabled"
+            )
         if user is not None:
             if not user.enabled:
                 raise AuthenticationFailed(
                     "User account is disabled", translation_key="user_account_disabled"
                 )
+            if linked_now:
+                self.logger.info("Linked OpenID Connect identity to user %s", user.username)
             return user
         if not self.allow_self_registration:
             raise AuthenticationFailed(
@@ -354,6 +388,42 @@ class OIDCLoginProvider(LoginProvider):
             else username,
             oidc_bootstrap=bootstrap,
             provider_link=(AuthProviderType.OIDC, identity_id),
+        )
+
+    async def _linkable_user(self, claims: dict[str, Any]) -> User | None:
+        """
+        Return the existing account an unlinked identity may claim, if linking is enabled.
+
+        Fork (HW-221), like Home Assistant's username linking: the account whose username
+        matches the slugified preferred_username, unless it is a service account or already
+        linked to an OIDC identity. Only enable it when the IdP controls its usernames.
+        """
+        if not self.link_existing_users:
+            return None
+        preferred_username = claims.get("preferred_username")
+        if not isinstance(preferred_username, str) or len(slugify(preferred_username)) < 2:
+            return None
+        user = await self.auth_manager.get_user_by_username(
+            slugify(preferred_username)[:50], include_disabled=True
+        )
+        if user is None or user.role == UserRole.SERVICE:
+            return None
+        if await self.auth_manager.database.get_row(
+            "user_auth_providers",
+            {"user_id": user.user_id, "provider_type": AuthProviderType.OIDC.value},
+        ):
+            return None
+        return user
+
+    async def _unlink(self, user: User, identity_id: str) -> None:
+        """Remove a link made by this sign-in, for a sign-in that is then denied."""
+        await self.auth_manager.database.delete(
+            "user_auth_providers",
+            {
+                "user_id": user.user_id,
+                "provider_type": AuthProviderType.OIDC.value,
+                "provider_user_id": identity_id,
+            },
         )
 
     async def _ensure_mapped_role_exists(self, role_id: str) -> None:

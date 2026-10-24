@@ -53,6 +53,8 @@ async def test_jsonrpc_command_runs_as_the_impersonated_user(
     mass.music.database.execute = AsyncMock()
     mass.music.database.commit = AsyncMock()
     mass.translations.ensure_locale_loaded = AsyncMock()  # type: ignore[method-assign]
+    # OIDC setup (server#7076) reads the webserver config during auth setup.
+    webserver.config = await mass.config.get_core_config("webserver")
     await webserver.auth.setup()
     service = await webserver.auth.create_user(username="ha_service", role=UserRole.SERVICE)
     guest = await webserver.auth.create_user(username="guest", role=UserRole.GUEST)

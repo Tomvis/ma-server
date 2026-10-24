@@ -144,7 +144,10 @@ See the user-management documentation for the file format and container example.
 [oidc_provider.py](helpers/oidc_provider.py) hashes the exact `(issuer, sub)` pair into an
 `oidc` link in `user_auth_providers`. Self-registration creates a User unless group mapping
 assigns another role. Matching usernames or emails never link OIDC to local or Home Assistant
-accounts; collisions get distinct usernames. Home Assistant's local-account linking remains
+accounts; collisions get distinct usernames. Fork (HW-221): the advanced `oidc_link_existing_users`
+setting (`link_existing_users` in the mounted configuration, default off) instead links a
+first sign-in to the enabled, non-service account whose username equals the slugified
+`preferred_username`, if that account has no OIDC link yet, like Home Assistant sign-in does. Home Assistant's local-account linking remains
 available, but excludes OIDC accounts. Disabled users cannot sign in. Player restrictions
 and display settings remain locally managed.
 

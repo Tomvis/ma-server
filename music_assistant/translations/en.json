@@ -1006,6 +1006,8 @@
   "core.webserver.config_entries.oidc_groups_claim.label": "OpenID Connect groups claim",
   "core.webserver.config_entries.oidc_issuer.description": "The exact HTTPS issuer identifier from your provider's discovery document, including any trailing slash. Discovery must advertise PKCE S256 and signed ID tokens.",
   "core.webserver.config_entries.oidc_issuer.label": "OpenID Connect issuer",
+  "core.webserver.config_entries.oidc_link_existing_users.description": "When an identity signs in for the first time, link it to the existing account whose username matches its preferred_username (as Home Assistant sign-in does), keeping that account's library, favourites and player access. Skips service accounts and accounts already linked to OpenID Connect. Only enable this when your identity provider controls usernames.",
+  "core.webserver.config_entries.oidc_link_existing_users.label": "Link OpenID Connect sign-ins to existing accounts",
   "core.webserver.config_entries.oidc_managed.label": "OpenID Connect and the Internal URL are managed by your deployment. Update the mounted configuration file and restart Music Assistant to change them.",
   "core.webserver.config_entries.oidc_name.description": "The name shown on the sign-in button, for example Authentik.",
   "core.webserver.config_entries.oidc_name.label": "Identity provider name",
