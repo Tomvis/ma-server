@@ -18,8 +18,8 @@ from music_assistant.providers.podcast_index.constants import MAX_ERROR_DETAIL_L
 from music_assistant.providers.podcast_index.helpers import make_api_request
 from music_assistant.providers.podcast_index.provider import PodcastIndexProvider
 
-API_KEY = "key"
-API_SECRET = "secret"
+API_KEY = "pi-test-key-7f3a"
+API_SECRET = "pi-test-secret-9c2e"
 
 
 class _FakeResponse:
