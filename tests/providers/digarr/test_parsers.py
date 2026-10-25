@@ -213,3 +213,36 @@ async def test_track_without_a_title_is_not_resolved(track_mass: MagicMock) -> N
     """Nothing to search for: no card rather than a guess."""
     assert await resolve_track(make_track_rec(track_title=None), track_mass, "digarr--x") is None
     track_mass.music.tracks.search.assert_not_called()
+
+
+async def test_track_accepts_the_artist_credited_with_a_leading_the(
+    track_mass: MagicMock,
+) -> None:
+    """Digarr's "Traveling Wilburys" is the providers' "The Traveling Wilburys"."""
+    hit = make_track("t1", "Handle With Care", "The Traveling Wilburys")
+    track_mass.music.tracks.search = AsyncMock(return_value=[hit])
+
+    rec = make_track_rec(artist_name="Traveling Wilburys", track_title="Handle With Care")
+    assert await resolve_track(rec, track_mass, "digarr--x") is hit
+
+
+async def test_track_skips_a_top_ranked_cover_for_the_original(track_mass: MagicMock) -> None:
+    """A cover ranked first must not hide the original further down the same results."""
+    cover = make_track("y1", "Windowpane", "Some Cover Band")
+    original = make_track("y2", "Windowpane", "Opeth")
+    track_mass.music.tracks.search = AsyncMock(return_value=[cover, original])
+
+    assert await resolve_track(make_track_rec(), track_mass, "digarr--x") is original
+
+
+async def test_artist_accepts_a_leading_the(mass: MagicMock) -> None:
+    """An artist search hit differing only by a leading "The" is the same artist."""
+    hit = Artist(
+        item_id="t", provider="tidal", name="The Traveling Wilburys", provider_mappings=set()
+    )
+    mass.music.providers = [make_provider("tidal--1")]
+    mass.music.artists.search = AsyncMock(return_value=[hit])
+
+    assert (
+        await resolve_artist(make_rec(artist_name="Traveling Wilburys"), mass, "digarr--x") is hit
+    )

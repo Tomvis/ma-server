@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID, MediaType, ProviderFeature
@@ -31,6 +32,7 @@ from music_assistant.providers.digarr.constants import (
     DOMAIN,
     PROVIDER_SEARCH_LIMIT,
     SEARCH_CONCURRENCY_LIMIT,
+    TRACK_SEARCH_LIMIT,
 )
 
 if TYPE_CHECKING:
@@ -44,6 +46,8 @@ LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.digarr")
 
 # Limit concurrent provider searches to avoid overwhelming their APIs.
 _SEARCH_SEMAPHORE = asyncio.Semaphore(SEARCH_CONCURRENCY_LIMIT)
+
+_LEADING_THE = re.compile(r"^the\s+", re.IGNORECASE)
 
 
 async def resolve_artist(
@@ -111,6 +115,18 @@ async def resolve_track(
     )
 
 
+def _names_match(name1: str, name2: str) -> bool:
+    """
+    Return True if two names match loosely, also ignoring a leading "The".
+
+    MusicBrainz (and so digarr) credits "Traveling Wilburys" where providers say
+    "The Traveling Wilburys"; compare_strings alone rejects that pair.
+    """
+    return compare_strings(name1, name2, strict=False) or compare_strings(
+        _LEADING_THE.sub("", name1), _LEADING_THE.sub("", name2), strict=False
+    )
+
+
 def _is_matching_result(
     item_mapping: ItemMapping, result: Artist | Album | Track, artist_name: str | None
 ) -> bool:
@@ -128,9 +144,7 @@ def _is_matching_result(
         if artist_name and searched_name.startswith(f"{artist_name} - ")
         else searched_name
     )
-    if not compare_strings(title_part, result.name, strict=False) and not compare_strings(
-        searched_name, result.name, strict=False
-    ):
+    if not _names_match(title_part, result.name) and not _names_match(searched_name, result.name):
         return False
 
     # Verify the artist too: a matching title from a different artist (cover or karaoke
@@ -138,8 +152,7 @@ def _is_matching_result(
     result_artists = getattr(result, "artists", None)
     if artist_name and result_artists:
         return any(
-            compare_strings(artist_name, result_artist.name, strict=False)
-            for result_artist in result_artists
+            _names_match(artist_name, result_artist.name) for result_artist in result_artists
         )
     return True
 
@@ -179,9 +192,9 @@ async def _search_provider(
     ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     provider: Any,
-) -> Artist | Album | Track | None:
+) -> list[Artist | Album | Track]:
     """
-    Search a single provider for a matching item.
+    Search a single provider and return its candidate items, best ranked first.
 
     :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
@@ -196,16 +209,16 @@ async def _search_provider(
                 item_mapping.name,
             )
             # Use a higher limit to work around provider bugs (e.g. Spotify misbehaves at limit=1).
-            search_results = await ctrl.search(
-                item_mapping.name, provider.instance_id, limit=PROVIDER_SEARCH_LIMIT
+            # Songs search deeper: covers and karaoke versions often outrank the original.
+            limit = (
+                TRACK_SEARCH_LIMIT
+                if item_mapping.media_type == MediaType.TRACK
+                else PROVIDER_SEARCH_LIMIT
             )
-            if not search_results:
-                return None
-
-            return search_results[0]
+            return list(await ctrl.search(item_mapping.name, provider.instance_id, limit=limit))
         except MusicAssistantError as err:
             LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
-            return None
+            return []
 
 
 async def _search_providers_concurrent(
@@ -228,11 +241,15 @@ async def _search_providers_concurrent(
     ]
 
     for task in asyncio.as_completed(tasks):
-        result = await task
-        if result is None:
-            continue
-
-        if _is_matching_result(item_mapping, result, artist_name):
+        for result in await task:
+            if not _is_matching_result(item_mapping, result, artist_name):
+                LOGGER.debug(
+                    "Rejecting %s from %s: name mismatch (searched: %s)",
+                    result.name,
+                    result.provider,
+                    item_mapping.name,
+                )
+                continue
             LOGGER.debug(
                 "Match on %s: %s (searched: %s)",
                 result.provider,
@@ -244,13 +261,6 @@ async def _search_providers_concurrent(
                     t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             return result
-
-        LOGGER.debug(
-            "Rejecting %s from %s: name mismatch (searched: %s)",
-            result.name,
-            result.provider,
-            item_mapping.name,
-        )
 
     return None
 

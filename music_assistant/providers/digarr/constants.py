@@ -31,6 +31,8 @@ RESOLUTION_BUFFER: Final[int] = 15
 SEARCH_CONCURRENCY_LIMIT: Final[int] = 5
 # Work around providers that misbehave at limit=1.
 PROVIDER_SEARCH_LIMIT: Final[int] = 2
+# Song search hits scanned per provider for one by the recommended artist.
+TRACK_SEARCH_LIMIT: Final[int] = 10
 # Number of library search hits scanned when checking for an existing copy.
 LIBRARY_MATCH_SCAN_LIMIT: Final[int] = 5
 
