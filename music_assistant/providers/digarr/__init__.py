@@ -858,6 +858,9 @@ class DigarrProvider(PluginProvider):
             if artist is None:
                 unresolved.append(rec.artist_name)
                 continue
+            if artist.uri in rec_ids:
+                # Another rec for the same artist (e.g. two of its albums): one card, one slot.
+                continue
             if len(items) >= self._row_size:
                 dropped_by_cap += 1
                 continue
@@ -933,6 +936,8 @@ class DigarrProvider(PluginProvider):
         for rec, track in zip(candidates, resolved, strict=True):
             if track is None:
                 unresolved.append(f"{rec.artist_name} - {rec.track_title}")
+                continue
+            if track.uri in rec_ids:
                 continue
             if len(items) >= self._row_size:
                 continue

@@ -392,3 +392,31 @@ async def test_refresh_resolves_for_the_bound_user(provider: DigarrProvider) -> 
     provider.mass.webserver.auth.get_user_by_username.assert_awaited_once_with("tom")
     assert resolve_a.await_args_list[0].kwargs["user"] is tom
     assert resolve_t.await_args_list[0].kwargs["user"] is tom
+
+
+async def test_repeat_artist_does_not_take_a_row_slot(provider: DigarrProvider) -> None:
+    """Two album recs by one artist render as one card, so the row fills past the repeat."""
+    provider._row_size = 2
+    madonna = Artist(item_id="m", provider="tidal", name="Madonna", provider_mappings=set())
+    cher = Artist(item_id="c", provider="tidal", name="Cher", provider_mappings=set())
+    provider._client.get_pending = AsyncMock(
+        return_value=[make_rec(1, "Madonna"), make_rec(2, "Madonna"), make_rec(3, "Cher")]
+    )
+    resolve = AsyncMock(side_effect=[madonna, madonna, cher])
+    with patch("music_assistant.providers.digarr.resolve_artist", resolve):
+        await provider._refresh()
+    assert provider._items == [madonna, cher]
+    assert provider._rec_ids[madonna.uri] == 1
+
+
+async def test_repeat_song_does_not_take_a_row_slot(provider: DigarrProvider) -> None:
+    """Two recs resolving to one track render once, so the songs row fills past it."""
+    provider._row_size = 2
+    provider._client.get_pending = AsyncMock(return_value=[])
+    provider._client.get_pending_tracks = AsyncMock(
+        return_value=[make_track_rec(rec_id=1), make_track_rec(rec_id=2), make_track_rec(rec_id=3)]
+    )
+    resolve = AsyncMock(side_effect=[make_track("a"), make_track("a"), make_track("b")])
+    with patch("music_assistant.providers.digarr.resolve_track", resolve):
+        await provider._refresh()
+    assert [t.item_id for t in provider._track_items] == ["a", "b"]
