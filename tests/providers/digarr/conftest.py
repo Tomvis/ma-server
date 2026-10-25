@@ -143,6 +143,7 @@ def provider() -> Generator[DigarrProvider]:
     """
     mass = MagicMock()
     mass.http_session = MagicMock()
+    mass.webserver.auth.get_user_by_username = AsyncMock(return_value=None)
     manifest = MagicMock()
     manifest.type = ProviderType.PLUGIN
     manifest.domain = "digarr"

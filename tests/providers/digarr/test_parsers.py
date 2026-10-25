@@ -246,3 +246,45 @@ async def test_artist_accepts_a_leading_the(mass: MagicMock) -> None:
     assert (
         await resolve_artist(make_rec(artist_name="Traveling Wilburys"), mass, "digarr--x") is hit
     )
+
+
+async def test_track_skips_providers_the_user_cannot_see(
+    track_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another user's Tidal must not serve this user's row: the row would hide the card."""
+    mine = make_provider("tidal--mine")
+    mine.supported_features = {ProviderFeature.LIBRARY_TRACKS}
+    theirs = make_provider("tidal--theirs")
+    theirs.supported_features = {ProviderFeature.LIBRARY_TRACKS}
+    track_mass.music.providers = [theirs, mine]
+    user = MagicMock()
+    monkeypatch.setattr(
+        "music_assistant.providers.digarr.parsers.visible_provider",
+        lambda _mass, instance_id, _user: None if instance_id == "tidal--theirs" else object(),
+    )
+    hit = make_track("t1", "Windowpane", "Opeth", provider="tidal")
+    track_mass.music.tracks.search = AsyncMock(return_value=[hit])
+
+    assert await resolve_track(make_track_rec(), track_mass, "digarr--x", user=user) is hit
+    searched = [c.args[1] for c in track_mass.music.tracks.search.call_args_list]
+    assert searched == ["tidal--mine"]
+
+
+async def test_library_copy_the_user_cannot_see_falls_back_to_streaming(
+    track_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library copy only on another user's source is no card for this user."""
+    owned = Track(item_id="9", provider="library", name="Windowpane", provider_mappings=set())
+    track_mass.music.tracks.get_library_item_by_external_ids = AsyncMock(return_value=owned)
+    hit = make_track("y1", "Windowpane", "Opeth")
+    track_mass.music.tracks.search = AsyncMock(return_value=[hit])
+    monkeypatch.setattr(
+        "music_assistant.providers.digarr.parsers.visible_items",
+        lambda _mass, items, _user: [i for i in items if i is not owned],
+    )
+    monkeypatch.setattr(
+        "music_assistant.providers.digarr.parsers.visible_provider",
+        lambda _mass, _instance_id, _user: object(),
+    )
+
+    assert await resolve_track(make_track_rec(), track_mass, "digarr--x", user=MagicMock()) is hit

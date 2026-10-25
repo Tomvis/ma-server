@@ -51,6 +51,7 @@ from music_assistant.providers.digarr.constants import (
 from music_assistant.providers.digarr.parsers import resolve_artist, resolve_track
 
 if TYPE_CHECKING:
+    from music_assistant_models.auth import User
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.media_items import (
         Artist,
@@ -840,8 +841,10 @@ class DigarrProvider(PluginProvider):
             self.logger.warning("digarr: could not fetch pending recommendations: %s", err)
             return
 
+        # Resolve as the bound user: rows hide items on sources the viewer can't see.
+        user = await self.mass.webserver.auth.get_user_by_username(self._ma_user)
         resolved = await asyncio.gather(
-            *[resolve_artist(rec, self.mass, self.instance_id) for rec in candidates]
+            *[resolve_artist(rec, self.mass, self.instance_id, user=user) for rec in candidates]
         )
 
         items: list[Artist] = []
@@ -864,7 +867,7 @@ class DigarrProvider(PluginProvider):
             artist_ids[artist.uri] = rec.artist_id
             mbid_artist_ids[rec.artist_mbid] = rec.artist_id
 
-        track_items, track_rec_ids, recording_rec_ids = await self._refresh_tracks()
+        track_items, track_rec_ids, recording_rec_ids = await self._refresh_tracks(user)
         rec_ids.update(track_rec_ids)
 
         self._items = items
@@ -894,7 +897,7 @@ class DigarrProvider(PluginProvider):
         self.signal_provider_event({"event": EVENT_RECOMMENDATIONS_UPDATED})
 
     async def _refresh_tracks(
-        self,
+        self, user: User | None
     ) -> tuple[list[Track], dict[str, int], dict[str, int]]:
         """
         Build the songs row's next generation: items, uri -> rec id, recording -> rec id.
@@ -902,6 +905,8 @@ class DigarrProvider(PluginProvider):
         Fetched separately from artists so a song-side failure (e.g. a digarr without
         track support answering 400) keeps the previous songs and never costs the
         artist row its refresh.
+
+        :param user: The bound user, to resolve only on sources they can see.
         """
         try:
             candidates = [
@@ -919,7 +924,7 @@ class DigarrProvider(PluginProvider):
             return self._track_items, previous, self._recording_rec_ids
 
         resolved = await asyncio.gather(
-            *[resolve_track(rec, self.mass, self.instance_id) for rec in candidates]
+            *[resolve_track(rec, self.mass, self.instance_id, user=user) for rec in candidates]
         )
         items: list[Track] = []
         rec_ids: dict[str, int] = {}

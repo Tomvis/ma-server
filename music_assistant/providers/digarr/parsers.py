@@ -28,6 +28,7 @@ from music_assistant_models.media_items import Album, Artist, ItemMapping, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
 from music_assistant.helpers.compare import compare_strings
+from music_assistant.helpers.provider_access import visible_items, visible_provider
 from music_assistant.providers.digarr.constants import (
     DOMAIN,
     PROVIDER_SEARCH_LIMIT,
@@ -36,6 +37,8 @@ from music_assistant.providers.digarr.constants import (
 )
 
 if TYPE_CHECKING:
+    from music_assistant_models.auth import User
+
     from music_assistant import MusicAssistant
     from music_assistant.controllers.music.media.albums import AlbumsController
     from music_assistant.controllers.music.media.artists import ArtistsController
@@ -54,6 +57,7 @@ async def resolve_artist(
     rec: DigarrRecommendation,
     mass: MusicAssistant,
     provider_instance_to_skip: str,
+    user: User | None = None,
 ) -> Artist | None:
     """
     Resolve a digarr recommendation to a library or streaming-provider Artist.
@@ -64,6 +68,7 @@ async def resolve_artist(
     :param rec: The digarr recommendation to resolve.
     :param mass: MusicAssistant instance for accessing library and providers.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
+    :param user: The user the row is for; only sources they can see resolve.
     """
     item_mapping = ItemMapping(
         media_type=MediaType.ARTIST,
@@ -76,7 +81,7 @@ async def resolve_artist(
     )
     return cast(
         "Artist | None",
-        await _resolve_item(item_mapping, mass, provider_instance_to_skip),
+        await _resolve_item(item_mapping, mass, provider_instance_to_skip, user=user),
     )
 
 
@@ -84,6 +89,7 @@ async def resolve_track(
     rec: DigarrRecommendation,
     mass: MusicAssistant,
     provider_instance_to_skip: str,
+    user: User | None = None,
 ) -> Track | None:
     """
     Resolve a digarr song recommendation to a library or streaming-provider Track.
@@ -94,6 +100,7 @@ async def resolve_track(
     :param rec: The digarr track recommendation to resolve.
     :param mass: MusicAssistant instance for accessing library and providers.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
+    :param user: The user the row is for; only sources they can see resolve.
     """
     if not rec.track_title:
         return None
@@ -110,7 +117,11 @@ async def resolve_track(
     return cast(
         "Track | None",
         await _resolve_item(
-            item_mapping, mass, provider_instance_to_skip, artist_name=rec.artist_name
+            item_mapping,
+            mass,
+            provider_instance_to_skip,
+            artist_name=rec.artist_name,
+            user=user,
         ),
     )
 
@@ -158,7 +169,10 @@ def _is_matching_result(
 
 
 def _get_streaming_providers(
-    mass: MusicAssistant, item_mapping: ItemMapping, provider_instance_to_skip: str
+    mass: MusicAssistant,
+    item_mapping: ItemMapping,
+    provider_instance_to_skip: str,
+    user: User | None = None,
 ) -> list[Any]:
     """
     Return streaming providers that support the ItemMapping's media type.
@@ -166,12 +180,16 @@ def _get_streaming_providers(
     :param mass: MusicAssistant instance.
     :param item_mapping: ItemMapping with the media type to search for.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
+    :param user: Only providers this user can see; None for all.
     """
     streaming_providers = []
     for p in mass.music.providers:
         if p.instance_id == provider_instance_to_skip:
             continue
         if not p.is_streaming_provider:
+            continue
+        # Rows drop items on sources the viewer can't see (e.g. another user's Tidal).
+        if user is not None and visible_provider(mass, p.instance_id, user) is None:
             continue
 
         if item_mapping.media_type == MediaType.ARTIST:
@@ -270,6 +288,7 @@ async def _resolve_item(
     mass: MusicAssistant,
     provider_instance_to_skip: str,
     artist_name: str | None = None,
+    user: User | None = None,
 ) -> Artist | Album | Track | None:
     """
     Resolve an ItemMapping to a library or provider item.
@@ -278,6 +297,7 @@ async def _resolve_item(
     :param mass: MusicAssistant instance.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
     :param artist_name: Artist name to verify candidate matches against, if known.
+    :param user: The user the row is for; only items they can see resolve.
     """
     ctrl: ArtistsController | AlbumsController | TracksController
     if item_mapping.media_type == MediaType.ARTIST:
@@ -296,11 +316,14 @@ async def _resolve_item(
         item_mapping.external_ids or "none",
     )
 
-    if library_item := await ctrl.get_library_item_by_external_ids(item_mapping.external_ids):
+    library_item = await ctrl.get_library_item_by_external_ids(item_mapping.external_ids)
+    if library_item and visible_items(mass, [library_item], user):
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
         return library_item
 
-    streaming_providers = _get_streaming_providers(mass, item_mapping, provider_instance_to_skip)
+    streaming_providers = _get_streaming_providers(
+        mass, item_mapping, provider_instance_to_skip, user
+    )
     if not streaming_providers:
         LOGGER.debug("No streaming providers available for resolution")
         return None
@@ -316,7 +339,8 @@ async def _resolve_item(
     # provide; re-check the library against the resolved item's external IDs so we prefer
     # the user's own copy when it exists.
     if result.external_ids:
-        if library_item := await ctrl.get_library_item_by_external_ids(result.external_ids):
+        library_item = await ctrl.get_library_item_by_external_ids(result.external_ids)
+        if library_item and visible_items(mass, [library_item], user):
             LOGGER.debug(
                 "Found %s in library via resolved external IDs: %s",
                 item_mapping.media_type.value,

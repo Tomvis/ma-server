@@ -374,3 +374,21 @@ async def test_track_recommendation_id_falls_back_to_the_recording_mbid(
     track.external_ids.add((ExternalID.MB_RECORDING, "rec-mbid"))
     provider._recording_rec_ids = {"rec-mbid": 7}
     assert provider.recommendation_id_for(track.uri, track) == 7
+
+
+async def test_refresh_resolves_for_the_bound_user(provider: DigarrProvider) -> None:
+    """Rows hide items on sources the viewer can't see, so resolve as the bound user."""
+    tom = MagicMock()
+    provider.mass.webserver.auth.get_user_by_username = AsyncMock(return_value=tom)
+    provider._client.get_pending = AsyncMock(return_value=[make_rec()])
+    provider._client.get_pending_tracks = AsyncMock(return_value=[make_track_rec()])
+    resolve_a = AsyncMock(return_value=None)
+    resolve_t = AsyncMock(return_value=None)
+    with (
+        patch("music_assistant.providers.digarr.resolve_artist", resolve_a),
+        patch("music_assistant.providers.digarr.resolve_track", resolve_t),
+    ):
+        await provider._refresh()
+    provider.mass.webserver.auth.get_user_by_username.assert_awaited_once_with("tom")
+    assert resolve_a.await_args_list[0].kwargs["user"] is tom
+    assert resolve_t.await_args_list[0].kwargs["user"] is tom
