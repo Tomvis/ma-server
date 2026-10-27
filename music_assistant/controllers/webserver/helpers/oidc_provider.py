@@ -48,6 +48,8 @@ CONF_OIDC_ROLE_MAPPING: Final = "oidc_role_mapping"
 CONF_OIDC_SCOPES: Final = "oidc_scopes"
 # Fork (HW-221): opt-in link of an unlinked OIDC identity to the existing account with its username.
 CONF_OIDC_LINK_EXISTING_USERS: Final = "oidc_link_existing_users"
+# Fork (HW-250): OIDC-only sign-in; the built-in password provider is hidden and refused.
+CONF_OIDC_DISABLE_PASSWORD_LOGIN: Final = "oidc_disable_password_login"  # noqa: S105 - config key
 OIDC_PROVIDER_ID: Final = "oidc"
 
 
@@ -114,6 +116,14 @@ def oidc_config_entries() -> tuple[ConfigEntry, ...]:
         ),
         ConfigEntry(
             key=CONF_OIDC_LINK_EXISTING_USERS,
+            type=ConfigEntryType.BOOLEAN,
+            default_value=False,
+            depends_on=CONF_OIDC_ENABLED,
+            requires_reload=True,
+            advanced=True,
+        ),
+        ConfigEntry(
+            key=CONF_OIDC_DISABLE_PASSWORD_LOGIN,
             type=ConfigEntryType.BOOLEAN,
             default_value=False,
             depends_on=CONF_OIDC_ENABLED,

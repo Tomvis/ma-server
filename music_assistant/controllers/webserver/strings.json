@@ -43,6 +43,10 @@
       "label": "Link OpenID Connect sign-ins to existing accounts",
       "description": "When an identity signs in for the first time, link it to the existing account whose username matches its preferred_username (as Home Assistant sign-in does), keeping that account's library, favourites and player access. Skips service accounts and accounts already linked to OpenID Connect. Only enable this when your identity provider controls usernames."
     },
+    "oidc_disable_password_login": {
+      "label": "Only allow OpenID Connect sign-in",
+      "description": "Hide and refuse Music Assistant username and password sign-in, so people sign in only through your identity provider. Existing sessions and access tokens keep working, and passwords are kept. Has no effect until OpenID Connect is set up, so a broken provider configuration never locks everyone out."
+    },
     "oidc_backchannel_logout": {
       "label": "Accept OpenID Connect logout notifications",
       "description": "Let your identity provider end the Music Assistant sessions created through OpenID Connect. Register /auth/oidc/backchannel-logout on this server as the provider's back-channel logout URL. Local password sessions and separately created access tokens are unaffected."

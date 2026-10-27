@@ -1000,6 +1000,8 @@
   "core.webserver.config_entries.oidc_client_id.label": "OpenID Connect client ID",
   "core.webserver.config_entries.oidc_client_secret.description": "The registered client secret. Stored encrypted. Required unless the client authentication method is none.",
   "core.webserver.config_entries.oidc_client_secret.label": "OpenID Connect client secret",
+  "core.webserver.config_entries.oidc_disable_password_login.description": "Hide and refuse Music Assistant username and password sign-in, so people sign in only through your identity provider. Existing sessions and access tokens keep working, and passwords are kept. Has no effect until OpenID Connect is set up, so a broken provider configuration never locks everyone out.",
+  "core.webserver.config_entries.oidc_disable_password_login.label": "Only allow OpenID Connect sign-in",
   "core.webserver.config_entries.oidc_enabled.description": "Offer sign-in through an OpenID Connect identity provider such as Authentik, Keycloak or Authelia. Built-in and Home Assistant sign-in remain available.",
   "core.webserver.config_entries.oidc_enabled.label": "Enable OpenID Connect",
   "core.webserver.config_entries.oidc_groups_claim.description": "The claim containing a list of group names, usually groups. Used only when group-to-role mapping is configured. Your provider must include it in the ID token or UserInfo response.",

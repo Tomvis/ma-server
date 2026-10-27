@@ -83,6 +83,7 @@ from music_assistant.controllers.webserver.helpers.oidc_provider import (
     CONF_OIDC_BACKCHANNEL_LOGOUT,
     CONF_OIDC_CLIENT_ID,
     CONF_OIDC_CLIENT_SECRET,
+    CONF_OIDC_DISABLE_PASSWORD_LOGIN,
     CONF_OIDC_ENABLED,
     CONF_OIDC_GROUPS_CLAIM,
     CONF_OIDC_ISSUER,
@@ -267,8 +268,24 @@ class AuthenticationManager:
         provider = self.login_providers.get(provider_id)
         if not provider:
             return AuthResult(success=False, error="Invalid provider")
+        if isinstance(provider, BuiltinLoginProvider) and self.password_login_disabled:
+            return AuthResult(success=False, error="Password sign-in is disabled")
 
         return await provider.authenticate(credentials)
+
+    @property
+    def password_login_disabled(self) -> bool:
+        """
+        Whether OIDC-only mode hides and refuses password sign-in (fork, HW-250).
+
+        Only while OIDC is set up and accounts exist, so a broken OIDC configuration or a
+        fresh server never leaves no way in. Passwords stay stored and settable.
+        """
+        return (
+            self.has_users
+            and OIDC_PROVIDER_ID in self.login_providers
+            and bool(self.webserver.get_config_value(CONF_OIDC_DISABLE_PASSWORD_LOGIN, False))
+        )
 
     async def authenticate_with_token(self, token: str) -> User | None:
         """
@@ -1074,6 +1091,8 @@ class AuthenticationManager:
         providers = []
         # a concurrent listing can add or remove the HA provider while this one awaits
         for provider_id, provider in list(self.login_providers.items()):
+            if isinstance(provider, BuiltinLoginProvider) and self.password_login_disabled:
+                continue
             providers.append(
                 {
                     "provider_id": provider_id,

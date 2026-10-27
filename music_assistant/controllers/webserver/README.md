@@ -147,7 +147,10 @@ assigns another role. Matching usernames or emails never link OIDC to local or H
 accounts; collisions get distinct usernames. Fork (HW-221): the advanced `oidc_link_existing_users`
 setting (`link_existing_users` in the mounted configuration, default off) instead links a
 first sign-in to the enabled, non-service account whose username equals the slugified
-`preferred_username`, if that account has no OIDC link yet, like Home Assistant sign-in does. Home Assistant's local-account linking remains
+`preferred_username`, if that account has no OIDC link yet, like Home Assistant sign-in does.
+Fork (HW-250): the advanced `oidc_disable_password_login` setting hides the built-in provider
+from `auth/providers` and refuses its sign-in, once OIDC is set up and accounts exist.
+Passwords, sessions and access tokens are kept. Home Assistant's local-account linking remains
 available, but excludes OIDC accounts. Disabled users cannot sign in. Player restrictions
 and display settings remain locally managed.
 
