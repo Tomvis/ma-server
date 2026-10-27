@@ -1784,3 +1784,18 @@ def _create_mp3_with_cover(tmp_path: pathlib.Path, track_path: str) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def test_critical_reception_parses_review_type() -> None:
+    """<SRC>_REVIEW_TYPE names the post the text came from; without text it is dropped."""
+    cr = _make_audio_tags(
+        {
+            "tpsreview": "Prog.",
+            "tpsreviewtype": "RFU",
+            "amgrating": "4.0",
+            "amgreviewtype": "review",
+        }
+    ).critical_reception
+    assert cr is not None
+    assert cr.sources is not None
+    assert [(s.source, s.review_type) for s in cr.sources] == [("AMG", None), ("TPS", "rfu")]

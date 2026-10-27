@@ -332,7 +332,7 @@ def _build_review_source_entry(
     tags: dict[str, Any], source_id: str, key_prefix: str
 ) -> ReviewSourceEntry | None:
     """
-    Build a ReviewSourceEntry from {prefix}_RATING/_FAVORITE/_ACCOLADES/_LINKS/_AUTHOR/_REVIEW.
+    Build a ReviewSourceEntry from the {prefix}_* review tags (RATING ... REVIEW_TYPE).
 
     Returns None when the source has no usable fields, so empty entries don't
     pollute the album metadata. Pre-3.2.0 files carrying the split _TYPE/_LABELS
@@ -358,6 +358,10 @@ def _build_review_source_entry(
     authors = list(split_items(tags.get(f"{key_prefix}author")))
     # full review text (3.6.0+): one value, never split — prose holds ";" and "/"
     review = str(_first_tag_value(tags.get(f"{key_prefix}review")) or "").strip() or None
+    # which post type that text came from (3.8.0+): ranks texts across sources
+    review_type = (
+        str(_first_tag_value(tags.get(f"{key_prefix}reviewtype")) or "").strip().lower() or None
+    )
     if (
         rating is None
         and favorite is None
@@ -375,6 +379,7 @@ def _build_review_source_entry(
         links=links or None,
         authors=authors or None,
         review=review,
+        review_type=review_type if review else None,
     )
 
 
