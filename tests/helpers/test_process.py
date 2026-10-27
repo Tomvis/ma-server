@@ -617,7 +617,8 @@ def _is_running(pid: int) -> bool:
     """Return whether a process runs; a killed one nobody reaped yet (a zombie) does not."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except FileNotFoundError, ProcessLookupError:
+        # ProcessLookupError: the process was reaped between opening and reading the file
         return False
     # the state follows the command name, which is wrapped in parentheses
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
