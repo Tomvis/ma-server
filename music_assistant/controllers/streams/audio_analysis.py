@@ -49,6 +49,7 @@ from music_assistant.controllers.streams.constants import (
 from music_assistant.controllers.streams.stream_sources import rank_provider_mappings
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.audio import pcm_container_bit_depth
+from music_assistant.helpers.camelot import parse_key_tag
 from music_assistant.helpers.datetime import local_clock_time_to_utc, utc_timestamp
 from music_assistant.helpers.util import inference_thread_budget, is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData, AudioAnalysisError
@@ -69,8 +70,16 @@ PROVIDER_LOUDNESS_DOMAIN = "provider_loudness"
 LOUDNESS_PROVIDER_PRIORITY = (PROVIDER_LOUDNESS_DOMAIN, LOUDNESS_ANALYSIS_DOMAIN)
 SMART_FADES_ANALYSIS_DOMAIN = "smart_fades"
 SONIC_ANALYSIS_DOMAIN = "sonic_analysis"
-# AA domains trusted for frontend-facing track data (bpm/key/waveform), authoritative first.
-TRACK_EXPORT_AA_PRIORITY = (SMART_FADES_ANALYSIS_DOMAIN, SONIC_ANALYSIS_DOMAIN)
+# Virtual AA domain for bpm/key read from file tags by music providers (e.g. Navidrome).
+# Like provider_loudness it bypasses the provider-availability gate.
+PROVIDER_TAGS_DOMAIN = "provider_tags"
+# AA domains trusted for frontend-facing track data (bpm/key/waveform), authoritative first;
+# tag values only fill in what no analyser measured.
+TRACK_EXPORT_AA_PRIORITY = (
+    SMART_FADES_ANALYSIS_DOMAIN,
+    SONIC_ANALYSIS_DOMAIN,
+    PROVIDER_TAGS_DOMAIN,
+)
 BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 BACKGROUND_PER_TRACK_TIMEOUT_SECONDS = 300
 BACKGROUND_PER_TRACK_TIMEOUT_DURATION_MULTIPLIER = 1.5
@@ -921,6 +930,41 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
             analysis=analysis,
             analysis_version=analysis_version,
             media_type=media_type,
+        )
+
+    async def set_track_tags(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        bpm: float | None,
+        key: str | None,
+    ) -> None:
+        """
+        Store a track's bpm and musical key as read from its file tags.
+
+        Shown for the track where no audio analysis measured them; unusable values are dropped.
+
+        :param item_id: Provider-native item ID.
+        :param provider_instance_id_or_domain: Music provider instance ID or domain.
+        :param bpm: The tagged beats per minute, None or 0 when untagged.
+        :param key: The tagged key, e.g. "F#m" or "A minor".
+        """
+        if not self._database_ready:
+            return
+        if bpm is not None and (not isfinite(bpm) or bpm <= 0):
+            bpm = None
+        parsed_key = parse_key_tag(key)
+        if bpm is None and parsed_key is None:
+            return
+        await self.set_audio_analysis(
+            item_id=item_id,
+            provider_instance_id_or_domain=provider_instance_id_or_domain,
+            aa_provider_domain=PROVIDER_TAGS_DOMAIN,
+            analysis=AudioAnalysisData(
+                bpm=bpm,
+                key=parsed_key[0] if parsed_key else None,
+                mode=parsed_key[1] if parsed_key else None,
+            ),
         )
 
     async def get_extra_data_for_album_tracks(
@@ -1981,7 +2025,7 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
         return provider.domain if provider.is_streaming_provider else provider.instance_id
 
     def _available_aa_domains(self) -> set[str]:
-        """Return available AA provider domains plus the virtual provider-loudness domain."""
+        """Return available AA provider domains plus the virtual provider domains."""
         return {
             p.domain for p in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS) if p.available
-        } | {PROVIDER_LOUDNESS_DOMAIN}
+        } | {PROVIDER_LOUDNESS_DOMAIN, PROVIDER_TAGS_DOMAIN}

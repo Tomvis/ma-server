@@ -80,6 +80,15 @@ def test_update_merges_new_fields() -> None:
     assert base.clap_embedding == [0.2] * 1024
 
 
+def test_update_takes_key_and_mode_together() -> None:
+    """A key always brings its own mode, so two sources' halves never combine (MUSIC-185)."""
+    base = AudioAnalysisData(key="G", mode="minor", bpm=99.0)
+    base.update(AudioAnalysisData(key="D"))
+    assert (base.key, base.mode, base.bpm) == ("D", None, 99.0)
+    base.update(AudioAnalysisData(bpm=120.0))
+    assert (base.key, base.mode, base.bpm) == ("D", None, 120.0)
+
+
 @pytest.mark.parametrize("smart_fades_first", [True, False])
 def test_update_keeps_both_providers_arrays(smart_fades_first: bool) -> None:
     """A legacy smart_fades row and a typed CLAP row keep each other's arrays in either order."""

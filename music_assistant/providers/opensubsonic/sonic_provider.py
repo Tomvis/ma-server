@@ -106,12 +106,17 @@ CONF_RAW_FILE = "request_raw_file"
 
 CACHE_CATEGORY_PODCAST_CHANNEL = 1
 CACHE_CATEGORY_PODCAST_EPISODES = 2
+CACHE_CATEGORY_ND_SONG_TAGS = 3
 # Albums per page when reading DR and release-group ids from Navidrome's native API.
 _ND_ALBUM_PAGE_SIZE = 500
 # Items per page when reading library changes from Navidrome's native API.
 _ND_CHANGES_PAGE_SIZE = 500
 # More changed items than this since the last sync are taken in by a full sync instead.
 _ND_MAX_CHANGES = 2000
+# Song bpm/key tags follow the change feed; a full pass over all songs (~7 KB each) only
+# runs this often, or after the feed missed changes.
+_ND_SONG_TAGS_CACHE_KEY = "song_tags"
+_ND_SONG_TAGS_BACKFILL_INTERVAL = 30 * 24 * 3600
 # Changes this close before the cursor are read again: a song is dated by its file mtime, which
 # can be older than a change Navidrome scanned before it (and stored under a newer time).
 _ND_CHANGES_OVERLAP = timedelta(minutes=10)
@@ -147,6 +152,17 @@ def _nd_album_extras(nd_album: dict[str, Any]) -> tuple[float | None, str | None
     if rgid is not None and not is_valid_uuid(rgid):
         rgid = None
     return dr, rgid
+
+
+def _nd_song_tags(nd_song: dict[str, Any]) -> tuple[float | None, str | None]:
+    """
+    Return the (bpm, key) tags a Navidrome native API song carries.
+
+    :param nd_song: A song object of Navidrome's native API.
+    """
+    bpm = float(nd_song.get("bpm") or 0) or None
+    key = next((v for v in (nd_song.get("tags") or {}).get("key") or [] if v), None)
+    return bpm, key
 
 
 def _nd_time(value: str) -> tuple[datetime, int]:
@@ -589,6 +605,10 @@ class OpenSonicProvider(MusicProvider):
 
         Note the lack of item count on this method.
         """
+        try:
+            await self._nd_backfill_song_tags()
+        except Exception as err:
+            self.logger.debug("Reading song bpm/key from the server failed: %s", err)
         query = ""
         offset = 0
         count = self._pagination_size
@@ -652,12 +672,21 @@ class OpenSonicProvider(MusicProvider):
             if (items := result[1]) is None:
                 changes.complete = False
                 remaining = 0
+                if media_type == MediaType.TRACK:
+                    # songs changed unseen: the next full sync re-reads every song's tags
+                    await self.mass.cache.delete(
+                        _ND_SONG_TAGS_CACHE_KEY,
+                        category=CACHE_CATEGORY_ND_SONG_TAGS,
+                        provider=self.instance_id,
+                    )
                 continue
             remaining -= len(items)
             for item in items:
                 # a deleted file stays in Navidrome's database, flagged missing
                 target = changes.removed if item.get("missing") else changes.changed
                 target.setdefault(media_type, set()).add(str(item["id"]))
+                if media_type == MediaType.TRACK and not item.get("missing"):
+                    await self._store_song_tags(item)
         if changes.complete:
             # a touched album may have regained tracks whose own change time is old
             # and songs whose change was dated before the song cursor when it was scanned
@@ -1282,6 +1311,48 @@ class OpenSonicProvider(MusicProvider):
             if len(page) < _ND_ALBUM_PAGE_SIZE:
                 return extras
             start += _ND_ALBUM_PAGE_SIZE
+
+    async def _nd_backfill_song_tags(self) -> None:
+        """Store the bpm/key tags of every song, unless that was done within the last month."""
+        if await self.mass.cache.get(
+            _ND_SONG_TAGS_CACHE_KEY,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_ND_SONG_TAGS,
+        ):
+            return
+        start = 0
+        while True:
+            page = await self._nd_get(
+                "/api/song",
+                {
+                    "missing": "false",
+                    "_sort": "id",
+                    "_order": "ASC",
+                    "_start": str(start),
+                    "_end": str(start + _ND_CHANGES_PAGE_SIZE),
+                },
+            )
+            if page is None:
+                return
+            for nd_song in page:
+                await self._store_song_tags(nd_song)
+            if len(page) < _ND_CHANGES_PAGE_SIZE:
+                break
+            start += _ND_CHANGES_PAGE_SIZE
+        await self.mass.cache.set(
+            _ND_SONG_TAGS_CACHE_KEY,
+            True,
+            expiration=_ND_SONG_TAGS_BACKFILL_INTERVAL,
+            provider=self.instance_id,
+            category=CACHE_CATEGORY_ND_SONG_TAGS,
+        )
+
+    async def _store_song_tags(self, nd_song: dict[str, Any]) -> None:
+        """Hand a native API song's bpm/key tags to audio analysis."""
+        bpm, key = _nd_song_tags(nd_song)
+        await self.mass.streams.audio_analysis.set_track_tags(
+            str(nd_song["id"]), self.instance_id, bpm, key
+        )
 
     async def _nd_album_songs(self, album_id: str) -> dict[str, int] | None:
         """

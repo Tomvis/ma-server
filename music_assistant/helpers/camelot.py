@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 def camelot_code(key: str | None, mode: str | None) -> tuple[int, bool] | None:
     """Return (wheel number, is_major) or None for unknown input."""
@@ -22,6 +24,21 @@ def camelot_key(key: str | None, mode: str | None) -> str | None:
     return f"{num}{'B' if is_major else 'A'}"
 
 
+def parse_key_tag(value: str | None) -> tuple[str, str] | None:
+    """
+    Return (pitch class, mode) of a file's key tag (e.g. "F#m", "Eb", "A minor"), or None.
+
+    :param value: The tag value; a bare pitch class means major.
+    """
+    if not value or not (match := _KEY_TAG.fullmatch(value.strip())):
+        return None
+    note, accidental, mode = match.groups()
+    accidental = {"♯": "#", "♭": "b"}.get(accidental, accidental.lower())
+    is_minor = mode is not None and mode.lower() in ("m", "min", "minor")
+    return f"{note.upper()}{accidental}", "minor" if is_minor else "major"
+
+
+_KEY_TAG = re.compile(r"([A-Ga-g])([#b♯♭]?)\s*(m|min|minor|maj|major)?", re.IGNORECASE)
 _FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
 # Camelot wheel numbers; relative major/minor share a number (Am=8A, C=8B)
 _CAMELOT_MAJOR = {

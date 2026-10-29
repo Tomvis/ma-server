@@ -23,6 +23,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.streams.audio_analysis import (
     PROVIDER_LOUDNESS_DOMAIN,
+    PROVIDER_TAGS_DOMAIN,
     SMART_FADES_ANALYSIS_DOMAIN,
     SONIC_ANALYSIS_DOMAIN,
     AudioAnalysisController,
@@ -648,3 +649,70 @@ async def test_tracks_audio_metadata_without_database(ctrl: AudioAnalysisControl
     """Every track gets None while the analysis database is not ready."""
     track = Track(item_id="t0", provider="fs--a", name="Test", provider_mappings=set())
     assert await ctrl.get_tracks_audio_metadata([track, track]) == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_tag_bpm_and_key_fill_in_where_no_analyser_measured(
+    ctrl: AudioAnalysisController,
+) -> None:
+    """Tag bpm/key are the last resort per field; measured values win where they exist (MUSIC-185)."""
+    tracks = await _setup_metadata_fixture(ctrl)
+    await ctrl.set_track_tags("t1", "fs--a", bpm=99.0, key="Gm")
+    await ctrl.set_track_tags("t3", "fs--a", bpm=120.0, key="Em")
+    await ctrl.set_track_tags("missing", "fs--a", bpm=None, key="D#")
+
+    batched_result = await ctrl.get_tracks_audio_metadata(tracks)
+
+    assert batched_result == [await ctrl.get_track_audio_metadata(track) for track in tracks]
+    summary = [(m.bpm, m.musical_key, m.camelot_key) if m else None for m in batched_result]
+    # t1: smart_fades bpm, sonic key; t3: tags only; missing: key from tags alone
+    assert summary[0] == (128.0, "D", None)
+    assert summary[2] == (120.0, "E minor", "9A")
+    assert summary[4] == (None, "D# major", "5B")
+
+
+@pytest.mark.asyncio
+async def test_tag_rows_count_without_any_aa_provider(ctrl: AudioAnalysisController) -> None:
+    """Tag values need no loaded AA provider, so they show with Smart Fades and Sonic off."""
+    tracks = await _setup_metadata_fixture(ctrl)
+    ctrl.mass.get_providers = MagicMock(return_value=[])  # type: ignore[method-assign]
+    await ctrl.set_track_tags("t3", "fs--a", bpm=120.0, key="Em")
+
+    result = await ctrl.get_tracks_audio_metadata([tracks[0], tracks[2]])
+
+    assert result[0] is None
+    assert result[1] is not None
+    assert (result[1].bpm, result[1].musical_key) == (120.0, "E minor")
+    assert result == [await ctrl.get_track_audio_metadata(t) for t in (tracks[0], tracks[2])]
+
+
+@pytest.mark.asyncio
+async def test_set_track_tags_stores_only_usable_values(ctrl: AudioAnalysisController) -> None:
+    """A zero bpm and an unparsable key are dropped; with neither left nothing is stored."""
+    tracks = await _setup_metadata_fixture(ctrl)
+    await ctrl.set_track_tags("t3", "fs--a", bpm=0, key="Zer")
+    await ctrl.set_track_tags("t2", "fs--a", bpm=float("nan"), key="Bbm")
+
+    rows = await ctrl.database.get_rows_from_query(
+        f"SELECT item_id FROM {AA_TABLE_ANALYSIS} WHERE aa_provider_domain = :domain",
+        {"domain": PROVIDER_TAGS_DOMAIN},
+    )
+    assert [row["item_id"] for row in rows] == ["t2"]
+    result = await ctrl.get_tracks_audio_metadata([tracks[1]])
+    # sonic's measured F# minor wins over the tag
+    assert result[0] is not None
+    assert result[0].musical_key == "F# minor"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_tags_are_not_rewritten(ctrl: AudioAnalysisController) -> None:
+    """Re-storing the same tag values on every sync writes nothing (HW-92)."""
+    await _setup_metadata_fixture(ctrl)
+    await ctrl.set_track_tags("t3", "fs--a", bpm=120.0, key="Em")
+    insert_spy = AsyncMock(wraps=ctrl.database.insert_or_replace)
+    ctrl.database.insert_or_replace = insert_spy  # type: ignore[method-assign]
+
+    await ctrl.set_track_tags("t3", "fs--a", bpm=120.0, key="Em")
+    await ctrl.set_track_tags("t3", "fs--a", bpm=121.0, key="Em")
+
+    assert insert_spy.await_count == 1

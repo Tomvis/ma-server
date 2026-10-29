@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -23,4 +23,8 @@ def provider() -> OpenSonicProvider:
     config.get_value.side_effect = lambda key, default=None: {
         "log_level": "GLOBAL",
     }.get(key, default)
+    mass.cache.get = AsyncMock(return_value=None)
+    mass.cache.set = AsyncMock()
+    mass.cache.delete = AsyncMock()
+    mass.streams.audio_analysis.set_track_tags = AsyncMock()
     return OpenSonicProvider(mass, manifest, config, SUPPORTED_FEATURES)

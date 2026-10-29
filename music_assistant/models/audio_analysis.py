@@ -190,6 +190,9 @@ class AudioAnalysisData(DataClassDictMixin):
             if new_val is None:
                 continue
             setattr(self, fld.name, new_val)
+        if new_values.key is not None:
+            # a mode only describes the key it was detected with
+            self.mode = new_values.mode
         return self
 
     def as_audio_metadata(self) -> AudioMetadata | None:
