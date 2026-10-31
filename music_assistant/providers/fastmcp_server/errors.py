@@ -22,5 +22,5 @@ class ToolFailureCode(StrEnum):
 
 
 def tool_failure(code: ToolFailureCode, message: str) -> ToolError:
-    """Build a public failure without request data or exception text."""
+    """Build a public failure; only MusicAssistantError text (user-facing) may appear in it."""
     return ToolError(f"[{code}] {message}")
