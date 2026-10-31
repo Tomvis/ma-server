@@ -3298,3 +3298,98 @@ async def _linked_genre_names(
         limit=0,
     )
     return {r["name"] for r in rows}
+
+
+async def _track_genre_ids(mass: MusicAssistant, track_id: int) -> set[int]:
+    """Return the ids of the genres a track is mapped to."""
+    rows = await mass.music.database.get_rows_from_query(
+        f"SELECT genre_id FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+        "WHERE media_type = 'track' AND media_id = :mid",
+        {"mid": track_id},
+        limit=0,
+    )
+    return {int(row["genre_id"]) for row in rows}
+
+
+async def _default_genre(genre_ctrl: GenreController, name: str) -> Genre:
+    """Return a seeded default music genre by its primary name."""
+    items = await genre_ctrl.library_items(search=name, hide_empty=False)
+    return next(g for g in items if g.name == name)
+
+
+class TestUmbrellaMembership:
+    """A promoted sub-genre stays listed under the umbrellas claiming it (MUSIC-190)."""
+
+    async def test_sub_genre_primary_match_includes_claiming_umbrella(
+        self, genre_ctrl: GenreController
+    ) -> None:
+        """A non-default genre's primary-name match also returns the umbrella aliasing it."""
+        metal = await _default_genre(genre_ctrl, "metal")
+        sub = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Death"))
+        await genre_ctrl.add_alias(metal.item_id, "Zumbrella Death")
+
+        found = await genre_ctrl._find_genres_for_alias("Zumbrella Death", None)
+        assert found == [int(sub.item_id), int(metal.item_id)]
+
+    async def test_default_primary_match_stays_exclusive(self, genre_ctrl: GenreController) -> None:
+        """An umbrella's own name never fans out to other umbrellas that alias it."""
+        rock = await _default_genre(genre_ctrl, "rock")
+        # upstream's defaults already list "Rock" under metal and punk
+        found = await genre_ctrl._find_genres_for_alias("Rock", None)
+        assert found == [int(rock.item_id)]
+
+    async def test_non_default_claimant_is_not_an_umbrella(
+        self, genre_ctrl: GenreController
+    ) -> None:
+        """Only default genres act as umbrellas; another sub-genre's alias is ignored."""
+        sub = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Doom"))
+        other = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Sludge"))
+        await genre_ctrl.add_alias(other.item_id, "Zumbrella Doom")
+
+        found = await genre_ctrl._find_genres_for_alias("Zumbrella Doom", None)
+        assert found == [int(sub.item_id)]
+
+    async def test_scanner_maps_sub_genre_and_umbrella(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """The scanner maps a sub-genre tag to the sub-genre and to its umbrella."""
+        metal = await _default_genre(genre_ctrl, "metal")
+        sub = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Thrash"))
+        await genre_ctrl.add_alias(metal.item_id, "Zumbrella Thrash")
+        track = await _add_test_track(mass, "UmbrellaScanTrack")
+        await _set_track_genres(mass, int(track.item_id), ["Zumbrella Thrash"])
+
+        await genre_ctrl._bulk_scan_unmapped_genres()
+
+        assert await _track_genre_ids(mass, int(track.item_id)) == {
+            int(sub.item_id),
+            int(metal.item_id),
+        }
+
+    async def test_sync_maps_sub_genre_and_umbrella(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """A provider sync maps both, and an unchanged re-sync keeps both."""
+        metal = await _default_genre(genre_ctrl, "metal")
+        sub = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Power"))
+        await genre_ctrl.add_alias(metal.item_id, "Zumbrella Power")
+        track = await _add_test_track(mass, "UmbrellaSyncTrack")
+        expected = {int(sub.item_id), int(metal.item_id)}
+
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"Zumbrella Power"})
+        assert await _track_genre_ids(mass, int(track.item_id)) == expected
+
+        # the cached fast path resolves the same way, so nothing is removed
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track.item_id, {"Zumbrella Power"})
+        assert await _track_genre_ids(mass, int(track.item_id)) == expected
+
+    async def test_scan_still_deletes_uncarried_empty_genre(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """Deleting empty genres after mapping still removes one nothing carries."""
+        orphan = await genre_ctrl.add_item_to_library(_make_genre("Zumbrella Orphan"))
+
+        await genre_ctrl._bulk_scan_unmapped_genres()
+
+        row = await mass.music.database.get_row(DB_TABLE_GENRES, {"item_id": int(orphan.item_id)})
+        assert row is None

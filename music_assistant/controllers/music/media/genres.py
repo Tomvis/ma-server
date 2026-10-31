@@ -115,6 +115,7 @@ class _SyncGenreLookup:
     primary_name_to_genre: dict[str, int]
     alias_to_genre: dict[str, list[int]]
     excluded_names: set[str]
+    umbrella_ids: set[int]
 
 
 # Curated default genres per taxonomy: (content_type, mapping). Music keeps content_type None;
@@ -1619,6 +1620,7 @@ class GenreController(MediaControllerBase[Genre]):
             # priority over alias match so a bare "pop" tag only maps to the Pop genre, not every
             # genre that accumulated "pop" as a secondary alias.
             alias_to_genre, primary_name_to_genre = await self._build_genre_lookup(content_type)
+            umbrella_ids = await self._get_umbrella_ids(content_type)
 
             union_parts = [
                 f"SELECT DISTINCT TRIM(g.value) AS raw_name "
@@ -1640,7 +1642,9 @@ class GenreController(MediaControllerBase[Genre]):
                 if not norm:
                     continue
                 if norm in primary_name_to_genre:
-                    raw_name_to_genres[raw_name] = [primary_name_to_genre[norm]]
+                    raw_name_to_genres[raw_name] = self._with_umbrellas(
+                        primary_name_to_genre[norm], norm, alias_to_genre, umbrella_ids
+                    )
                 elif norm in alias_to_genre:
                     raw_name_to_genres[raw_name] = alias_to_genre[norm]
                 else:
@@ -1698,7 +1702,7 @@ class GenreController(MediaControllerBase[Genre]):
         )
         await self._propagate_genre_mappings_to_parents()
 
-    async def _cleanup_stale_genre_mappings(self) -> None:
+    async def _cleanup_stale_genre_mappings(self, delete_empty_genres: bool = True) -> None:
         """
         Remove genre mappings where the alias is no longer in the media item's metadata.genres.
 
@@ -1706,6 +1710,8 @@ class GenreController(MediaControllerBase[Genre]):
         in the media item's current metadata.genres. This includes items where metadata.genres
         is empty or null — all mappings for such items are removed. Empty non-default genres
         (those without a translation_key) are also deleted.
+
+        :param delete_empty_genres: Also delete the non-default genres left without mappings.
         """
         db = self.mass.music.database
         gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
@@ -1758,7 +1764,13 @@ class GenreController(MediaControllerBase[Genre]):
         mappings_removed = count_before - await db.get_count(gm)
         if mappings_removed:
             self.logger.info("Genre scan: removed %d stale genre mappings", mappings_removed)
+        if delete_empty_genres:
+            await self._delete_empty_genres()
 
+    async def _delete_empty_genres(self) -> None:
+        """Delete the non-default, non-excluded genres that no media item maps to."""
+        db = self.mass.music.database
+        gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
         # Delete playlog entries for empty non-default genres before removing them, to avoid
         # orphaned playlog rows pointing to genres that no longer exist.
         # is_default = 0 identifies non-default genres; default genres are always kept
@@ -1804,7 +1816,9 @@ class GenreController(MediaControllerBase[Genre]):
 
         :return: Total number of items mapped.
         """
-        await self._cleanup_stale_genre_mappings()
+        # empty genres go after mapping, so a genre created before its first scan
+        # (e.g. a promoted sub-genre) can claim its items instead of being deleted
+        await self._cleanup_stale_genre_mappings(delete_empty_genres=False)
 
         db = self.mass.music.database
         gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
@@ -1816,6 +1830,7 @@ class GenreController(MediaControllerBase[Genre]):
         # names only resolve against — and new genres are created within — their own namespace.
         for content_type, tables in GENRE_BUCKETS:
             alias_to_genre, primary_name_to_genre = await self._build_genre_lookup(content_type)
+            umbrella_ids = await self._get_umbrella_ids(content_type)
 
             # Extract all unique raw genre names from this taxonomy's media items.
             # We don't filter by unmapped items here because a media item may have some
@@ -1842,7 +1857,9 @@ class GenreController(MediaControllerBase[Genre]):
                 if not norm:
                     continue
                 if norm in primary_name_to_genre:
-                    raw_name_to_genres[raw_name] = [primary_name_to_genre[norm]]
+                    raw_name_to_genres[raw_name] = self._with_umbrellas(
+                        primary_name_to_genre[norm], norm, alias_to_genre, umbrella_ids
+                    )
                 elif norm in alias_to_genre:
                     raw_name_to_genres[raw_name] = alias_to_genre[norm]
                 else:
@@ -1899,6 +1916,7 @@ class GenreController(MediaControllerBase[Genre]):
         if mapped_any:
             await db.commit()
             await self._propagate_genre_mappings_to_parents()
+        await self._delete_empty_genres()
         count_after = await db.get_count(gm)
 
         return count_after - count_before
@@ -2131,6 +2149,47 @@ class GenreController(MediaControllerBase[Genre]):
                         alias_to_genre[norm].append(genre_id)
         return alias_to_genre, primary_name_to_genre
 
+    async def _get_umbrella_ids(self, content_type: MediaType | None) -> set[int]:
+        """
+        Return the ids of the curated default (umbrella) genres in a single taxonomy.
+
+        :param content_type: Genre taxonomy to scope the lookup to (None = music/general).
+        """
+        rows = await self.mass.music.database.get_rows_from_query(
+            f"SELECT item_id FROM {DB_TABLE_GENRES} "
+            "WHERE is_default = 1 AND is_excluded = 0 AND content_type IS :content_type",
+            {"content_type": content_type.value if content_type else None},
+            limit=0,
+        )
+        return {int(row["item_id"]) for row in rows}
+
+    @staticmethod
+    def _with_umbrellas(
+        primary_id: int,
+        name_norm: str,
+        alias_to_genre: dict[str, list[int]],
+        umbrella_ids: set[int],
+    ) -> list[int]:
+        """
+        Return the genres a name matching a genre's primary name maps to.
+
+        A primary-name match on a default (umbrella) genre stays exclusive. A match on any
+        other genre also maps to the umbrella genres that claim the name as an alias, so a
+        sub-genre promoted to its own genre stays listed under its umbrella.
+
+        :param primary_id: The genre whose primary name matched.
+        :param name_norm: The matched name, normalised via ``create_safe_string``.
+        :param alias_to_genre: Normalised alias -> owning genre ids for the taxonomy.
+        :param umbrella_ids: Ids of the default genres in the taxonomy.
+        """
+        if primary_id in umbrella_ids:
+            return [primary_id]
+        return [primary_id] + [
+            gid
+            for gid in alias_to_genre.get(name_norm, [])
+            if gid in umbrella_ids and gid != primary_id
+        ]
+
     async def _resolve_genre_names_cached(
         self, genre_names: set[str], content_type: MediaType | None
     ) -> set[int] | None:
@@ -2156,7 +2215,11 @@ class GenreController(MediaControllerBase[Genre]):
             # an excluded genre deliberately resolve to nothing (mirrors
             # _find_genres_for_alias, which the full path uses)
             if (genre_id := lookup.primary_name_to_genre.get(search_name)) is not None:
-                target_ids.add(genre_id)
+                target_ids.update(
+                    self._with_umbrellas(
+                        genre_id, search_name, lookup.alias_to_genre, lookup.umbrella_ids
+                    )
+                )
             elif genre_ids := lookup.alias_to_genre.get(search_name):
                 target_ids.update(genre_ids)
             elif search_name not in lookup.excluded_names:
@@ -2177,6 +2240,7 @@ class GenreController(MediaControllerBase[Genre]):
             primary_name_to_genre=primary_name_to_genre,
             alias_to_genre=alias_to_genre,
             excluded_names={row["search_name"] for row in excluded_rows},
+            umbrella_ids=await self._get_umbrella_ids(content_type),
         )
 
     async def _get_synced_genre_ids(
@@ -2290,6 +2354,7 @@ class GenreController(MediaControllerBase[Genre]):
             # primary name. If so, return immediately — an exact primary-name match takes full
             # priority over alias scanning. This prevents broad tags like "pop" from fanning out
             # to every genre that accumulated "pop" as a secondary alias (Rock, Punk, etc.).
+            # Only a non-default genre's match also returns the umbrellas claiming the name.
             primary = await self.mass.music.database.get_rows_from_query(
                 f"SELECT item_id FROM {DB_TABLE_GENRES} "
                 "WHERE search_name = :search_name AND is_excluded = 0 "
@@ -2298,7 +2363,12 @@ class GenreController(MediaControllerBase[Genre]):
                 limit=1,
             )
             if primary:
-                return [int(primary[0]["item_id"])]
+                primary_id = int(primary[0]["item_id"])
+                umbrella_ids = await self._get_umbrella_ids(content_type)
+                if primary_id in umbrella_ids:
+                    return [primary_id]
+                alias_to_genre, _ = await self._build_genre_lookup(content_type)
+                return self._with_umbrellas(primary_id, search_name, alias_to_genre, umbrella_ids)
 
             # Search genre_aliases JSON columns (case-insensitive, can match multiple)
             rows = await self.mass.music.database.get_rows_from_query(
