@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import logging
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -21,7 +22,11 @@ from fastmcp.server.auth import AccessToken
 from music_assistant_models.auth import AuthProviderType, Scope, User, UserRole
 from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry
 from music_assistant_models.enums import ConfigEntryType
-from music_assistant_models.errors import InsufficientPermissions, UserNotFoundError
+from music_assistant_models.errors import (
+    InsufficientPermissions,
+    PlayerUnavailableError,
+    UserNotFoundError,
+)
 
 from music_assistant.providers.fastmcp_server import dynamic_serialization, meta_discovery
 from music_assistant.providers.fastmcp_server.capabilities import Capability
@@ -1361,7 +1366,7 @@ async def test_empty_upstream_exception_names_type_and_command() -> None:
         raise IndexError
 
     adapter = _real_adapter(_handler("music/search", search))
-    with pytest.raises(ToolError, match=r"\[execution_failed\]"):
+    with pytest.raises(ToolError, match=r"\[execution_failed\]") as error:
         await adapter.call(
             "ma_api:music/search",
             {"search_query": "missing"},
@@ -1370,6 +1375,58 @@ async def test_empty_upstream_exception_names_type_and_command() -> None:
             max_items=None,
             ctx=MagicMock(),
         )
+    assert str(error.value) == "[execution_failed] Command execution failed: IndexError"
+
+
+async def test_music_assistant_error_message_reaches_caller(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MusicAssistantError text is single-lined, truncated, and the failure is logged."""
+
+    async def search(search_query: str) -> list[str]:
+        del search_query
+        raise PlayerUnavailableError("Queue kitchen\nis not available " + "x" * 400)
+
+    adapter = _real_adapter(_handler("music/search", search))
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ToolError) as error,
+    ):
+        await adapter.call(
+            "ma_api:music/search",
+            {"search_query": "missing"},
+            response_mode="compact",
+            fields=None,
+            max_items=None,
+            ctx=MagicMock(),
+        )
+    message = str(error.value)
+    prefix = "[execution_failed] Command execution failed: PlayerUnavailableError: "
+    assert message.startswith(prefix + "Queue kitchen is not available xxx")
+    assert message.endswith("\u2026")
+    assert len(message) == len(prefix) + 300
+    record = next(r for r in caplog.records if "music/search" in r.getMessage())
+    assert record.levelno == logging.WARNING
+    assert isinstance(record.exc_info[1], PlayerUnavailableError)
+
+
+async def test_generic_exception_message_is_not_exposed() -> None:
+    """Non-MusicAssistantError text may hold request data, so only the type is shown."""
+
+    async def search(search_query: str) -> list[str]:
+        raise KeyError(search_query)
+
+    adapter = _real_adapter(_handler("music/search", search))
+    with pytest.raises(ToolError) as error:
+        await adapter.call(
+            "ma_api:music/search",
+            {"search_query": "private-query"},
+            response_mode="compact",
+            fields=None,
+            max_items=None,
+            ctx=MagicMock(),
+        )
+    assert str(error.value) == "[execution_failed] Command execution failed: KeyError"
 
 
 async def test_adapter_hides_catalog_when_mcp_auth_is_disabled() -> None:

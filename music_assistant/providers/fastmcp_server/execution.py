@@ -8,6 +8,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import logging
 import re
 import time
 from collections.abc import AsyncGenerator, Callable, Mapping
@@ -20,6 +21,7 @@ from music_assistant_models.auth import AuthProviderType, Scope
 from music_assistant_models.errors import (
     AuthenticationRequired,
     InsufficientPermissions,
+    MusicAssistantError,
     UserNotFoundError,
 )
 from music_assistant_models.translations import TRANSLATION_RESOLVER
@@ -77,6 +79,8 @@ if TYPE_CHECKING:
 
     from .token_identity import TokenIdentity
 
+LOGGER = logging.getLogger(__name__)
+
 _ALIASES_BY_COMMAND = aliases_by_command()
 
 _COMPACT_ITEMS = 25
@@ -88,6 +92,7 @@ _FULL_BYTES = 65_536
 _COMPACT_STRING = 2_048
 _FULL_STRING = 8_192
 _CALL_TIMEOUT_SECONDS = 60
+_ERROR_DETAIL_CHARS = 300
 CATALOG_REVISION = 2
 
 __all__ = [
@@ -110,6 +115,16 @@ def _confirmation_prompt(name: str, evidence: frozenset[str]) -> str:
     if "impersonation" in evidence:
         parts.append("impersonation of another user")
     return f"Run {name} using {' and '.join(parts)}?"
+
+
+def _execution_failure(exc: Exception) -> ToolError:
+    """Name the failure; only MusicAssistantError messages are user-facing enough to show."""
+    detail = type(exc).__name__
+    if isinstance(exc, MusicAssistantError) and (message := " ".join(str(exc).split())):
+        if len(message) > _ERROR_DETAIL_CHARS:
+            message = message[: _ERROR_DETAIL_CHARS - 1] + "\u2026"
+        detail = f"{detail}: {message}"
+    return tool_failure(ToolFailureCode.EXECUTION_FAILED, f"Command execution failed: {detail}")
 
 
 def _public_tool_error(exc: ToolError) -> ToolError:
@@ -532,10 +547,8 @@ class DynamicAPIAdapter:
         except Exception as exc:
             if execution_started:
                 self._audit_execution(invocation, "execution.failed", impersonating=impersonating)
-            raise tool_failure(
-                ToolFailureCode.EXECUTION_FAILED,
-                "Command execution failed",
-            ) from exc
+            LOGGER.warning("MCP command %s failed", invocation.entry.command, exc_info=exc)
+            raise _execution_failure(exc) from exc
         self._audit_execution(invocation, "execution.succeeded", impersonating=impersonating)
         return invocation, result
 

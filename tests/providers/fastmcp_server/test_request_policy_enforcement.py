@@ -328,8 +328,10 @@ async def test_default_audit_log_excludes_bearer_fingerprint_secret_and_exceptio
             ctx=cast("Context", MagicMock()),
         )
 
-    assert len(caplog.records) == 1
-    rendered = repr(caplog.records[0].__dict__)
+    # The WARNING traceback from execution.py (HERMES-44) is a separate, unredacted log.
+    audit_records = [r for r in caplog.records if r.name.endswith(".audit")]
+    assert len(audit_records) == 1
+    rendered = repr(audit_records[0].__dict__)
     for forbidden in (
         bearer,
         hashlib.sha256(bearer.encode()).hexdigest(),
