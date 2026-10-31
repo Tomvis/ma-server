@@ -1407,6 +1407,7 @@ async def test_music_assistant_error_message_reaches_caller(
     assert len(message) == len(prefix) + 300
     record = next(r for r in caplog.records if "music/search" in r.getMessage())
     assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
     assert isinstance(record.exc_info[1], PlayerUnavailableError)
 
 
