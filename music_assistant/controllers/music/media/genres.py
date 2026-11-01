@@ -42,6 +42,7 @@ from music_assistant.constants import (
     DB_TABLE_AUDIOBOOKS,
     DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
+    DB_TABLE_GENRE_MEDIA_ITEM_SOURCE,
     DB_TABLE_GENRES,
     DB_TABLE_MEDIA_PROGRESS,
     DB_TABLE_PLAYLISTS,
@@ -1185,7 +1186,11 @@ class GenreController(MediaControllerBase[Genre]):
         return updated
 
     async def sync_media_item_genres(
-        self, media_type: MediaType, media_id: str | int, genre_names: set[str]
+        self,
+        media_type: MediaType,
+        media_id: str | int,
+        genre_names: set[str],
+        source: tuple[str, str] | None = None,
     ) -> None:
         """
         Sync genre mappings for a media item.
@@ -1194,13 +1199,25 @@ class GenreController(MediaControllerBase[Genre]):
         Removes mappings that are no longer present in the incoming genre_names set,
         except for genres the user linked manually.
 
+        With a source, the names are what that provider mapping reports, and the item is
+        synced to the union of what each of its provider mappings last reported: an item
+        merged from several provider items (two Navidrome accounts, one recording on two
+        albums, a file and a streaming copy) otherwise swaps genres with each listing
+        (MUSIC-192).
+
         :param media_type: The type of media item being synced.
         :param media_id: The database ID of the media item.
         :param genre_names: Set of genre names from the provider.
+        :param source: Provider instance and provider item id that reported the names.
         """
         media_id_int = int(media_id)
         gm = DB_TABLE_GENRE_MEDIA_ITEM_MAPPING
         content_type = genre_content_type_for(media_type)
+        multi_source = False
+        if source is not None:
+            genre_names, multi_source = await self._union_source_genres(
+                media_type, media_id_int, source, genre_names
+            )
 
         # fast path for the (very common) unchanged case: resolve the incoming names
         # against a short-lived cached snapshot of this taxonomy — the same resolution
@@ -1214,6 +1231,12 @@ class GenreController(MediaControllerBase[Genre]):
             )
             # a genre the user excluded from the item is never mapped to it again
             if removable_ids <= target_ids - excluded_ids <= stored_ids:
+                if multi_source:
+                    # an overwrite from one mapping replaced the stored names with its own;
+                    # the post-sync scan drops links whose alias is not stored (HW-92)
+                    await self._update_metadata_genres(
+                        media_type, media_id_int, add=genre_names, remove=set()
+                    )
                 return
 
         # batch the (possible) genre creations and mapping changes into a single commit
@@ -1264,11 +1287,13 @@ class GenreController(MediaControllerBase[Genre]):
             # library syncs don't refresh stored metadata for unchanged items, while the
             # post-sync genre scan maps from it: mirror the changes there, or the scan deletes
             # each added mapping and re-adds each removed one, every sync (HW-92)
-            if to_add or removed_aliases:
+            if to_add or removed_aliases or multi_source:
                 await self._update_metadata_genres(
                     media_type,
                     media_id_int,
-                    add={target_mappings[gid] for gid in to_add},
+                    add=set(target_mappings.values())
+                    if multi_source
+                    else {target_mappings[gid] for gid in to_add},
                     remove=removed_aliases - set(target_mappings.values()),
                 )
 
@@ -1760,6 +1785,16 @@ class GenreController(MediaControllerBase[Genre]):
                 f"  WHERE content_type IS NOT {expected_literal}"
                 f")",
             )
+
+        # source rows of provider mappings the item no longer has (or of deleted items)
+        gs = DB_TABLE_GENRE_MEDIA_ITEM_SOURCE
+        await db.delete_where_query(
+            gs,
+            f"NOT EXISTS (SELECT 1 FROM {DB_TABLE_PROVIDER_MAPPINGS} p "
+            f"WHERE p.media_type = {gs}.media_type AND p.item_id = {gs}.media_id "
+            f"AND p.provider_instance = {gs}.provider_instance "
+            f"AND p.provider_item_id = {gs}.provider_item_id)",
+        )
 
         mappings_removed = count_before - await db.get_count(gm)
         if mappings_removed:
@@ -2274,6 +2309,67 @@ class GenreController(MediaControllerBase[Genre]):
             limit=0,
         )
         return {row["alias"] for row in rows if row["alias"] and int(row["genre_id"]) in genre_ids}
+
+    async def _union_source_genres(
+        self,
+        media_type: MediaType,
+        media_id: int,
+        source: tuple[str, str],
+        genre_names: set[str],
+    ) -> tuple[set[str], bool]:
+        """
+        Store what one provider mapping reports and return the union over the item's mappings.
+
+        Rows of mappings the item no longer has are dropped. Returns the union and whether
+        more than one mapping contributed.
+
+        :param media_type: The type of the media item.
+        :param media_id: The database ID of the media item.
+        :param source: Provider instance and provider item id that reported the names.
+        :param genre_names: The names this mapping reports now.
+        """
+        db = self.mass.music.database
+        gs = DB_TABLE_GENRE_MEDIA_ITEM_SOURCE
+        pm = DB_TABLE_PROVIDER_MAPPINGS
+        instance_id, prov_item_id = source[0], str(source[1])
+        params = {"media_type": media_type.value, "media_id": media_id}
+        rows = await db.get_rows_from_query(
+            f"SELECT s.provider_instance, s.provider_item_id, s.genres, "
+            f"EXISTS(SELECT 1 FROM {pm} p WHERE p.media_type = s.media_type "
+            "AND p.item_id = s.media_id AND p.provider_instance = s.provider_instance "
+            "AND p.provider_item_id = s.provider_item_id) AS live "
+            f"FROM {gs} s WHERE s.media_type = :media_type AND s.media_id = :media_id",
+            params,
+            limit=0,
+        )
+        own = sorted({name.strip() for name in genre_names if name and name.strip()})
+        union = set(own)
+        stored_own: list[str] | None = None
+        contributors = 1
+        for row in rows:
+            key = (row["provider_instance"], row["provider_item_id"])
+            if key == (instance_id, prov_item_id):
+                stored_own = json_loads(row["genres"])
+                continue
+            if not row["live"]:
+                await db.delete(
+                    gs, {**params, "provider_instance": key[0], "provider_item_id": key[1]}
+                )
+                continue
+            contributors += 1
+            union.update(name for name in json_loads(row["genres"]) if isinstance(name, str))
+        if stored_own != own:
+            await db.insert(
+                gs,
+                {
+                    **params,
+                    "provider_instance": instance_id,
+                    "provider_item_id": prov_item_id,
+                    "genres": serialize_to_json(own),
+                },
+                allow_replace=True,
+            )
+        return union, contributors > 1
 
     async def _update_metadata_genres(
         self, media_type: MediaType, media_id: int, add: set[str], remove: set[str]

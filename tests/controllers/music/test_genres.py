@@ -35,6 +35,7 @@ from music_assistant.constants import (
     DB_TABLE_ALBUMS,
     DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
+    DB_TABLE_GENRE_MEDIA_ITEM_SOURCE,
     DB_TABLE_GENRES,
     DB_TABLE_MEDIA_PROGRESS,
     DB_TABLE_PODCASTS,
@@ -3393,3 +3394,164 @@ class TestUmbrellaMembership:
 
         row = await mass.music.database.get_row(DB_TABLE_GENRES, {"item_id": int(orphan.item_id)})
         assert row is None
+
+
+# ===================================================================
+# MUSIC-192: an item merged from several provider items links the union of their genres
+# ===================================================================
+
+
+async def _add_source_mapping(
+    mass: MusicAssistant, track_id: int, instance: str, prov_item_id: str
+) -> None:
+    """Map a library track to one more provider item."""
+    await mass.music.database.insert(
+        DB_TABLE_PROVIDER_MAPPINGS,
+        {
+            "media_type": "track",
+            "item_id": track_id,
+            "provider_domain": "opensubsonic",
+            "provider_instance": instance,
+            "provider_item_id": prov_item_id,
+            "in_library": 1,
+        },
+    )
+    await mass.music.database.commit()
+
+
+async def _linked_track_genres(mass: MusicAssistant, track_id: int) -> set[str]:
+    """Return the names of the genres a track is linked to."""
+    rows = await mass.music.database.get_rows_from_query(
+        f"SELECT g.name FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} m "
+        f"JOIN {DB_TABLE_GENRES} g ON g.item_id = m.genre_id "
+        "WHERE m.media_type = 'track' AND m.media_id = :mid",
+        {"mid": track_id},
+        limit=0,
+    )
+    return {row["name"] for row in rows}
+
+
+async def _stored_track_genres(mass: MusicAssistant, track_id: int) -> set[str]:
+    """Return a track's stored metadata.genres."""
+    rows = await mass.music.database.get_rows_from_query(
+        f"SELECT json_extract(metadata, '$.genres') AS genres FROM {DB_TABLE_TRACKS} "
+        "WHERE item_id = :mid",
+        {"mid": track_id},
+        limit=1,
+    )
+    return set(json.loads(rows[0]["genres"] or "[]"))
+
+
+class TestMultiSourceGenreSync:
+    """A sync from one provider item no longer drops the genres another one reports."""
+
+    async def _two_source_track(self, mass: MusicAssistant, name: str) -> int:
+        track = await _add_test_track(mass, name)
+        track_id = int(track.item_id)
+        await _add_source_mapping(mass, track_id, "nd--tom", f"{name}-a")
+        await _add_source_mapping(mass, track_id, "nd--lera", f"{name}-b")
+        return track_id
+
+    async def test_back_to_back_syncs_keep_both_sources(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """Syncing each source in turn leaves the union linked, every time."""
+        track_id = await self._two_source_track(mass, "Multi Source 1")
+        a, b = ("nd--tom", "Multi Source 1-a"), ("nd--lera", "Multi Source 1-b")
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsAlpha"}, source=a)
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsBeta"}, source=b)
+        expected = {"MsAlpha", "MsBeta"}
+        assert await _linked_track_genres(mass, track_id) == expected
+        for _ in range(2):
+            await genre_ctrl.sync_media_item_genres(
+                MediaType.TRACK, track_id, {"MsAlpha"}, source=a
+            )
+            assert await _linked_track_genres(mass, track_id) == expected
+            await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsBeta"}, source=b)
+            assert await _linked_track_genres(mass, track_id) == expected
+        assert await _stored_track_genres(mass, track_id) >= expected
+
+    async def test_source_drops_only_its_own_genre(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """A genre leaves when no source reports it any more."""
+        track_id = await self._two_source_track(mass, "Multi Source 2")
+        a, b = ("nd--tom", "Multi Source 2-a"), ("nd--lera", "Multi Source 2-b")
+        await genre_ctrl.sync_media_item_genres(
+            MediaType.TRACK, track_id, {"MsShared", "MsOld"}, source=a
+        )
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsShared"}, source=b)
+        await genre_ctrl.sync_media_item_genres(
+            MediaType.TRACK, track_id, {"MsShared", "MsNew"}, source=a
+        )
+        assert await _linked_track_genres(mass, track_id) == {"MsShared", "MsNew"}
+        assert "MsOld" not in await _stored_track_genres(mass, track_id)
+
+    async def test_removed_mapping_stops_contributing(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """Once the library item loses a provider mapping, its genres go with the next sync."""
+        track_id = await self._two_source_track(mass, "Multi Source 3")
+        a, b = ("nd--tom", "Multi Source 3-a"), ("nd--lera", "Multi Source 3-b")
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsKeep"}, source=a)
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsGone"}, source=b)
+        await mass.music.database.delete(
+            DB_TABLE_PROVIDER_MAPPINGS,
+            {"media_type": "track", "provider_instance": b[0], "provider_item_id": b[1]},
+        )
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsKeep"}, source=a)
+        assert await _linked_track_genres(mass, track_id) == {"MsKeep"}
+        rows = await mass.music.database.get_rows_from_query(
+            f"SELECT provider_instance FROM {DB_TABLE_GENRE_MEDIA_ITEM_SOURCE} "
+            "WHERE media_type = 'track' AND media_id = :mid",
+            {"mid": track_id},
+            limit=0,
+        )
+        assert [row["provider_instance"] for row in rows] == [a[0]]
+
+    async def test_overwritten_names_are_restored_and_survive_the_scan(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """An overwrite storing one source's names gets the others back, so the scan keeps them."""
+        track_id = await self._two_source_track(mass, "Multi Source 4")
+        a, b = ("nd--tom", "Multi Source 4-a"), ("nd--lera", "Multi Source 4-b")
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsOne"}, source=a)
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsTwo"}, source=b)
+        # a changed-item refresh from source a overwrites the stored metadata with its own
+        await _set_track_genres(mass, track_id, ["MsOne"])
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsOne"}, source=a)
+        assert await _stored_track_genres(mass, track_id) == {"MsOne", "MsTwo"}
+        await genre_ctrl._cleanup_stale_genre_mappings(delete_empty_genres=False)
+        assert await _linked_track_genres(mass, track_id) == {"MsOne", "MsTwo"}
+
+    async def test_single_source_still_replaces(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """With one provider item the sync replaces the genres, as before."""
+        track = await _add_test_track(mass, "Single Source")
+        track_id = int(track.item_id)
+        await _add_source_mapping(mass, track_id, "nd--tom", "single-a")
+        a = ("nd--tom", "single-a")
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"SsFirst"}, source=a)
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"SsSecond"}, source=a)
+        assert await _linked_track_genres(mass, track_id) == {"SsSecond"}
+
+    async def test_cleanup_drops_orphan_source_rows(
+        self, mass: MusicAssistant, genre_ctrl: GenreController
+    ) -> None:
+        """Source rows of mappings that no longer exist are removed by the scan cleanup."""
+        track_id = await self._two_source_track(mass, "Multi Source 5")
+        b = ("nd--lera", "Multi Source 5-b")
+        await genre_ctrl.sync_media_item_genres(MediaType.TRACK, track_id, {"MsOrphan"}, source=b)
+        await mass.music.database.delete(
+            DB_TABLE_PROVIDER_MAPPINGS,
+            {"media_type": "track", "provider_instance": b[0], "provider_item_id": b[1]},
+        )
+        await genre_ctrl._cleanup_stale_genre_mappings(delete_empty_genres=False)
+        rows = await mass.music.database.get_rows_from_query(
+            f"SELECT 1 FROM {DB_TABLE_GENRE_MEDIA_ITEM_SOURCE} "
+            "WHERE media_type = 'track' AND media_id = :mid",
+            {"mid": track_id},
+            limit=0,
+        )
+        assert rows == []

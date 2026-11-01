@@ -32,6 +32,7 @@ from music_assistant.constants import (
     DB_TABLE_FAVORITES,
     DB_TABLE_GENRE_MEDIA_ITEM_EXCLUSION,
     DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
+    DB_TABLE_GENRE_MEDIA_ITEM_SOURCE,
     DB_TABLE_GENRES,
     DB_TABLE_LEGACY_PLAYLOG,
     DB_TABLE_MEDIA_PROGRESS,
@@ -518,6 +519,19 @@ class MusicDatabaseSetupMixin:
             [media_type] TEXT NOT NULL,
             FOREIGN KEY([genre_id]) REFERENCES [genres]([item_id]),
             UNIQUE(genre_id, media_id, media_type)
+            );"""
+        )
+        # created on every start (no schema step): the genre names each provider mapping
+        # reported, so a sync links an item to the union over its mappings (MUSIC-192)
+        await self.database.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_GENRE_MEDIA_ITEM_SOURCE}(
+            [media_id] INTEGER NOT NULL,
+            [media_type] TEXT NOT NULL,
+            [provider_instance] TEXT NOT NULL,
+            [provider_item_id] TEXT NOT NULL,
+            [genres] json NOT NULL,
+            UNIQUE(media_id, media_type, provider_instance, provider_item_id)
             );"""
         )
         await self.database.execute(

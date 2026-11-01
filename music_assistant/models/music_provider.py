@@ -1695,7 +1695,10 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
             genre_names = fallback_genres
 
         await self.mass.music.genres.sync_media_item_genres(
-            media_type, library_item_id, set(genre_names)
+            media_type,
+            library_item_id,
+            set(genre_names),
+            source=(self.instance_id, provider_item_id),
         )
 
     async def _sync_library_artists(self, items: AsyncIterator[Artist] | None = None) -> set[int]:
