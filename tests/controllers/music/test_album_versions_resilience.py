@@ -82,6 +82,7 @@ def _make_controller(providers: list[Mock], album: Album) -> AlbumsController:
             (p for p in providers if p.instance_id == instance_id), None
         )
     )
+    mass.music.get_visible_provider = mass.get_provider
     controller = AlbumsController.__new__(AlbumsController)
     controller.mass = mass
     controller.logger = logging.getLogger(__name__)
