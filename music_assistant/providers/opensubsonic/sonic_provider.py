@@ -449,6 +449,9 @@ class OpenSonicProvider(MusicProvider):
 
     async def resolve_image(self, path: str) -> bytes | Any:
         """Return the image."""
+        if path.startswith(("http://", "https://")):
+            # artist/album info image URLs are fetched directly, not via getCoverArt
+            return path
         self.logger.debug("Requesting cover art for '%s'", path)
         # a URL (artist/album info image) is not a cover art id: hand it back to be fetched
         if path.startswith(("http://", "https://")):
