@@ -5,6 +5,7 @@
   "name": "digarr",
   "description": "Surfaces your digarr recommendations on Discover, so you can hear an artist before approving it into Lidarr.",
   "codeowners": ["@stereotom"],
+  "tier": "community",
   "credits": ["[digarr](https://github.com/iuliandita/digarr)"],
   "requirements": [],
   "documentation": "",

@@ -5,6 +5,7 @@
   "name": "music-rater",
   "description": "Keeps AMG/TPS review data current on every library album (Navidrome and streaming).",
   "codeowners": ["@Tomvis"],
+  "tier": "community",
   "requirements": [],
   "documentation": "",
   "multi_instance": false
