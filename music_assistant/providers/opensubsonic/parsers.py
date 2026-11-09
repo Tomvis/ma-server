@@ -257,28 +257,9 @@ def parse_artist(
             )
         )
 
-    if sonic_artist.artist_image_url:
-        metadata.add_image(
-            MediaItemImage(
-                type=ImageType.THUMB,
-                path=sonic_artist.artist_image_url,
-                provider=instance_id,
-                remotely_accessible=True,
-            )
-        )
-
     if sonic_info:
         if sonic_info.biography:
             metadata.description = sonic_info.biography
-        if sonic_info.small_image_url:
-            metadata.add_image(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sonic_info.small_image_url,
-                    provider=instance_id,
-                    remotely_accessible=True,
-                )
-            )
 
     artist = Artist(
         item_id=sonic_artist.id,
@@ -322,17 +303,6 @@ def parse_album(
         )
 
     if sonic_info:
-        # the info image is the server's own cover at thumbnail size (Navidrome: a 300px
-        # /share/img/ link); next to the full-size cover_art it only risks being shown first
-        if sonic_info.small_image_url and not sonic_album.cover_art:
-            metadata.add_image(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sonic_info.small_image_url,
-                    remotely_accessible=True,
-                    provider=instance_id,
-                )
-            )
         if sonic_info.notes:
             metadata.description = sonic_info.notes
 

@@ -2137,3 +2137,97 @@ async def test_migration_replaces_play_history_indexes_on_a_fork_database_stampe
         {"table": DB_TABLE_PLAY_HISTORY},
     )
     assert {row["name"] for row in indexes} == {f"{DB_TABLE_PLAY_HISTORY}_user_timestamp_cov_idx"}
+
+
+async def test_migration_drops_remotely_accessible_opensubsonic_images(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A pre-72 database loses the external site images opensubsonic stored for artists and albums.
+
+    Cover art served by the subsonic server, images of other providers and unparsable rows
+    stay, a played item forgets such an image and running the migration twice is harmless.
+    """
+    external = _image("thumb", "https://lastfm.example/a.png", "opensubsonic--a")
+    external["remotely_accessible"] = True
+    cover_art = _image("thumb", "ar-1", "opensubsonic--a")
+    other = _image("thumb", "https://lastfm.example/b.png", "spotify--b")
+    other["remotely_accessible"] = True
+    for table in ("artists", "albums"):
+        await database.execute(f"ALTER TABLE {table} ADD COLUMN metadata json")
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        await database.execute(f"CREATE TABLE {table}([id] INTEGER PRIMARY KEY, [image] json)")
+    stored = {
+        ("artists", 1): serialize_to_json({"images": [external, cover_art, other]}),
+        ("artists", 2): 'not json "opensubsonic"',
+        ("albums", 1): serialize_to_json({"images": [external], "description": "x"}),
+        ("albums", 2): serialize_to_json({"images": [cover_art]}),
+    }
+    for (table, item_id), metadata in stored.items():
+        await database.execute(
+            f"INSERT INTO {table} (item_id, metadata) VALUES (:item_id, :metadata)",
+            {"item_id": item_id, "metadata": metadata},
+        )
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        for row_id, image in ((1, external), (2, cover_art)):
+            await database.execute(
+                f"INSERT INTO {table} (id, image) VALUES (:id, :image)",
+                {"id": row_id, "image": serialize_to_json(image)},
+            )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    for _ in range(2):
+        await migrate_database(
+            mass, database, MagicMock(), prev_version=71, create_tables=AsyncMock()
+        )
+
+    artists = {
+        row["item_id"]: row["metadata"]
+        for row in await database.get_rows_from_query("SELECT item_id, metadata FROM artists")
+    }
+    assert json.loads(artists[1]) == {"images": [cover_art, other]}
+    assert artists[2] == stored[("artists", 2)]
+    albums = {
+        row["item_id"]: row["metadata"]
+        for row in await database.get_rows_from_query("SELECT item_id, metadata FROM albums")
+    }
+    assert json.loads(albums[1]) == {"images": [], "description": "x"}
+    assert albums[2] == stored[("albums", 2)]
+    for table in (DB_TABLE_MEDIA_PROGRESS, DB_TABLE_PLAY_HISTORY):
+        played = {
+            row["id"]: row["image"]
+            for row in await database.get_rows_from_query(f"SELECT id, image FROM {table}")
+        }
+        assert played[1] is None
+        assert json.loads(played[2]) == cover_art
+
+
+async def test_migration_drops_opensubsonic_external_images_on_a_fork_database_stamped_72(
+    database: DatabaseConnection,
+) -> None:
+    """
+    A database stamped 72 by this branch still gets upstream's 72 step.
+
+    Upstream gates the opensubsonic image drop at "prev_version <= 71", but this branch was
+    already stamped 72, so it is widened to "<= 72" (and DB_SCHEMA_VERSION moved to 73).
+    Revert the gate and this test fails.
+    """
+    external = _image("thumb", "https://navidrome.example/share/img/a", "opensubsonic--a")
+    external["remotely_accessible"] = True
+    cover_art = _image("thumb", "al-1", "opensubsonic--a")
+    await database.execute("ALTER TABLE albums ADD COLUMN metadata json")
+    await database.execute(
+        "INSERT INTO albums (item_id, metadata) VALUES (1, :metadata)",
+        {"metadata": serialize_to_json({"images": [external, cover_art]})},
+    )
+    await database.commit()
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+
+    await migrate_database(mass, database, MagicMock(), prev_version=72, create_tables=AsyncMock())
+
+    row = await database.get_row("albums", {"item_id": 1})
+    assert row is not None
+    assert json.loads(row["metadata"]) == {"images": [cover_art]}

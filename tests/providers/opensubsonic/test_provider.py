@@ -13,7 +13,7 @@ import pytest
 from libopensonic.errors import DataNotFoundError
 from libopensonic.media import PodcastChannel
 from music_assistant_models.enums import ContentType, ImageType, MediaType, StreamType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 
 from music_assistant.providers.opensubsonic.parsers import EP_CHAN_SEP
 from music_assistant.providers.opensubsonic.sonic_provider import OpenSonicProvider
@@ -621,3 +621,28 @@ async def test_track_lyrics_caches_not_found(provider: OpenSonicProvider) -> Non
     await asyncio.gather(*tasks)
     assert await provider.get_track_lyrics(item) is None
     provider.conn.get_lyrics_by_song_id.assert_awaited_once_with("tr-2")
+
+
+async def test_legacy_auth_follows_setup_data(
+    provider: OpenSonicProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy auth choice made in the setup flow reaches the connection."""
+    setup_data = {
+        "base_url": "https://sonic.local",
+        "username": "user",
+        "password": "secret",
+        "enable_legacy_auth": True,
+    }
+    monkeypatch.setattr(
+        provider, "get_setup_value", lambda key, default=None: setup_data.get(key, default)
+    )
+    connection = Mock()
+    connection.return_value.ping = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "music_assistant.providers.opensubsonic.sonic_provider.SonicConnection", connection
+    )
+
+    with pytest.raises(LoginFailed):
+        await provider.handle_async_init()
+
+    assert connection.call_args.kwargs["legacy_auth"] is True
