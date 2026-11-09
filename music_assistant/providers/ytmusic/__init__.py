@@ -164,6 +164,7 @@ SUPPORTED_FEATURES = {
     ProviderFeature.BROWSE,
     ProviderFeature.SEARCH,
     ProviderFeature.ARTIST_ALBUMS,
+    ProviderFeature.ARTIST_TRACKS,
     ProviderFeature.ARTIST_TOPTRACKS,
     ProviderFeature.SIMILAR_ARTISTS,
     ProviderFeature.SIMILAR_TRACKS,
@@ -657,14 +658,48 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
         return albums
 
     @use_cache(3600 * 24 * 7, allow_expired_cache=True)  # Cache for 7 days
-    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
-        """Get a list of 25 most popular tracks for the given artist."""
+    async def get_artist_tracks(self, prov_artist_id: str) -> list[Track]:
+        """
+        Get the tracks of the given artist.
+
+        These are the artist's songs list (YTM's "Top songs", up to 150, by popularity), the
+        list YTM itself shows as the artist's songs. Listing them through every album instead
+        takes a request per album, minutes for a large discography. An artist without a songs
+        list gets its albums' tracks, each song once.
+        """
         artist_obj = await get_artist(prov_artist_id=prov_artist_id, headers=self._headers)
         if artist_obj.get("songs") and artist_obj["songs"].get("browseId"):
-            prov_playlist_id = artist_obj["songs"]["browseId"]
-            playlist_tracks = await self.get_playlist_tracks(prov_playlist_id)
-            return playlist_tracks[:25]
-        return []
+            return await self.get_playlist_tracks(artist_obj["songs"]["browseId"])
+        albums = await self.get_artist_albums(prov_artist_id)
+        results = await asyncio.gather(
+            *(self.get_album_tracks(album.item_id) for album in albums), return_exceptions=True
+        )
+        tracks: list[Track] = []
+        seen: set[str] = set()
+        error: Exception | None = None
+        for album, result in zip(albums, results, strict=True):
+            if isinstance(result, Exception):
+                # one failing album must not drop the artist's other tracks
+                error = result
+                self.logger.warning(
+                    "Unable to fetch the tracks of album %s: %s", album.item_id, result
+                )
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            for track in result:
+                if (unique_id := f"{track.name}.{track.version}") not in seen:
+                    seen.add(unique_id)
+                    tracks.append(track)
+        if error is not None and not tracks:
+            # nothing could be listed at all, so surface the reason instead of an empty list
+            raise error
+        return tracks
+
+    @use_cache(3600 * 24 * 7, allow_expired_cache=True)  # Cache for 7 days
+    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
+        """Get a list of 25 most popular tracks for the given artist."""
+        return (await self.get_artist_tracks(prov_artist_id))[:25]
 
     @use_cache(3600 * 24 * 14)  # Cache for 14 days
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
