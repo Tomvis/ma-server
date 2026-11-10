@@ -1182,6 +1182,13 @@ class AlbumsController(MediaControllerBase[Album]):
         for db_track in await self.get_library_album_tracks(db_id):
             if not recursive:
                 raise MusicAssistantError("Album still has tracks linked")
+            if await self.mass.music.database.get_count_from_query(
+                f"SELECT 1 FROM {DB_TABLE_ALBUM_TRACKS} "
+                "WHERE track_id = :track_id AND album_id != :album_id",
+                {"track_id": int(db_track.item_id), "album_id": db_id},
+            ):
+                # one recording on two albums: the other album keeps the track
+                continue
             with contextlib.suppress(MediaNotFoundError):
                 await self.mass.music.tracks.remove_item_from_library(db_track.item_id)
         # remove the item before its relations so failed analysis cleanup leaves it intact
