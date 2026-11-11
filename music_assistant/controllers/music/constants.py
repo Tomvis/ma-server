@@ -80,7 +80,11 @@ CONF_KEEP_REMASTERS_APART: Final[str] = "keep_remasters_apart"
 # 73: upstream took 72 (opensubsonic artist/album images hosted on external sites are
 # dropped), gated at "prev_version <= 71". This branch was already stamped 72, so it is
 # widened to "<= 72" and the version moved to 73.
-DB_SCHEMA_VERSION: Final[int] = 73
+#
+# 74: upstream took 73 (the old name_nocase_idx indexes are dropped; startup creates
+# search_name_idx instead), gated at "prev_version <= 72". This branch was already
+# stamped 73, so it is widened to "<= 73" and the version moved to 74.
+DB_SCHEMA_VERSION: Final[int] = 74
 # headroom kept free on top of what moving the audio analysis out of library.db writes
 DB_FREE_SPACE_MARGIN: Final[int] = 100 * 1024 * 1024
 
