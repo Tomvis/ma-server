@@ -7,11 +7,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
-from aiohttp import (
-    ClientConnectorCertificateError,
-    ClientConnectorSSLError,
-    ClientResponseError,
-)
+from aiohttp import ClientConnectorCertificateError, ClientConnectorSSLError, ClientResponseError
 from libopensonic import AsyncConnection as SonicConnection
 from libopensonic import Extensions as OpenSubsonicExtensions
 from libopensonic.errors import (
@@ -1147,7 +1143,7 @@ class OpenSonicProvider(MusicProvider):
                 return (
                     False,
                     mark.position,
-                    datetime.fromisoformat(mark.created) if mark.created else None,
+                    datetime.fromisoformat(mark.changed) if mark.changed else None,
                 )
         # If we get here, there is no bookmark
         return (False, 0, None)
