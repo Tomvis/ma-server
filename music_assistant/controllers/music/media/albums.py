@@ -2721,7 +2721,9 @@ class AlbumsController(MediaControllerBase[Album]):
             },
         )
 
-    def _sync_details_query_parts(self) -> tuple[str, str, dict[str, Any]]:
+    async def _sync_details_query_parts(
+        self, provider_mappings: Iterable[ProviderMapping]
+    ) -> tuple[str, str, dict[str, Any]]:
         """Return extra (columns, joins, params) for the albums sync-details query."""
         # the sync loop needs the listen-later flag plus the review/DR metadata to
         # decide whether anything actually changed, without hydrating a full Album
