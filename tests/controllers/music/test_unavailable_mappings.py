@@ -268,8 +268,10 @@ async def test_the_daily_check_keeps_what_the_provider_still_lacks(
     assert provider.lookups == 2
     assert not await _available(mass, db_podcast)
     assert not await _available(mass, db_radio)
-    assert await mass.music.podcasts.library_count() == 1
-    assert await mass.music.radio.library_count() == 1
+    # fork: library_count mirrors library_items (in-library mappings only), and these
+    # fixture mappings are not in_library, so assert the rows survived directly (HW-315)
+    assert (await mass.music.podcasts.get_library_item(db_podcast.item_id)).item_id
+    assert (await mass.music.radio.get_library_item(db_radio.item_id)).item_id
 
 
 async def test_the_daily_check_skips_providers_not_loaded(mass: MusicAssistant) -> None:
