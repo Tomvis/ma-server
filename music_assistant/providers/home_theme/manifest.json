@@ -5,7 +5,6 @@
   "name": "Home theme",
   "description": "Keeps each person's home theme and language (from the household's authentik settings) and their own in-app choices.",
   "codeowners": ["@Tomvis"],
-  "tier": "community",
   "requirements": [],
   "documentation": "",
   "multi_instance": false,
