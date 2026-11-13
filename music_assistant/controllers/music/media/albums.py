@@ -735,6 +735,12 @@ class AlbumsController(MediaControllerBase[Album]):
         # register (extra) api handlers
         api_base = self.api_base
         self.mass.register_api_command(
+            f"music/{api_base}/letter_index",
+            self.letter_index,
+            required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
+        )
+        self.mass.register_api_command(
             f"music/{api_base}/album_tracks",
             self.tracks,
             required_scope=Scope.LIBRARY_READ,
@@ -887,15 +893,11 @@ class AlbumsController(MediaControllerBase[Album]):
         if reachable_via is not None and not reachable_via:
             return []
         extra_query_params: dict[str, Any] = {}
-        extra_query_parts: list[str] = []
-        extra_join_parts: list[str] = []
-        artist_table_joined = False
         # album-specific filters (album_type / listen_later / critical_reception),
-        # shared with library_count so count and list stay in sync.
-        _apply_album_specific_filters(
-            query_parts=extra_query_parts,
-            query_params=extra_query_params,
-            album_types=album_types,
+        # shared with library_count and letter_index so all three stay in sync.
+        extra_query_parts = self._library_filter_parts(
+            extra_query_params,
+            album_types,
             listen_later=listen_later,
             dr_buckets=dr_buckets,
             amg_ratings=amg_ratings,
@@ -908,6 +910,8 @@ class AlbumsController(MediaControllerBase[Album]):
             tps_untagged=tps_untagged,
             match_mode=critical_reception_match,
         )
+        extra_join_parts: list[str] = []
+        artist_table_joined = False
         if field == SortField.ARTIST_NAME:
             extra_join_parts.append(
                 "JOIN album_artists ON album_artists.album_id = albums.item_id "
@@ -1014,6 +1018,83 @@ class AlbumsController(MediaControllerBase[Album]):
                     if len(result) >= limit:
                         break
         return result
+
+    async def letter_index(  # noqa: PLR0913
+        self,
+        favorite: bool | None = None,
+        search: str | None = None,
+        provider: str | list[str] | None = None,
+        genre: int | list[int] | None = None,
+        played_only: bool = False,
+        album_types: list[AlbumType] | None = None,
+        listen_later: bool | None = None,
+        dr_buckets: list[str] | None = None,
+        amg_ratings: list[float | int] | None = None,
+        amg_favorite: bool | None = None,
+        amg_accolades: list[str] | None = None,
+        amg_untagged: bool | None = None,
+        tps_ratings: list[float | int] | None = None,
+        tps_favorite: bool | None = None,
+        tps_accolades: list[str] | None = None,
+        tps_untagged: bool | None = None,
+        critical_reception_match: str = "all",
+        *,
+        sort_field: SortField | None = None,
+        sort_direction: SortDirection | None = None,
+        reachable_via: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[dict[str, str | int]]:
+        """
+        Return where each starting letter begins in the in-database albums listing.
+
+        Each entry holds a letter ("A" to "Z", or "#" for anything else) and the offset of
+        its first album in ``library_items`` for the same arguments, in listing order.
+        Empty when sorted on anything but name or sort name, or when searching.
+
+        :param favorite: Only include the current user's likes (True) or dislikes (False).
+        :param search: Filter by search query.
+        :param provider: Filter by provider instance ID (single string or list).
+        :param genre: Filter by genre id(s).
+        :param played_only: Filter to only played albums.
+        :param album_types: Filter by album types.
+        :param sort_field: Sort field to use.
+        :param sort_direction: Sort direction, the field's default when omitted.
+        :param reachable_via: Restrict results to items with a provider mapping reachable
+            through one of these provider instance ids, see `library_items`.
+
+        Fork filters (listen_later, DR / AMG / TPS) mirror :meth:`library_items`, so the
+        offsets match the filtered list. The listen-later view drops the in-library join,
+        which the shared letter index can't, so it gets no index.
+        """
+        if listen_later is True:
+            return []
+        query_params: dict[str, Any] = {}
+        return await self._library_letter_index(
+            self._library_filter_parts(
+                query_params,
+                album_types,
+                listen_later=listen_later,
+                dr_buckets=dr_buckets,
+                amg_ratings=amg_ratings,
+                amg_favorite=amg_favorite,
+                amg_accolades=amg_accolades,
+                amg_untagged=amg_untagged,
+                tps_ratings=tps_ratings,
+                tps_favorite=tps_favorite,
+                tps_accolades=tps_accolades,
+                tps_untagged=tps_untagged,
+                match_mode=critical_reception_match,
+            ),
+            query_params,
+            favorite=favorite,
+            search=search,
+            provider=provider,
+            genre=genre,
+            played_only=played_only,
+            sort_field=sort_field,
+            sort_direction=sort_direction,
+            reachable_via=reachable_via,
+        )
 
     async def library_count(  # noqa: PLR0913
         self,
@@ -2751,6 +2832,43 @@ class AlbumsController(MediaControllerBase[Album]):
             critical_reception=CriticalReception.from_dict(json_loads(raw_cr)) if raw_cr else None,
             dynamic_range=db_row["dynamic_range"],
         )
+
+    @staticmethod
+    def _library_filter_parts(  # noqa: PLR0913
+        query_params: dict[str, Any],
+        album_types: list[AlbumType] | None,
+        *,
+        listen_later: bool | None = None,
+        dr_buckets: list[str] | None = None,
+        amg_ratings: list[float | int] | None = None,
+        amg_favorite: bool | None = None,
+        amg_accolades: list[str] | None = None,
+        amg_untagged: bool | None = None,
+        tps_ratings: list[float | int] | None = None,
+        tps_favorite: bool | None = None,
+        tps_accolades: list[str] | None = None,
+        tps_untagged: bool | None = None,
+        match_mode: str = "all",
+    ) -> list[str]:
+        """Return the WHERE conditions of the album-specific library listing filters."""
+        query_parts: list[str] = []
+        _apply_album_specific_filters(
+            query_parts=query_parts,
+            query_params=query_params,
+            album_types=album_types,
+            listen_later=listen_later,
+            dr_buckets=dr_buckets,
+            amg_ratings=amg_ratings,
+            amg_favorite=amg_favorite,
+            amg_accolades=amg_accolades,
+            amg_untagged=amg_untagged,
+            tps_ratings=tps_ratings,
+            tps_favorite=tps_favorite,
+            tps_accolades=tps_accolades,
+            tps_untagged=tps_untagged,
+            match_mode=match_mode,
+        )
+        return query_parts
 
     def _get_sort_sql(self, field: SortField, direction: SortDirection | None) -> str:
         """
