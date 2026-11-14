@@ -37,6 +37,7 @@ from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
+    RetriesExhausted,
     SetupFailedError,
     UnplayableMediaError,
 )
@@ -104,6 +105,7 @@ from .helpers import (
     get_podcast_episode,
     get_song_radio_tracks,
     get_track,
+    get_visitor_id,
     is_brand_account,
     library_add_remove_album,
     library_add_remove_artist,
@@ -227,6 +229,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     _cipher = None
     _yt_user: str | None
     _cookie: str
+    _visitor_id: str = ""
     _yt_dlp_module = None
     _episode_playbacks: dict[str, EpisodePlayback]
 
@@ -277,6 +280,12 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
         self._yt_user = yt_username if is_brand_account(yt_username) else None
         # yt-dlp needs a netscape formatted cookie
         self._netscape_cookie = convert_to_netscape(self._cookie, YTM_COOKIE_DOMAIN)
+        try:
+            # every ytmusicapi client fetches a visitor id of its own, unless the headers carry one
+            self._visitor_id = await get_visitor_id()
+        except RequestException as err:
+            # YouTube being unreachable (e.g. right after a host reboot) is worth a retry
+            raise SetupFailedError(f"YouTube Music is not reachable: {err}") from err
         self._initialize_headers()
         self._initialize_context()
         self._cookies = {"CONSENT": "YES+1"}
@@ -441,12 +450,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_album(self, prov_album_id: str) -> Album:
         """Get full album details by id."""
-        if album_obj := await get_album(
-            headers=self._headers,
-            prov_album_id=prov_album_id,
-            language=self.language,
-            user=self._yt_user,
-        ):
+        if album_obj := await self._get_album_obj(prov_album_id):
             return self._parse_album(album_obj=album_obj, album_id=prov_album_id)
         msg = f"Item {prov_album_id} not found"
         raise MediaNotFoundError(msg)
@@ -454,12 +458,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     @use_cache(3600 * 24 * 30, allow_expired_cache=True)  # Cache for 30 days
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get album tracks for given album id."""
-        album_obj = await get_album(
-            headers=self._headers,
-            prov_album_id=prov_album_id,
-            language=self.language,
-            user=self._yt_user,
-        )
+        album_obj = await self._get_album_obj(prov_album_id)
         if not album_obj.get("tracks"):
             return []
         album_artists = [
@@ -488,12 +487,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
         YTM won't surface these variants via search, so we must explicitly grab
         them out of the other_versions field.
         """
-        if album_obj := await get_album(
-            headers=self._headers,
-            prov_album_id=prov_album_id,
-            language=self.language,
-            user=self._yt_user,
-        ):
+        if album_obj := await self._get_album_obj(prov_album_id):
             return [
                 self._parse_album(album_obj=ov, album_id=ov["browseId"])
                 for ov in album_obj.get("other_versions", [])
@@ -504,9 +498,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     @use_cache(3600 * 24 * 30)  # Cache for 30 days
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get full artist details by id."""
-        if artist_obj := await get_artist(
-            prov_artist_id=prov_artist_id, headers=self._headers, language=self.language
-        ):
+        if artist_obj := await self._get_artist_obj(prov_artist_id, self.language):
             return self._parse_artist(artist_obj=artist_obj)
         msg = f"Item {prov_artist_id} not found"
         raise MediaNotFoundError(msg)
@@ -600,7 +592,7 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     @use_cache(3600 * 24 * 7, allow_expired_cache=True)  # Cache for 7 days
     async def get_similar_artists(self, prov_artist_id: str, limit: int = 25) -> list[Artist]:
         """Retrieve a list of artists similar to the provided artist."""
-        artist_obj = await get_artist(prov_artist_id=prov_artist_id, headers=self._headers)
+        artist_obj = await self._get_artist_obj(prov_artist_id, "en")
         artists = []
 
         for similar_artist in artist_obj.get("related", {}).get("results", []):
@@ -618,9 +610,9 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
     @use_cache(3600 * 24 * 7, cache_checksum="v1", allow_expired_cache=True)  # Cache for 7 days
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
         """Get a list of albums for the given artist."""
-        artist_obj = await get_artist(prov_artist_id=prov_artist_id, headers=self._headers)
+        artist_obj = await self._get_artist_obj(prov_artist_id, "en")
 
-        # get_artist() only embeds ~10 item previews, so fetch each section in full.
+        # get_artist() only embeds ~10 item previews, so fetch each section separately.
         # "singles" covers singles and EPs, "shows" covers radio shows and audio dramas.
         sections = [
             (key, section)
@@ -689,38 +681,12 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
         Get the tracks of the given artist.
 
         These are the artist's songs list (YTM's "Top songs", up to 150, by popularity), the
-        list YTM itself shows as the artist's songs. Listing them through every album instead
-        takes a request per album, minutes for a large discography. An artist without a songs
-        list gets its albums' tracks, each song once.
+        list YTM itself shows as the artist's songs. An artist without a songs list has none.
         """
-        artist_obj = await get_artist(prov_artist_id=prov_artist_id, headers=self._headers)
+        artist_obj = await self._get_artist_obj(prov_artist_id, "en")
         if artist_obj.get("songs") and artist_obj["songs"].get("browseId"):
             return await self.get_playlist_tracks(artist_obj["songs"]["browseId"])
-        albums = await self.get_artist_albums(prov_artist_id)
-        results = await asyncio.gather(
-            *(self.get_album_tracks(album.item_id) for album in albums), return_exceptions=True
-        )
-        tracks: list[Track] = []
-        seen: set[str] = set()
-        error: Exception | None = None
-        for album, result in zip(albums, results, strict=True):
-            if isinstance(result, Exception):
-                # one failing album must not drop the artist's other tracks
-                error = result
-                self.logger.warning(
-                    "Unable to fetch the tracks of album %s: %s", album.item_id, result
-                )
-                continue
-            if isinstance(result, BaseException):
-                raise result
-            for track in result:
-                if (unique_id := f"{track.name}.{track.version}") not in seen:
-                    seen.add(unique_id)
-                    tracks.append(track)
-        if error is not None and not tracks:
-            # nothing could be listed at all, so surface the reason instead of an empty list
-            raise error
-        return tracks
+        return []
 
     @use_cache(3600 * 24 * 7, allow_expired_cache=True)  # Cache for 7 days
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
@@ -781,7 +747,13 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
             start_seconds = await get_episode_start_seconds(
                 video_id, headers=self._headers, user=self._yt_user
             )
-        except (YTMusicError, RequestException, KeyError, MediaNotFoundError) as err:
+        except (
+            YTMusicError,
+            RequestException,
+            KeyError,
+            MediaNotFoundError,
+            RetriesExhausted,
+        ) as err:
             # without YouTube's progress the episode resumes from Music Assistant's own
             self.logger.debug("Unable to get the progress of episode %s: %s", video_id, err)
             raise NotImplementedError from err
@@ -1226,6 +1198,8 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
             )
         sapisid = sapisid_from_cookie(self._cookie)
         headers["Authorization"] = get_authorization(sapisid + " " + YTM_DOMAIN)
+        if self._visitor_id:
+            headers["X-Goog-Visitor-Id"] = self._visitor_id
         self._headers = headers
 
     def _initialize_context(self) -> None:
@@ -1741,6 +1715,33 @@ class YoutubeMusicProvider(RecommendationPayloadMixin, MusicProvider):
             await import_module_in_thread("yt_dlp")
         except ImportError:
             raise SetupFailedError("Package yt_dlp failed to install")
+
+    @use_cache(3600)  # Cache for 1 hour
+    async def _get_artist_obj(self, prov_artist_id: str, language: str) -> dict[str, Any]:
+        """
+        Return the raw artist, cached so the calls of one artist page share a single fetch.
+
+        :param prov_artist_id: The provider id of the artist.
+        :param language: Language of the response, "en" to read the albums, singles or related
+            artists sections, which ytmusicapi finds by their translated title.
+        """
+        return await get_artist(
+            prov_artist_id=prov_artist_id, headers=self._headers, language=language
+        )
+
+    @use_cache(3600)  # Cache for 1 hour
+    async def _get_album_obj(self, prov_album_id: str) -> dict[str, Any]:
+        """
+        Return the raw album, cached so the calls of one album page share a single fetch.
+
+        :param prov_album_id: The provider id of the album.
+        """
+        return await get_album(
+            headers=self._headers,
+            prov_album_id=prov_album_id,
+            language=self.language,
+            user=self._yt_user,
+        )
 
     async def _get_playlist_entries(self, prov_playlist_id: str) -> list[dict[str, Any]]:
         """Return the raw entries of a playlist in listing order."""
