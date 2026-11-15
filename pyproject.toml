@@ -53,7 +53,7 @@ description = "Music Assistant"
 license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.14"
-version = "1.0.0b2"
+version = "0.0.0"
 
 [project.optional-dependencies]
 test = [
