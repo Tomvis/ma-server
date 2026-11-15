@@ -916,30 +916,17 @@ async def test_library_count_unchanged_without_user(counted_mass: MusicAssistant
     for media_type in ("tracks", "albums", "artists"):
         controller = getattr(counted_mass.music, media_type)
         with patch(GET_CURRENT_USER, return_value=None):
-            listed = await controller.library_items(limit=0)
-            assert await controller.library_count() == len(listed)
+            library_items = await controller.library_items(limit=500)
+            assert await controller.library_count() == len(library_items)
 
 
 async def test_library_count_unchanged_for_unrestricted_user(
     counted_mass: MusicAssistant,
 ) -> None:
-    """
-    A user that may see every music source sees the true library totals.
-
-    Upstream pins this against the raw row count of the table. This branch cannot:
-    its library_count mirrors library_items, which is restricted to items holding an
-    in-library provider mapping, so a row that exists without one (a listen-later
-    album, say) is deliberately not counted. Pinning count against the *list* is the
-    invariant that actually matters here -- count and list are meant to track each
-    other 1-1 -- and it is strictly stronger than the row count upstream asserts,
-    which cannot catch the two drifting apart together.
-
-    Uses upstream's post-#6255 User fixture: provider_filter is gone from the model,
-    so the old Mock(provider_filter=[]) no longer drives anything.
-    """
+    """A user that may see every music source sees the true library totals."""
     with patch(GET_CURRENT_USER, return_value=_user(USER_ALL)):
-        listed = await counted_mass.music.tracks.library_items(limit=0)
-        assert await counted_mass.music.tracks.library_count() == len(listed)
+        library_items = await counted_mass.music.tracks.library_items(limit=500)
+        assert await counted_mass.music.tracks.library_count() == len(library_items)
 
 
 async def test_album_artists_only_ignores_albums_on_hidden_sources(

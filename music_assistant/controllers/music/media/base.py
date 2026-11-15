@@ -2696,6 +2696,29 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     ) -> None:
         """Update existing library record in the database."""
 
+    @final
+    async def _library_count(
+        self,
+        favorite_only: bool,
+        extra_query_parts: list[str] | None = None,
+        extra_query_params: dict[str, Any] | None = None,
+    ) -> int:
+        """
+        Return the number of items the library listing shows the current user.
+
+        :param favorite_only: Only count the items the current user likes.
+        :param extra_query_parts: The type-specific listing conditions.
+        :param extra_query_params: Bound values of the type-specific listing conditions.
+        """
+        query_params = dict(extra_query_params) if extra_query_params else {}
+        return await self.get_library_items_count_by_query(
+            favorite=favorite_only or None,
+            provider_filter=self._ensure_provider_filter(None),
+            extra_query_parts=[*(extra_query_parts or []), *self.listing_filter(query_params)],
+            extra_query_params=query_params,
+            in_library_only=True,
+        )
+
     def _listing_filter_clause(self, query_params: dict[str, Any]) -> str | None:
         """
         Return an extra SQL condition that narrows library listings for the calling user.

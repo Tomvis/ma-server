@@ -1635,6 +1635,20 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
         for table in MEDIA_ITEM_DB_TABLES:
             await database.execute(f"DROP INDEX IF EXISTS {table}_name_nocase_idx")
 
+    if prev_version <= 74:
+        # Upstream gates this at "prev_version <= 73"; widened to <= 74 (DB_SCHEMA_VERSION
+        # 75) for the same reason as the <= 64 step above.
+        # the podcast of an episode, so the cleanup keeps the progress of library podcasts;
+        # existing rows get it from the next report of their provider
+        try:
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_MEDIA_PROGRESS} ADD COLUMN podcast_item_id TEXT"
+            )
+        except Exception as err:
+            # create_tables makes a missing table with the column already in place
+            if "duplicate column" not in str(err) and "no such table" not in str(err):
+                raise
+
     # (re)build the FTS search tables so they are in sync with the content tables;
     # this both populates them on first migration to the FTS-enabled schema and
     # repairs them after any migration that rewrote rows without the sync triggers active

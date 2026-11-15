@@ -109,8 +109,7 @@ async def test_same_isrc_from_two_providers_dedupes(music: MusicController) -> N
 
     assert library_track_1.item_id == library_track_2.item_id
     assert len(library_track_2.provider_mappings) == 2
-    assert len(await music.tracks.library_items()) == 1
-    assert await music.tracks.library_count() == 1
+    assert await music.database.get_count(music.tracks.db_table) == 1
 
 
 async def test_formatted_isrc_from_two_providers_dedupes(music: MusicController) -> None:
@@ -150,12 +149,7 @@ async def test_matching_checks_more_than_fifty_external_id_candidates(
     )
 
     assert matched.item_id == expected.item_id
-    # Row count, not library_count(). On this branch library_count mirrors
-    # library_items, which only returns items holding an in-library provider mapping,
-    # and add_item_to_library does not set that flag -- the sync loop does. Both
-    # therefore report 0 here while the table really holds 51 rows, which is what this
-    # test is about: every candidate row sharing the identifier must exist to paginate.
-    assert await music.database.get_count("tracks") == 51
+    assert await music.database.get_count(music.tracks.db_table) == 51
 
 
 async def test_non_unique_external_id_candidates_are_all_verified(
@@ -187,8 +181,7 @@ async def test_non_unique_external_id_candidates_are_all_verified(
 
     assert matched.item_id == expected.item_id
     assert matched.item_id != unrelated.item_id
-    # see the note above: row count, not library_count()
-    assert await music.database.get_count("albums") == 2
+    assert await music.database.get_count(music.albums.db_table) == 2
     assert {mapping.provider_instance for mapping in matched.provider_mappings} == {
         "apple_music_1",
         "qobuz_1",
