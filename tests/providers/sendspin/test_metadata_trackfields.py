@@ -44,6 +44,10 @@ def _player(
         elapsed_time_last_updated=1.0,
     )
     player.state = SimpleNamespace(current_media=media, playback_state=PlaybackState.PLAYING)
+    # upstream #7649: the protocol player reads the media of the player it is attached to
+    player._player_media = media
+    player._player_playing = True
+    player._media_identity = Mock(return_value=("track-1",))
     queue = SimpleNamespace(
         repeat_mode=RepeatMode.OFF,
         shuffle_enabled=False,
