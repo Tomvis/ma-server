@@ -80,6 +80,8 @@ def _player(
     player._build_current_media_metadata = lambda *args, **kwargs: (
         SendspinPlayer._build_current_media_metadata(player, *args, **kwargs)
     )
+    # upstream 2.11.0.dev2026112003 anchors the progress to the timeline: not what these pin
+    player._timeline_anchored = Mock(side_effect=lambda metadata, *_a, **_k: (metadata, 0))
     metadata_role = Mock()
     player._metadata_role = metadata_role
     return player, metadata_role

@@ -391,8 +391,12 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
             # finally calls `_cancel_providers`, which pops the session and dispatches the
             # very fire-and-forget cancel this block exists to avoid. Popping first leaves
             # the worker's call a no-op.
+            # A live source worker cancels its own providers inline as it stops (upstream
+            # 2.11.0.dev2026112003), so its session is left to it.
             cancel_tasks: list[asyncio.Task[None]] = []
             for session_key in list(self._active_sessions):
+                if session_key in self._live_sources:
+                    continue
                 provider_ids = self._active_sessions.pop(session_key, None)
                 if not provider_ids:
                     continue
@@ -1994,8 +1998,14 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
         audio_format: AudioFormat,
         providers: list[AudioAnalysisProvider],
         source: AudioSource | None = None,
+        cancel_failed_starts: bool = True,
     ) -> set[str]:
-        """Call start_analysis on each provider, returning IDs of those that accepted."""
+        """
+        Call start_analysis on each provider, returning IDs of those that accepted.
+
+        cancel_failed_starts is False for a live source, whose worker cancels every
+        provider it offered when it ends.
+        """
         self._mark_analysis_activity()
         provider_ids: set[str] = set()
         # Bound each provider's start_analysis: AudioBuffer.get_buffer awaits this
@@ -2024,7 +2034,8 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
                 # (e.g. the loudness provider spawns its ffmpeg process before storing
                 # the session). We never add the provider to provider_ids, so nothing
                 # else will ever cancel it - do it here or the process/session leaks.
-                self._cancel_provider_session(provider, session_key)
+                if cancel_failed_starts:
+                    self._cancel_provider_session(provider, session_key)
                 continue
             except Exception as err:
                 # provider.start_analysis is provider-implemented; skip the one that
@@ -2034,7 +2045,8 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
                 )
                 # Same rationale as the timeout arm: a partially-started session must
                 # still be torn down even though we're not tracking this provider.
-                self._cancel_provider_session(provider, session_key)
+                if cancel_failed_starts:
+                    self._cancel_provider_session(provider, session_key)
                 continue
             if accepted:
                 provider_ids.add(provider.instance_id)
@@ -2429,7 +2441,12 @@ class AudioAnalysisController(AudioAnalysisDatabaseMixin):
             # starts (an unload or a reload) is not part of the analysis afterwards
             self._active_sessions[session_key] = provider_ids = {p.instance_id for p in providers}
             accepted = await self._start_analysis_on_providers(
-                session_key, streamdetails, pcm_format, providers, live.source_session.source
+                session_key,
+                streamdetails,
+                pcm_format,
+                providers,
+                live.source_session.source,
+                cancel_failed_starts=False,
             )
             provider_ids.intersection_update(accepted)
             while provider_ids and session_key in self._active_sessions:

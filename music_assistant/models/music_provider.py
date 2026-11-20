@@ -2103,12 +2103,26 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 return
             genre_names = fallback_genres
 
-        await self.mass.music.genres.sync_media_item_genres(
+        if not await self.mass.music.genres.sync_media_item_genres(
             media_type,
             library_item_id,
             set(genre_names),
             source=(self.instance_id, provider_item_id),
-        )
+        ):
+            return
+        # the genre scan keeps only links whose name is stored on the item, and an item with
+        # stored genres no longer inherits genres from its tracks, so store every name
+        controller = self.mass.music.get_controller(media_type)
+        library_item = await controller.get_library_item(library_item_id)
+        stored = set(library_item.metadata.genres or set())
+        # the genre scan compares names case-insensitively, so skip names stored in another case
+        stored_keys = {name.strip().lower() for name in stored}
+        stored |= {
+            name.strip()
+            for name in genre_names
+            if name.strip() and name.strip().lower() not in stored_keys
+        }
+        await controller.replace_metadata(library_item_id, {"genres": stored})
 
     async def _sync_library_artists(self, items: AsyncIterator[Artist] | None = None) -> set[int]:
         """
@@ -2604,7 +2618,7 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
         if moved_tracks:
             try:
                 await self._merge_reissued_albums(moved_tracks, track_albums)
-            except Exception as err:  # noqa: BLE001 - best effort, the sync itself succeeded
+            except Exception as err:
                 self.logger.warning(
                     "Could not merge reissued albums: %s",
                     describe_sync_error(err),

@@ -911,9 +911,8 @@ class TestSyncMediaItemGenres:
         track = await _add_test_track(mass, "Sync Track New Tag")
         track_id = int(track.item_id)
         await _set_track_genres(mass, track_id, ["SyncOldTag"])
-        await genre_ctrl.sync_media_item_genres(
-            MediaType.TRACK, track.item_id, {"SyncOldTag", "SyncNewTag"}
-        )
+        # the provider sync stores the names since upstream 2.11.0.dev2026112003
+        await _provider_sync_genres(mass, track, {"SyncOldTag", "SyncNewTag"})
         await genre_ctrl._cleanup_stale_genre_mappings()
 
         rows = await mass.music.database.get_rows_from_query(
@@ -3772,7 +3771,8 @@ async def _provider_sync_genres(
     mass: MusicAssistant, item: Track | Album | Artist, genres: set[str]
 ) -> None:
     """Run a provider library sync's genre step for an item that carries the given genres."""
-    provider = MagicMock(mass=mass)
+    # fork (MUSIC-192): the names are kept per provider instance, which needs a real id
+    provider = MagicMock(mass=mass, instance_id="fs_local_sync_test")
     provider.get_item_genre_names = AsyncMock(side_effect=NotImplementedError)
     await MusicProvider._sync_item_genres(
         provider, item.media_type, "prov-item", int(item.item_id), genres

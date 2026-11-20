@@ -1332,15 +1332,14 @@ class GenreController(MediaControllerBase[Genre]):
                     allow_replace=True,
                 )
             # library syncs don't refresh stored metadata for unchanged items, while the
-            # post-sync genre scan maps from it: mirror the changes there, or the scan deletes
-            # each added mapping and re-adds each removed one, every sync (HW-92)
-            if to_add or removed_aliases or multi_source:
+            # post-sync genre scan maps from it: mirror the changes there, or the scan re-adds
+            # each removed mapping every sync (HW-92). Added names are stored by the provider
+            # sync itself since upstream 2.11.0.dev2026112003 (with the item update event).
+            if removed_aliases or multi_source:
                 await self._update_metadata_genres(
                     media_type,
                     media_id_int,
-                    add=set(target_mappings.values())
-                    if multi_source
-                    else {target_mappings[gid] for gid in to_add},
+                    add=set(target_mappings.values()) if multi_source else set(),
                     remove=removed_aliases - set(target_mappings.values()),
                 )
         return {target_mappings[genre_id] for genre_id in to_add}
