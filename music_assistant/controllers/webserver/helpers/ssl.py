@@ -166,7 +166,7 @@ async def verify_ssl_certificate(certificate: str, private_key: str) -> SSLCerti
             is_expiring_soon=False,
             error_message=f"Certificate file not found: {e}",
         )
-    except Exception as e:
+    except (OSError, ValueError) as e:
         return SSLCertificateInfo(
             is_valid=False,
             key_type="Unknown",
@@ -189,7 +189,7 @@ async def verify_ssl_certificate(certificate: str, private_key: str) -> SSLCerti
             is_expiring_soon=False,
             error_message=f"Private key file not found: {e}",
         )
-    except Exception as e:
+    except (OSError, ValueError) as e:
         return SSLCertificateInfo(
             is_valid=False,
             key_type="Unknown",
@@ -213,7 +213,7 @@ async def verify_ssl_certificate(certificate: str, private_key: str) -> SSLCerti
             is_expiring_soon=False,
             error_message=_format_ssl_error(e),
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - any verification failure is reported to the user
         return SSLCertificateInfo(
             is_valid=False,
             key_type="Unknown",

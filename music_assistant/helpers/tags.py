@@ -1055,7 +1055,7 @@ class AudioTags:
 
         if tag := self.tags.get("replaygaintrackgain"):
             try:
-                gain_adjustment = float(tag.split(" ")[0])
+                gain_adjustment = _parse_replaygain_gain(tag)
                 return -18 - gain_adjustment
             except (ValueError, IndexError) as e:
                 LOGGER.warning("Invalid replaygaintrackgain tag value: %r — %s", tag, e)
@@ -1074,7 +1074,7 @@ class AudioTags:
 
         if tag := self.tags.get("replaygainalbumgain"):
             try:
-                gain_adjustment = float(tag.split(" ")[0])
+                gain_adjustment = _parse_replaygain_gain(tag)
                 return -18 - gain_adjustment
             except (ValueError, IndexError) as e:
                 LOGGER.warning("Invalid replaygainalbumgain tag value: %r — %s", tag, e)
@@ -2081,7 +2081,7 @@ def parse_tags_mutagen(input_file: str, fd: int | None = None) -> dict[str, Any]
             result = _parse_id3_tags(audio.tags)
 
         return result
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.debug("Error parsing mutagen tags for %s: %s", input_file, err)
         return result
 
@@ -2239,7 +2239,7 @@ def _write_replaygain_track_gain_sync(path: str, track_gain_db: float) -> bool:
 
     try:
         audio = mutagen.File(path)
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.debug("mutagen could not open %s: %s", path, err)
         return False
     if audio is None:
@@ -2248,7 +2248,7 @@ def _write_replaygain_track_gain_sync(path: str, track_gain_db: float) -> bool:
     if audio.tags is None:
         try:
             audio.add_tags()
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
             LOGGER.debug("could not initialise tags on %s: %s", path, err)
             return False
 
@@ -2281,7 +2281,7 @@ def _write_replaygain_track_gain_sync(path: str, track_gain_db: float) -> bool:
     except (OSError, PermissionError) as err:
         LOGGER.debug("could not write replaygain tag to %s: %s", path, err)
         return False
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure writing replaygain tag to %s: %s", path, err)
         return False
 
@@ -2326,7 +2326,7 @@ def _open_mutagen_for_write(path: str) -> Any | None:
         audio = mutagen.File(path)
     # Broad: mutagen.File can raise format-specific parse errors, struct errors,
     # and IOError variants whose hierarchy is not stable across mutagen versions.
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.debug("mutagen could not open %s: %s", path, err)
         return None
     if audio is None:
@@ -2335,7 +2335,7 @@ def _open_mutagen_for_write(path: str) -> Any | None:
         try:
             audio.add_tags()
         # Broad: add_tags() can raise per-format exceptions that don't share a base class.
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
             LOGGER.debug("could not initialise tags on %s: %s", path, err)
             return None
     return audio
@@ -2375,7 +2375,7 @@ def _write_identifier_tags_sync(
         return False
     # Broad boundary: mutagen's save() can raise per-format exceptions; logged as
     # warning so unexpected surprises are visible but never crash the scan.
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure saving identifier tags to %s: %s", path, err)
         return False
 
@@ -2409,7 +2409,7 @@ def _apply_mbid_tag(tags: Any, mbid: str) -> bool:
             return False
         return True
     # Broad: mutagen's tag APIs are untyped and per-format exceptions don't share a base.
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure applying MusicBrainz Recording Id: %s", err)
         return False
 
@@ -2440,7 +2440,7 @@ def _apply_acoustid_tag(tags: Any, acoustid: str) -> bool:
         else:
             return False
         return True
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure applying Acoustid Id: %s", err)
         return False
 
@@ -2468,7 +2468,7 @@ def _apply_isrc_tag(tags: Any, isrcs: list[str]) -> bool:
         else:
             return False
         return True
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure applying ISRC: %s", err)
         return False
 
@@ -2499,9 +2499,25 @@ def _apply_artist_mbid_tag(tags: Any, artist_mbids: list[str]) -> bool:
         else:
             return False
         return True
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - mutagen raises undocumented errors
         LOGGER.warning("unexpected failure applying MusicBrainz Artist Id: %s", err)
         return False
+
+
+def _parse_replaygain_gain(value: str) -> float:
+    """
+    Return the gain in dB of a ReplayGain gain tag.
+
+    Accepts the standard form ("-5.30 dB") as well as the variants taggers write
+    without a space before the unit ("-5.30dB") or without the unit at all ("-5.30").
+
+    :param value: The raw tag value.
+    :raises ValueError: When the value holds no number.
+    """
+    value = value.strip()
+    if value[-2:].lower() == "db":
+        value = value[:-2]
+    return float(value)
 
 
 def _parse_release_date(value: str) -> datetime | None:

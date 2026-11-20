@@ -50,10 +50,12 @@ from music_assistant.controllers.config.constants import BASE_KEYS, _ConfigValue
 from music_assistant.controllers.config.helpers import (
     _mask_encrypted,
     _provider_status,
+    _raw_config_to_store,
     _reject_encrypted_values,
     _unavailable_provider_config,
     _with_translation_owner,
 )
+from music_assistant.helpers.action_result import without_insecure_open_url
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.provider_access import (
     source_access,
@@ -289,7 +291,7 @@ class ProviderConfigMixin:
             return []
         if isinstance(result, ConfigActionResult):
             result.translation_owner = result.translation_owner or f"provider.{provider.domain}"
-            return result
+            return without_insecure_open_url(provider, result)
         return self._wrap_provider_config_entries(provider, result)
 
     def seed_stored_config_values(self, config: ProviderConfig) -> None:
@@ -443,17 +445,19 @@ class ProviderConfigMixin:
         "config/providers/share_candidates",
         required_scope=(Scope.CONFIG_PROVIDERS_OWN, Scope.LIBRARY_WRITE),
     )
-    async def get_share_candidates(self) -> list[UserSummary]:
+    async def get_share_candidates(self, include_guests: bool = False) -> list[UserSummary]:
         """
         Return the users a music source or playlist can be shared with.
 
         Every enabled member and the Home Assistant system user are listed, without their role
-        or settings. Guests are left out.
+        or settings. Guests are left out unless requested.
+
+        :param include_guests: Include guest accounts as sharing recipients.
         """
         return [
             UserSummary.from_user(user)
             for user in await self.mass.webserver.auth.list_users()
-            if user.enabled and user.role != UserRole.GUEST
+            if user.enabled and (include_guests or user.role != UserRole.GUEST)
         ]
 
     def release_user_sources(self, user_id: str) -> None:
@@ -694,6 +698,41 @@ class ProviderConfigMixin:
         ):
             entry.value = value
 
+    def can_add_provider(self, manifest: ProviderManifest) -> bool:
+        """
+        Return whether the calling user may add an instance of the given provider.
+
+        :param manifest: The manifest of the provider.
+        """
+        user, manages_all_sources = self._access_caller()
+        if user is None or manages_all_sources:
+            return True
+        # a member may only add what becomes a music source of its own: a music
+        # service that allows more than one account and lets members set it up
+        return (
+            manifest.type == ProviderType.MUSIC
+            and not manifest.builtin
+            and manifest.multi_instance
+            and manifest.self_service
+        )
+
+    def own_provider_domains(self) -> builtins.set[str]:
+        """
+        Return the domains of the providers the calling user has set up.
+
+        A user who manages every music source has all that is set up; anyone else has the
+        music sources they own.
+        """
+        user, manages_all_sources = self._access_caller()
+        raw_confs: dict[str, dict[str, Any]] = self.get(CONF_PROVIDERS, {})
+        if user is None or manages_all_sources:
+            return {raw_conf["domain"] for raw_conf in raw_confs.values()}
+        return {
+            raw_conf["domain"]
+            for instance_id, raw_conf in raw_confs.items()
+            if source_owner(self.mass, instance_id) == user.user_id
+        }
+
     @api_command("config/providers/reload", required_scope=Scope.CONFIG_PROVIDERS_OWN)
     async def _reload_provider(self, instance_id: str) -> None:
         """
@@ -717,11 +756,16 @@ class ProviderConfigMixin:
     ) -> ProviderConfig:
         """Update ProviderConfig."""
         config = await self.get_provider_config(instance_id)
+        conf_key = f"{CONF_PROVIDERS}/{config.instance_id}"
+        stored_values = (self.get(conf_key) or {}).get("values", {})
         changed_keys = config.update(values)
+        raw_conf = _raw_config_to_store(config, stored_values, values)
         prov_instance = self.mass.get_provider(instance_id)
         available = prov_instance.available if prov_instance else False
         if not changed_keys and (config.enabled == available):
-            # no changes
+            if raw_conf["values"] != stored_values:
+                # only the storage changed, not the config: nothing to apply
+                self.set(conf_key, raw_conf)
             return config
         if not config.enabled:
             prov_manifest = self.mass.get_provider_manifest(config.domain)
@@ -735,18 +779,6 @@ class ProviderConfigMixin:
         config.validate()
         # save the config first to prevent issues when the
         # provider wants to manipulate the config during load
-        conf_key = f"{CONF_PROVIDERS}/{config.instance_id}"
-        raw_conf = config.to_raw()
-        # Preserve stored values that don't have config entries in the current context
-        # (e.g. values written by a provider at runtime while its declared entries
-        # changed) - to_raw() only rebuilds the values from the declared entries.
-        existing_values = (self.get(conf_key) or {}).get("values", {})
-        new_values = raw_conf.get("values", {})
-        config_entry_keys = set(config.values.keys())
-        for key, value in existing_values.items():
-            if key not in new_values and key not in config_entry_keys:
-                new_values[key] = value
-        raw_conf["values"] = new_values
         self.set(conf_key, raw_conf)
         try:
             if config.enabled and prov_instance and available:
@@ -929,17 +961,7 @@ class ProviderConfigMixin:
 
     def _check_provider_setup_permission(self, manifest: ProviderManifest) -> None:
         """Raise when the calling user may not add an instance of the given provider."""
-        user, manages_all_sources = self._access_caller()
-        if user is None or manages_all_sources:
-            return
-        # a member may only add what becomes a music source of its own: a music
-        # service that allows more than one account and lets members set it up
-        if (
-            manifest.type != ProviderType.MUSIC
-            or manifest.builtin
-            or not manifest.multi_instance
-            or not manifest.self_service
-        ):
+        if not self.can_add_provider(manifest):
             raise InsufficientPermissions(
                 f"The {Scope.CONFIG_PROVIDERS_WRITE.value} scope is required to add {manifest.name}"
             )

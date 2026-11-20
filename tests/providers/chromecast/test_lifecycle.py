@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import UUID, uuid4
 
 import pytest
-from music_assistant_models.enums import IdentifierType, PlayerType, ProtocolRole
+from music_assistant_models.enums import ChannelLayout, IdentifierType, PlayerType, ProtocolRole
 from pychromecast.const import CAST_TYPE_AUDIO, CAST_TYPE_GROUP
 from pychromecast.controllers.multizone import MultizoneManager
 from pychromecast.socket_client import CONNECTION_STATUS_CONNECTED
@@ -86,33 +86,43 @@ def _connect_client(*_args: object) -> MagicMock:
 
 
 @pytest.mark.parametrize(
-    ("cast_info", "role", "player_type"),
+    ("cast_info", "role", "player_type", "channel_layout"),
     [
-        (_cast_info(), ProtocolRole.NATIVE, PlayerType.PLAYER),
-        (_cast_info(manufacturer="Sonos"), ProtocolRole.AUDIO, PlayerType.PLAYER),
-        (_cast_info(cast_type=CAST_TYPE_GROUP), ProtocolRole.NATIVE, PlayerType.GROUP),
+        (_cast_info(), ProtocolRole.NATIVE, PlayerType.PLAYER, None),
+        (_cast_info(manufacturer="Sonos"), ProtocolRole.AUDIO, PlayerType.PLAYER, None),
+        (_cast_info(cast_type=CAST_TYPE_GROUP), ProtocolRole.NATIVE, PlayerType.GROUP, None),
         (
             _cast_info(cast_type=CAST_TYPE_GROUP, multichannel=True),
             ProtocolRole.NATIVE,
-            PlayerType.STEREO_PAIR,
+            PlayerType.MULTI_CHANNEL,
+            ChannelLayout.STEREO,
         ),
         # a group of speakers of another brand is still a Cast group
         (
             _cast_info(manufacturer="Sonos", cast_type=CAST_TYPE_GROUP),
             ProtocolRole.NATIVE,
             PlayerType.GROUP,
+            None,
         ),
     ],
     ids=["google-speaker", "other-brand", "cast-group", "stereo-pair", "other-brand-group"],
 )
 def test_a_cast_device_reports_its_role(
-    cast_info: ChromecastInfo, role: ProtocolRole, player_type: PlayerType
+    cast_info: ChromecastInfo,
+    role: ProtocolRole,
+    player_type: PlayerType,
+    channel_layout: ChannelLayout | None,
 ) -> None:
-    """Cast is native for a Google device and a Cast group, an audio output of any other."""
+    """
+    Cast is native for a Google device and a Cast group, an audio output of any other.
+
+    A stereo pair is a multi-channel player with a stereo layout.
+    """
     protocol = _cast_player(MagicMock(), cast_info)
 
     assert protocol.role == role
     assert protocol.type == player_type
+    assert protocol.channel_layout == channel_layout
 
 
 def _discovering_provider(attached: set[UUID], known: list[UUID]) -> Any:
@@ -536,3 +546,49 @@ async def test_a_detached_device_ends_the_wait_for_an_app_s_next_track(
 
     unattached_update.assert_not_called()
     assert protocol._app_track_change_ends is None
+
+
+def _output_ids(scenario: Scenario, player_id: str) -> set[str]:
+    """Return the ids of the outputs a player lists."""
+    state = scenario.player(player_id)
+    assert state is not None
+    return {output.output_protocol_id for output in state.output_protocols}
+
+
+async def test_the_removal_of_a_switched_off_bridge_output_changes_the_outputs(
+    scenario: Scenario,
+) -> None:
+    """
+    Removing the switched-off Sendspin output of a Cast bridge reports changed outputs.
+
+    That report is what lets the squeezelite bridge of the device evaluate its bridge again
+    once the Cast bridge made way for it.
+    """
+    identifiers = {IdentifierType.MAC_ADDRESS: MAC_ADDRESS}
+    squeezelite = await scenario.add_provider("squeezelite")
+    chromecast = await scenario.add_provider("chromecast")
+    sendspin = await scenario.add_provider("sendspin")
+    native = squeezelite.protocol(MAC_ADDRESS, "Kitchen", identifiers=identifiers)
+    carrier = chromecast.protocol("cast_kitchen", "Kitchen", role="audio", identifiers=identifiers)
+    bridge = sendspin.protocol(
+        "spb_001122334466", "Kitchen", role="audio", underlying_protocol_id="cast_kitchen"
+    )
+    for protocol in (native, carrier, bridge):
+        await scenario.register(protocol)
+    player_id = scenario.single_player(native, carrier, bridge).player_id
+    await scenario.mass.config.save_protocol_config(bridge.protocol_id, {"enabled": False})
+    await scenario.settle()
+    assert bridge.player is None
+    assert bridge.protocol_id in _output_ids(scenario, player_id)
+    changes: list[set[str]] = []
+    scenario.mass.players.subscribe_player_state_update(
+        lambda player, changed: (
+            changes.append(set(changed)) if player.player_id == player_id else None
+        )
+    )
+
+    await scenario.mass.players.remove_protocol(bridge.protocol_id)
+
+    # reported by the removal itself, not left to a later update of the player
+    assert any("output_protocols" in changed for changed in changes)
+    assert bridge.protocol_id not in _output_ids(scenario, player_id)

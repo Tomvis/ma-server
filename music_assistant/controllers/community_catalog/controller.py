@@ -18,7 +18,6 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.constants import CONF_PROVIDERS
 from music_assistant.controllers.community_catalog.constants import (
@@ -49,10 +48,12 @@ from music_assistant.controllers.community_catalog.models import (
 from music_assistant.controllers.community_catalog.store import CatalogStore
 from music_assistant.controllers.community_catalog.versions import VersionChanger
 from music_assistant.helpers.api import api_command
+from music_assistant.helpers.provider_manifest import read_manifest_file
 from music_assistant.models.core_controller import CoreController
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import CoreConfig
+    from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
 
@@ -68,10 +69,8 @@ _UPDATE_RETRY_INTERVAL: Final = 3600
 # why a command of the community catalog fails, as the admin reads it; the texts of the
 # translation keys community_catalog_<key> in the errors of strings.json
 _ERRORS: Final[dict[str, str]] = {
-    "remove_first": (
-        "Remove what you installed from the community catalog before you switch it off."
-    ),
-    "switched_off": "Switch the community catalog on to install from it.",
+    "remove_first": "Remove what you installed from the community catalog before you disable it.",
+    "switched_off": "Enable the community catalog to install from it.",
     "not_installed": "{0} is not installed from the community catalog.",
     "no_update": "There is no update of {0} to install.",
     "not_offered": "The community catalog does not offer {0} for this version of Music Assistant.",
@@ -163,8 +162,8 @@ class CommunityCatalogController(CoreController):
         """
         Handle logic when the config is updated.
 
-        :raises ActionUnavailable: The community catalog is switched off while something the
-            admin installed from it is still installed.
+        :raises ActionUnavailable: The community catalog is disabled while something the admin
+            installed from it is still installed.
         """
         if (
             f"values/{CONF_ENABLED}" in changed_keys
@@ -226,6 +225,8 @@ class CommunityCatalogController(CoreController):
         elif decision is None and domain in self._waiting_moves():
             error = self._move_errors.get(domain)
             decision = Decision(Verdict.MOVE_FAILED, error) if error else Decision(Verdict.MOVED)
+        elif decision is None and self._offered(domain):
+            decision = Decision(Verdict.NOT_INSTALLED)
         if decision is None or decision.verdict == Verdict.LOAD:
             return None
         detail = decision.detail or ""
@@ -238,7 +239,7 @@ class CommunityCatalogController(CoreController):
 
     @api_command("community_catalog/providers", required_scope=Scope.SYSTEM_MANAGE)
     async def get_providers(self) -> list[CommunityProvider]:
-        """Return the installed community providers and, while switched on, what the catalog offers."""
+        """Return the installed community providers and, while enabled, what the catalog offers."""
         self._raise_in_safe_mode()
         installed = self._store.state.installed
         providers = [
@@ -462,7 +463,7 @@ class CommunityCatalogController(CoreController):
             self._decisions[domain] = decision
             self._folder_hashes[domain] = folder_hash
             if decision.verdict == Verdict.LOAD:
-                providers[str(folder)] = await ProviderManifest.parse(str(folder / "manifest.json"))
+                providers[str(folder)] = (await read_manifest_file(folder / "manifest.json"))[0]
             elif decision.verdict != Verdict.SWITCH:
                 self.logger.warning(
                     "Not loading community provider %s: %s",
@@ -481,7 +482,7 @@ class CommunityCatalogController(CoreController):
         :param installed: What was installed.
         :param folder_hash: The content hash of the live folder before.
         """
-        # evaluate only asks for this with an entry in the index of this server's line
+        # evaluate only asks for this with an entry in the index of this server's channel
         assert self._store.index is not None
         entry = self._store.index.providers[domain]
         self.logger.info("Installing community provider %s again: its files changed", domain)
@@ -654,6 +655,16 @@ class CommunityCatalogController(CoreController):
         return any(
             player.playback_state == PlaybackState.PLAYING
             for player in self.mass.players.iter_players()
+        )
+
+    def _offered(self, domain: str) -> bool:
+        """Return whether the community catalog is enabled and offers a provider to this server."""
+        entry = self._gate.own_entry(domain)
+        return (
+            entry is not None
+            and not self.mass.safe_mode
+            and bool(self.config.get_value(CONF_ENABLED))
+            and available_provider(domain, entry, self.logger) is not None
         )
 
     def _installable(self, domain: str) -> IndexProvider:

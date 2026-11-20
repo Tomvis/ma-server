@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from music_assistant.controllers.community_catalog.index import server_line
+from music_assistant.controllers.community_catalog.index import catalog_channel
 from music_assistant.controllers.community_catalog.models import IndexStatus
 
 if TYPE_CHECKING:
@@ -40,6 +40,8 @@ class Verdict(StrEnum):
     # not installed: a moved provider that waits to be installed from the catalog
     MOVED = "moved"
     MOVE_FAILED = "move_failed"
+    # not installed: the catalog offers it to this server
+    NOT_INSTALLED = "not_installed"
     # not decided: the start of the community catalog is not done, or does not run at all
     STARTING = "starting"
     SAFE_MODE = "safe_mode"
@@ -66,8 +68,9 @@ _REASONS: Final[dict[Verdict, str]] = {
         "The community catalog could not be reached to check this, so it does not run. "
         "Restart Music Assistant when your server is online again."
     ),
-    Verdict.BLOCKED: "The community catalog blocked this ({0}), so it no longer runs. "
-    "You can remove it.",
+    Verdict.BLOCKED: (
+        "The community catalog blocked this, so it no longer runs. You can remove it. Reason: {0}"
+    ),
     Verdict.NOT_LISTED: (
         "This is no longer in the community catalog, so it no longer runs. You can remove it."
     ),
@@ -80,19 +83,19 @@ _REASONS: Final[dict[Verdict, str]] = {
         "something else from the community catalog, so it does not run."
     ),
     Verdict.REINSTALL_FAILED: (
-        "The files of this were changed on your server and could not be downloaded again "
-        "({0}), so it does not run. Restart Music Assistant to try again."
+        "Its files were changed on your server and could not be downloaded again ({0}), "
+        "so it does not run. Restart Music Assistant to try again."
     ),
     Verdict.WENT_BACK: (
-        "Version {0} of this failed to load, and the version before it is no longer "
-        "available, so it does not run."
+        "Version {0} failed to load, and the version before it is no longer available, "
+        "so it does not run."
     ),
     Verdict.RESTART_TO_GO_BACK: (
-        "Version {0} of this failed to load. Restart Music Assistant to finish going back "
-        "to the version before it."
+        "Version {0} failed to load. Restart Music Assistant to finish going back to the "
+        "version before it."
     ),
     Verdict.RESTART_TO_UPDATE: (
-        "Version {0} of this is ready. Restart Music Assistant to finish the update."
+        "Version {0} is ready. Restart Music Assistant to finish the update."
     ),
     Verdict.MOVED: (
         "This moved to the community catalog. Music Assistant installs it from there by itself "
@@ -101,6 +104,10 @@ _REASONS: Final[dict[Verdict, str]] = {
     Verdict.MOVE_FAILED: (
         "This moved to the community catalog, but Music Assistant could not install it from "
         "there ({0}). It tries again at every start and whenever it checks the catalog."
+    ),
+    Verdict.NOT_INSTALLED: (
+        "This is no longer installed. An administrator can install it again from the "
+        "Marketplace, or you can remove it here."
     ),
     Verdict.STARTING: (
         "Music Assistant is still starting what comes from the community catalog. "
@@ -118,7 +125,7 @@ def evaluate(
     entry: IndexProvider | None,
     *,
     has_index: bool,
-    own_line: bool,
+    own_channel: bool,
 ) -> Decision:
     """
     Return whether an installed community provider may load, or switches to another version.
@@ -129,11 +136,11 @@ def evaluate(
     :param folder_hash: The content hash of the live folder, None when there is none.
     :param entry: The provider in the kept copy of the index, None when it is not in it.
     :param has_index: Whether the server has a kept copy of the index at all.
-    :param own_line: Whether the kept copy is the index of this server's line.
+    :param own_channel: Whether the kept copy is the index of this server's channel.
     """
     if not has_index:
         return Decision(Verdict.CATALOG_UNREACHABLE)
-    offered = entry.offered_version if entry is not None and own_line else None
+    offered = entry.offered_version if entry is not None and own_channel else None
     if offered == installed.failed_version:
         # a version the server went back from is not tried again
         offered = None
@@ -147,8 +154,8 @@ def evaluate(
         )
         # a blocked version switches to the version the catalog offers instead
         return Decision(Verdict.BLOCKED, reason, entry.reason_url, offered)
-    if not own_line:
-        # the versions of another line cannot be installed again here
+    if not own_channel:
+        # the versions of another channel cannot be installed again here
         if folder_hash == installed.content_hash:
             return Decision(Verdict.LOAD)
         return Decision(Verdict.CATALOG_UNREACHABLE)
@@ -195,19 +202,19 @@ class Gate:
             folder_hash,
             index.providers.get(domain) if index is not None else None,
             has_index=index is not None,
-            own_line=self.own_index() is not None,
+            own_channel=self.own_index() is not None,
         )
 
     def own_index(self) -> CatalogIndex | None:
-        """Return the kept copy of the index when it is the one of this server's line."""
+        """Return the kept copy of the index when it is the one of this server's channel."""
         index = self._store.index
-        if index is None or index.server_line != server_line(self.mass.version):
+        if index is None or index.channel != catalog_channel(self.mass.version):
             return None
         return index
 
     def own_entry(self, domain: str) -> IndexProvider | None:
         """
-        Return a provider in the index of this server's line, None when it is not in it.
+        Return a provider in the index of this server's channel, None when it is not in it.
 
         :param domain: The domain of the provider.
         """
