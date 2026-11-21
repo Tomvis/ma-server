@@ -447,7 +447,6 @@ CONF_ENTRY_MAX_CONCURRENT_TASKS = ConfigEntry(
     type=ConfigEntryType.INTEGER,
     range=(1, 10),
     default_value=2,
-    advanced=True,
     requires_reload=False,
 )
 
@@ -686,6 +685,7 @@ CONF_ENTRY_ANNOUNCE_VOLUME_STRATEGY = ConfigEntry(
     ],
     default_value="percentual",
     category="announcements",
+    advanced=True,
 )
 
 CONF_ENTRY_ANNOUNCE_VOLUME = ConfigEntry(
@@ -693,6 +693,7 @@ CONF_ENTRY_ANNOUNCE_VOLUME = ConfigEntry(
     type=ConfigEntryType.INTEGER,
     default_value=85,
     category="announcements",
+    advanced=True,
 )
 
 CONF_ENTRY_ANNOUNCE_VOLUME_MIN = ConfigEntry(
@@ -700,6 +701,7 @@ CONF_ENTRY_ANNOUNCE_VOLUME_MIN = ConfigEntry(
     type=ConfigEntryType.INTEGER,
     default_value=15,
     category="announcements",
+    advanced=True,
 )
 
 CONF_ENTRY_ANNOUNCE_VOLUME_MAX = ConfigEntry(
@@ -707,6 +709,7 @@ CONF_ENTRY_ANNOUNCE_VOLUME_MAX = ConfigEntry(
     type=ConfigEntryType.INTEGER,
     default_value=75,
     category="announcements",
+    advanced=True,
 )
 
 
