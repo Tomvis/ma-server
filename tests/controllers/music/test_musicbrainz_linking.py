@@ -300,7 +300,7 @@ async def test_linker_merges_the_album_holding_a_link_of_its_release(
         harness.merge.return_value = _library_album("1", tidal)
         added = await harness.ctrl.link_musicbrainz_mappings(album, [TIDAL_ALBUM_URL])
 
-    harness.merge.assert_awaited_once_with(1, 99)
+    harness.merge.assert_awaited_once_with(1, 99, merge_state=True)  # fork: merge_state kwarg
     assert [m.provider_domain for m in added] == ["tidal"]
     assert tidal in album.provider_mappings
 
