@@ -512,7 +512,7 @@ async def migrate_database(  # noqa: C901, PLR0912, PLR0915
                     f"'{media_type.value}', TRIM(g.value) "
                     f"FROM {table}, "
                     f"json_each(json_extract({table}.metadata, '$.genres')) AS g "
-                    f"JOIN genre_lookup gl ON gl.raw_name = LOWER(TRIM(g.value)) "
+                    f"CROSS JOIN genre_lookup gl ON gl.raw_name = LOWER(TRIM(g.value)) "
                     f"WHERE json_extract({table}.metadata, '$.genres') IS NOT NULL "
                     f"AND json_extract({table}.metadata, '$.genres') != '[]'"
                 )

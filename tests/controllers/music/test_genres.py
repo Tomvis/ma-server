@@ -2086,6 +2086,33 @@ class TestGenreLookupAndScanner:
 
         assert valid_name in await _linked_genre_names(mass, MediaType.TRACK, track.item_id)
 
+    @pytest.mark.parametrize(
+        "scan_method", ["_bulk_scan_media_genres", "_bulk_scan_unmapped_genres"]
+    )
+    async def test_scanner_looks_up_genre_names_through_an_index(
+        self, mass: MusicAssistant, genre_ctrl: GenreController, scan_method: str
+    ) -> None:
+        """The mapping insert searches the genre lookup by index, not by a scan per genre."""
+        track = await _add_test_track(mass, f"PlanTrack{scan_method}")
+        await _set_track_genres(mass, int(track.item_id), [f"PlanGenre{scan_method}"])
+        db = mass.music.database
+        lookup_queries: list[tuple[str, dict[str, Any] | None]] = []
+        original_execute = db.execute
+
+        async def _recording_execute(query: str, values: dict[str, Any] | None = None) -> Any:
+            if "genre_lookup" in query:
+                lookup_queries.append((query, values))
+            return await original_execute(query, values)
+
+        with patch.object(db, "execute", _recording_execute):
+            await getattr(genre_ctrl, scan_method)()
+
+        assert lookup_queries
+        for query, values in lookup_queries:
+            plan = await db._db.execute_fetchall(f"EXPLAIN QUERY PLAN {query}", values)
+            details = [row[3] for row in plan]
+            assert any(d.startswith("SEARCH gl USING AUTOMATIC") for d in details), details
+
 
 # ===================================================================
 # Group J: Base Class Integration (3 tests)

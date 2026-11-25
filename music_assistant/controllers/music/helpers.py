@@ -128,13 +128,16 @@ def genre_lookup_cte(raw_name_to_genres: Mapping[str, Sequence[int]]) -> tuple[s
     Return a ``genre_lookup(raw_name, genre_id)`` CTE and the query params it binds.
 
     Raw names are lowercased so they can be joined on ``LOWER(TRIM(g.value))``.
+    Join it as ``CROSS JOIN genre_lookup`` after the ``json_each`` of the item genres:
+    SQLite cannot size ``json_each``, so it would otherwise scan the lookup for every genre
+    of every item instead of indexing it (a 1s scan took minutes on a 30k track library).
 
     :param raw_name_to_genres: The genre ids each raw genre name resolves to.
     """
     # one JSON param instead of a param per pair keeps huge libraries under SQLite's variable limit
     pairs = [[name, gid] for name, gids in raw_name_to_genres.items() for gid in gids]
     cte = (
-        "WITH genre_lookup(raw_name, genre_id) AS ("
+        "WITH genre_lookup(raw_name, genre_id) AS MATERIALIZED ("
         "SELECT LOWER(json_extract(value, '$[0]')), json_extract(value, '$[1]') "
         "FROM json_each(:genre_lookup))"
     )
