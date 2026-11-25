@@ -229,3 +229,47 @@ async def test_unchanged_library_does_not_update_tracks(
     ) as update:
         await _sync(provider)
     update.assert_not_called()
+
+
+async def _aiter(items: list[Track]) -> AsyncGenerator[Track]:
+    for item in items:
+        yield item
+
+
+async def test_live_album_sharing_tracks_is_not_folded(
+    mass: MusicAssistant, provider: _FakeFileProvider
+) -> None:
+    """
+    An album the provider still has keeps its row when a changes sync moves its tracks.
+
+    MUSIC-249: a changes sync lists only the changed tracks, so an EP whose tracks were also
+    linked to a new edition looked abandoned and was folded into it while still live.
+    """
+    ep = _album("alb-ep", "Pitch Black")
+    provider.library_albums = [ep]
+    provider.library_tracks = [_track("t1", 1, ep), _track("t2", 2, ep)]
+    await _sync(provider)
+    ep_id = await _album_db_id(mass, "alb-ep")
+
+    edition = _album("alb-se", "I", "Special Edition")
+    provider.library_albums = [ep, edition]
+
+    async def _get_album(prov_album_id: str) -> Album:
+        for album in provider.library_albums:
+            if album.item_id == prov_album_id:
+                return album
+        raise MediaNotFoundError(f"Album {prov_album_id} not found")
+
+    # the provider still serves the EP: that, not the changes listing, decides it is live
+    provider.get_album = _get_album  # type: ignore[method-assign]
+    await provider.sync_library(MediaType.ALBUM)
+    # the changes sync hands in only the changed tracks: the EP's own listing is not among them
+    await provider._sync_library_tracks(
+        _aiter([_track("t1", 5, edition), _track("t2", 6, edition)])
+    )
+
+    assert await mass.music.albums.get_library_item(ep_id)
+    ep_item = await mass.music.albums.get_library_item(ep_id)
+    assert {x.item_id for x in ep_item.provider_mappings} == {"alb-ep"}
+    edition_item = await mass.music.albums.get_library_item(await _album_db_id(mass, "alb-se"))
+    assert {x.item_id for x in edition_item.provider_mappings} == {"alb-se"}

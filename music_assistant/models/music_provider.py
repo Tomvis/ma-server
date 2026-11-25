@@ -2687,17 +2687,22 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                 # split over several albums: the tracks are linked, the old row is left be
                 continue
             target_id = target_ids.pop()
-            self.logger.info(
-                "Album %s was reissued as album %s, merging it into the new one",
-                album_id,
-                target_id,
-            )
             source = await self.mass.music.albums.get_library_item(album_id)
             dead_ids = {
                 x.item_id
                 for x in source.provider_mappings
                 if x.provider_instance == self.instance_id
             }
+            if await self._any_album_still_served(dead_ids):
+                # MUSIC-249: a changes sync lists only the changed tracks, so an album that
+                # merely shares tracks with the new one (an EP on a reissue's bonus disc)
+                # looks abandoned here. Only an album the provider no longer has is reissued.
+                continue
+            self.logger.info(
+                "Album %s was reissued as album %s, merging it into the new one",
+                album_id,
+                target_id,
+            )
             merged = await self.mass.music.albums.merge_library_items(
                 target_id, album_id, merge_state=False
             )
@@ -2708,6 +2713,31 @@ class MusicProvider(MediaCatalogMixin, RecommendationsMixin, AudioStreamMixin, P
                     await self.mass.music.albums.remove_provider_mapping(
                         target_id, mapping.provider_instance, mapping.item_id
                     )
+
+    async def _any_album_still_served(self, prov_album_ids: set[str]) -> bool:
+        """
+        Return whether this provider still serves any of the given album id's.
+
+        A provider that cannot look albums up reports none served, which keeps the merge
+        working for it. Any other lookup failure counts as served: folding a live album
+        into another is worse than leaving a stale row for the next sync.
+
+        :param prov_album_ids: Provider album id's of one library album on this instance.
+        """
+        for prov_album_id in prov_album_ids:
+            try:
+                await self.get_album(prov_album_id)
+            except MediaNotFoundError, NotImplementedError:
+                continue
+            except Exception as err:  # noqa: BLE001 - any failure leaves the album be
+                self.logger.debug(
+                    "Could not check album %s, not merging it: %s",
+                    prov_album_id,
+                    describe_sync_error(err),
+                )
+                return True
+            return True
+        return False
 
     async def _sync_library_podcasts(self) -> set[int]:
         """Sync Library Podcasts to Music Assistant library."""
