@@ -294,19 +294,6 @@ def _coerce_float_list(values: Iterable[Any] | None) -> list[float]:
     ]
 
 
-def _track_position(track: Track) -> str:
-    """
-    Return the disc/track identity of a track, counting an unset disc as disc 1.
-
-    A provider that serves single-disc releases has no disc to report: Bandcamp
-    numbers every track disc 0, while the same album tagged locally is disc 1. Keyed
-    on the raw number the two never line up, so the positional half of the album-track
-    de-duplication below silently stops working and each track reads as one the
-    library lacks.
-    """
-    return f"{track.disc_number or 1}.{track.track_number}"
-
-
 _FEAT_SUFFIX = re.compile(
     r"\s*[([]?\s*(?:feat\.?|ft\.?|featuring|with)\s+[^)\]]*[)\]]?\s*$", re.IGNORECASE
 )

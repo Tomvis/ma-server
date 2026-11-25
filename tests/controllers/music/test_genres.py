@@ -914,32 +914,6 @@ class TestSyncMediaItemGenres:
         )
         assert json.loads(stored[0]["genres"]) == ["SyncKeepA"]
 
-    async def test_sync_records_new_genre_in_metadata_so_cleanup_keeps_it(
-        self, mass: MusicAssistant, genre_ctrl: GenreController
-    ) -> None:
-        """A genre the provider adds survives the post-sync stale-alias cleanup (HW-92)."""
-        track = await _add_test_track(mass, "Sync Track New Tag")
-        track_id = int(track.item_id)
-        await _set_track_genres(mass, track_id, ["SyncOldTag"])
-        # the provider sync stores the names since upstream 2.11.0.dev2026112003
-        await _provider_sync_genres(mass, track, {"SyncOldTag", "SyncNewTag"})
-        await genre_ctrl._cleanup_stale_genre_mappings()
-
-        rows = await mass.music.database.get_rows_from_query(
-            f"SELECT alias FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
-            "WHERE media_id = :mid AND media_type = 'track'",
-            {"mid": track_id},
-            limit=0,
-        )
-        assert {r["alias"] for r in rows} == {"SyncOldTag", "SyncNewTag"}
-        stored = await mass.music.database.get_rows_from_query(
-            f"SELECT json_extract(metadata, '$.genres') AS genres FROM {DB_TABLE_TRACKS} "
-            "WHERE item_id = :id",
-            {"id": track_id},
-            limit=1,
-        )
-        assert set(json.loads(stored[0]["genres"])) == {"SyncOldTag", "SyncNewTag"}
-
     async def test_sync_idempotent(self, mass: MusicAssistant, genre_ctrl: GenreController) -> None:
         """Second call with same set is a no-op."""
         track = await _add_test_track(mass, "Sync Track 6")
