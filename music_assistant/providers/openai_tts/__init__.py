@@ -127,7 +127,7 @@ async def fetch_backend_voices(
             msg = f"Text-to-speech backend at {base_url} is not reachable: {err}"
             raise SetupFailedError(msg) from err
         return []
-    except Exception:
+    except Exception:  # noqa: BLE001 - user-set server, any failure means no voices
         return []
     items = data.get("voices", data.get("data")) if isinstance(data, dict) else data
     if not isinstance(items, list):
