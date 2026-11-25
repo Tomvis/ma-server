@@ -446,10 +446,6 @@ class OpenSonicProvider(MusicProvider):
         :raises MusicAssistantError: If the server rejects the cover art request.
         """
         self.logger.debug("Requesting cover art for '%s'", path)
-        # a URL (artist/album info image) is not a cover art id: hand it back to be fetched
-        if path.startswith(("http://", "https://")):
-            return path
-
         try:
             art = await self.conn.get_cover_art(path)
             return await art.content.read()
