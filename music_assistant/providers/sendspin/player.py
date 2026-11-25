@@ -375,6 +375,7 @@ if TYPE_CHECKING:
     from music_assistant_models.streamdetails import StreamDetails
 
     from music_assistant.controllers.player_queues.state import PlayerQueueData
+    from music_assistant.mass import MusicAssistant
     from music_assistant.models.setup_flow import SetupSession
     from music_assistant.providers.chromecast.sendspin_bridge import (
         SendspinBridgeManager,
@@ -383,6 +384,26 @@ if TYPE_CHECKING:
     from music_assistant.providers.hass import HomeAssistantProvider
 
     from .provider import PinPairingSession, SendspinProvider
+
+
+async def _full_album(mass: MusicAssistant, queue_item: QueueItem | None) -> Album | None:
+    """
+    Return the full album of a queue item's track, if known (fork: the metadata's year).
+
+    Module-level, beside upstream's ``_album_artist``, so tests that mock that method keep working.
+
+    :param mass: The Music Assistant instance to look the album up with.
+    :param queue_item: The queue item to look up.
+    """
+    if not queue_item or not queue_item.media_item or not is_track(queue_item.media_item):
+        return None
+    album_mapping = queue_item.media_item.album
+    if album_mapping is None or isinstance(album_mapping, Album):
+        return album_mapping
+    result = await mass.music.get_library_item_by_prov_id(
+        MediaType.ALBUM, album_mapping.item_id, album_mapping.provider
+    )
+    return result if isinstance(result, Album) else None
 
 
 def _queue_position(queue: PlayerQueue | None) -> tuple[int | None, int | None]:
@@ -396,11 +417,12 @@ def _queue_position(queue: PlayerQueue | None) -> tuple[int | None, int | None]:
     """
     if queue is None:
         return None, None
-    # getattr: upstream's tests hand in queue stand-ins without these attributes.
+    # getattr + int checks: upstream's tests hand in queue stand-ins (SimpleNamespace or
+    # MagicMock) without these attributes or with mock values.
     current_index = getattr(queue, "current_index", None)
     items = getattr(queue, "items", 0)
-    queue_track = current_index + 1 if current_index is not None else None
-    total_tracks = items if items > 0 else None
+    queue_track = current_index + 1 if isinstance(current_index, int) else None
+    total_tracks = items if isinstance(items, int) and items > 0 else None
     return queue_track, total_tracks
 
 
@@ -2265,7 +2287,8 @@ class SendspinPlayer(SendspinBasePlayer):
         if not self._metadata_publish_allowed(generation):
             return
 
-        full_album, album_artist = await self._album_and_artist(queue_item)
+        album_artist = await self._album_artist(queue_item)
+        full_album = await _full_album(self.mass, queue_item)
         if not self._metadata_publish_allowed(generation):
             return
 
@@ -3028,7 +3051,8 @@ class SendspinPlayer(SendspinBasePlayer):
         scheduled_item = (media.queue_item_id, start_us, start_ms)
         if self._scheduled_item == scheduled_item and self._scheduled_artwork == artwork:
             return
-        full_album, album_artist = await self._album_and_artist(queue_item)
+        album_artist = await self._album_artist(queue_item)
+        full_album = await _full_album(self.mass, queue_item)
         metadata = replace(
             self._build_current_media_metadata(
                 next_media,
@@ -3093,21 +3117,17 @@ class SendspinPlayer(SendspinBasePlayer):
             self.last_sent_artwork_url = artwork_url
             self._scheduled_artwork = None
 
-    async def _album_and_artist(
-        self, queue_item: QueueItem | None
-    ) -> tuple[Album | None, str | None]:
+    async def _album_artist(self, queue_item: QueueItem | None) -> str | None:
         """
-        Return the full album of a queue item's track and its album artist, if known.
-
-        Fork: the full album also feeds the metadata's year (ItemMapping.year is usually unset).
+        Return the album artist of a queue item's track, if known.
 
         :param queue_item: The queue item to look up.
         """
         if not queue_item or not queue_item.media_item or not is_track(queue_item.media_item):
-            return None, None
+            return None
         album_mapping = queue_item.media_item.album
         if album_mapping is None:
-            return None, None
+            return None
         full_album: Album | None
         if isinstance(album_mapping, Album):
             full_album = album_mapping
@@ -3116,7 +3136,9 @@ class SendspinPlayer(SendspinBasePlayer):
                 MediaType.ALBUM, album_mapping.item_id, album_mapping.provider
             )
             full_album = result if isinstance(result, Album) else None
-        return full_album, (full_album.artist_str if full_album and full_album.artists else None)
+        if full_album and full_album.artists:
+            return full_album.artist_str
+        return None
 
     async def _send_artist_artwork(
         self, current_item: QueueItem, *, generation: int | None = None
