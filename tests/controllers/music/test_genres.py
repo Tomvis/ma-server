@@ -2063,29 +2063,34 @@ class TestGenreLookupAndScanner:
     @pytest.mark.parametrize(
         "scan_method", ["_bulk_scan_media_genres", "_bulk_scan_unmapped_genres"]
     )
-    async def test_scanner_looks_up_genre_names_through_an_index(
-        self, mass: MusicAssistant, genre_ctrl: GenreController, scan_method: str
+    async def test_scanner_searches_genre_lookup_by_index(
+        self,
+        mass: MusicAssistant,
+        genre_ctrl: GenreController,
+        monkeypatch: pytest.MonkeyPatch,
+        scan_method: str,
     ) -> None:
-        """The mapping insert searches the genre lookup by index, not by a scan per genre."""
+        """The mapping statements search the genre lookup by index instead of scanning it."""
+        database = mass.music.database
         track = await _add_test_track(mass, f"PlanTrack{scan_method}")
         await _set_track_genres(mass, int(track.item_id), [f"PlanGenre{scan_method}"])
-        db = mass.music.database
-        lookup_queries: list[tuple[str, dict[str, Any] | None]] = []
-        original_execute = db.execute
+        plans: list[list[str]] = []
+        execute = database.execute
 
-        async def _recording_execute(query: str, values: dict[str, Any] | None = None) -> Any:
-            if "genre_lookup" in query:
-                lookup_queries.append((query, values))
-            return await original_execute(query, values)
+        async def _explain_and_execute(query: str, values: dict[str, Any] | None = None) -> Any:
+            if "gl.raw_name" in query:
+                rows = await database.get_rows_from_query(
+                    f"EXPLAIN QUERY PLAN {query}", values, limit=0
+                )
+                plans.append([row["detail"] for row in rows])
+            return await execute(query, values)
 
-        with patch.object(db, "execute", _recording_execute):
-            await getattr(genre_ctrl, scan_method)()
+        monkeypatch.setattr(database, "execute", _explain_and_execute)
+        await getattr(genre_ctrl, scan_method)()
 
-        assert lookup_queries
-        for query, values in lookup_queries:
-            plan = await db._db.execute_fetchall(f"EXPLAIN QUERY PLAN {query}", values)
-            details = [row[3] for row in plan]
-            assert any(d.startswith("SEARCH gl USING AUTOMATIC") for d in details), details
+        assert plans
+        for details in plans:
+            assert any(d.startswith("SEARCH gl ") and "(raw_name=?)" in d for d in details), details
 
 
 # ===================================================================
