@@ -29,7 +29,7 @@ from music_assistant_models.player import DeviceInfo, OutputProtocol, PlayerMedi
 from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
 
-from music_assistant.constants import EXTERNAL_PAUSE_IDLE_TIMEOUT
+from music_assistant.constants import EXTERNAL_PAUSE_IDLE_TIMEOUT, PlaybackQuality
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.mass import MusicAssistant
@@ -72,11 +72,15 @@ def _bind_player(mass: MusicAssistant | MagicMock) -> tuple[SonosPlayer, MagicMo
     player._marked_asleep = False
     player._woken_from_sleep = False
     player.cloud_queue_id = None
+    player.group_queue_id = None
+    player._stepping_out = False
+    player._taken_over_item_id = None
     player.cloud_queue_item_generation = 0
     player._window_item_ids = {}
     player._served_bindings = {}
     player._evicted_cloud_queue = None
     player._flow_queue_id = None
+    player._flow_media = None
     player._queue_session_id = None
     player._hand_over_tasks = set()
     player._airplay_rejoin_members = set()
@@ -967,6 +971,7 @@ async def test_a_jump_is_not_undone_by_the_report_on_the_replaced_load() -> None
     group = client.player.group
     group.play_cloud_queue = AsyncMock()
     group.active_session_id = "session"
+    mass.streams.resolve_stream_url = AsyncMock(return_value="http://ma/single/track2.wav")
     player._announcement_media = None
     player.cloud_queue_id = "queue1"
     queues = _real_queues("queue1", ["track0", "track1", "track2"])
@@ -1786,7 +1791,7 @@ async def test_pause_pauses_a_speaker_only_in_a_track_it_gets_as_a_file(
     # the speaker reports the item it cached for the position, and plays what it fetched there
     player._served_bindings = {"abc@0": (0, "xyz")}
     player._config = MagicMock()
-    player._config.get_value.return_value = "wav"
+    player._config.get_value.return_value = "lossless_uncompressed"
     queue_item = mass.player_queues.get_item.return_value
     mass.streams.serves_as_file.return_value = served_as_file
 
@@ -1802,11 +1807,141 @@ async def test_pause_pauses_a_speaker_only_in_a_track_it_gets_as_a_file(
         group.pause.assert_not_awaited()
 
 
+def _speaker_to_pause(
+    status_item_id: str | None, metadata_item_id: str | None, file_item_ids: set[str]
+) -> tuple[SonosPlayer, MagicMock]:
+    """
+    Return a speaker playing our cloud queue of load generation 7, and its group.
+
+    :param status_item_id: The item the group's playback status names.
+    :param metadata_item_id: The item the group's playback metadata names.
+    :param file_item_ids: The queue items served to the speaker as a file.
+    """
+    player, mass, client = _connected_player()
+    client.player.is_passive = False
+    group = client.player.group
+    group.stop = AsyncMock()
+    group.pause = AsyncMock()
+    group.playback_actions.can_pause = True
+    group.playback_item_id = status_item_id
+    group.playback_metadata = (
+        {"currentItem": {"id": metadata_item_id, "track": {"name": "Shout"}}}
+        if metadata_item_id
+        else {}
+    )
+    player._player = MagicMock(spec=Player)
+    player._player.active_source = "pl0123456789ab"
+    player._player.stop_called = False
+    player.cloud_queue_id = "pl0123456789ab"
+    player.cloud_queue_item_generation = 7
+    player._config = MagicMock()
+    player._config.get_value.return_value = "lossless_uncompressed"
+    mass.player_queues.get_item.side_effect = lambda _queue_id, item_id: MagicMock(
+        queue_item_id=item_id
+    )
+    mass.streams.serves_as_file.side_effect = lambda _player, queue_item, _codec: (
+        queue_item.queue_item_id in file_item_ids
+    )
+    return player, group
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_item_id", "metadata_item_id", "file_item_ids", "pauses"),
+    [
+        pytest.param("abc@7", None, {"abc"}, True, id="right after a load"),
+        pytest.param("def@7", "abc@7", {"def"}, True, id="right after a change of track"),
+        pytest.param(None, "abc@7", {"abc"}, True, id="status names no item"),
+        pytest.param("abc@7", None, set(), False, id="item not served as a file"),
+        pytest.param("abc@3", None, {"abc"}, False, id="status item of another load"),
+        pytest.param("abc", None, {"abc"}, False, id="status item without a generation"),
+        pytest.param("abc@6", "abc@6", {"abc"}, False, id="load in flight"),
+    ],
+)
+async def test_pause_follows_the_item_the_playback_status_names(
+    status_item_id: str | None, metadata_item_id: str | None, file_item_ids: set[str], pauses: bool
+) -> None:
+    """
+    Test a pause reads the item the speaker plays from its status, before the metadata names it.
+
+    :param status_item_id: The item the group's playback status names.
+    :param metadata_item_id: The item the group's playback metadata names.
+    :param file_item_ids: The queue items served to the speaker as a file.
+    :param pauses: Whether the speaker is paused rather than stopped.
+    """
+    player, group = _speaker_to_pause(status_item_id, metadata_item_id, file_item_ids)
+
+    await player.pause()
+
+    if pauses:
+        group.pause.assert_awaited_once()
+        group.stop.assert_not_awaited()
+    else:
+        group.stop.assert_awaited_once()
+        group.pause.assert_not_awaited()
+
+
+def test_a_pause_reported_right_after_a_change_of_track_reads_as_paused() -> None:
+    """Test a pause in a new track served as a file is a pause while the metadata names the old one."""
+    player, group = _speaker_to_pause("def@7", "abc@7", {"def"})
+    client = cast("MagicMock", player.client)
+    client.player.is_coordinator = True
+    client.player.group_members = ["sonos_player"]
+    _report_playing_our_queue(group, "abc@7")
+    group.playback_state = SonosPlayBackState.PLAYBACK_STATE_PAUSED
+
+    player.update_attributes()
+
+    assert player._attr_playback_state is PlaybackState.PAUSED
+
+
+def test_a_speaker_paused_in_a_flow_stream_reads_idle_until_it_is_loaded_anew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a speaker that plays again by itself after a pause waits, idle, for the queue's resume."""
+    player, group = _speaker_to_pause("flow@7", "flow@7", set())
+    client = cast("MagicMock", player.client)
+    client.player.is_coordinator = True
+    client.player.group_members = ["sonos_player"]
+    player._flow_media = PlayerMedia(
+        uri="http://ma/flow/session/queue/track0/sonos_player.wav",
+        queue_item_id="flow",
+        queue_session_id="session",
+    )
+    player._flow_paused = player._flow_resume_asked = False
+    resume = MagicMock()
+    monkeypatch.setattr(player, "_resume_paused_flow", resume)
+    _report_playing_our_queue(group, "flow@7")
+    reported: list[PlaybackState] = []
+
+    for state in ("PLAYING", "PAUSED", "BUFFERING", "PLAYING"):
+        group.playback_state = SonosPlayBackState(f"PLAYBACK_STATE_{state}")
+        player.update_attributes()
+        reported.append(player._attr_playback_state)
+
+    assert reported == [PlaybackState.PLAYING, *[PlaybackState.IDLE] * 3]
+    resume.assert_called_once_with("pl0123456789ab", "session")
+
+
 def test_a_speaker_fetches_files() -> None:
     """Test a speaker asks for a track as a file, where the stream server has one."""
     player, _ = _make_player()
 
     assert player.fetches_files is True
+
+
+def test_a_speaker_shows_the_titles_in_a_stream() -> None:
+    """Test a radio station a speaker plays as one stream carries its titles by default."""
+    player, _ = _make_player()
+
+    assert player.shows_stream_titles is True
+
+
+def test_a_speaker_defaults_to_lossless_uncompressed() -> None:
+    """Test a speaker the user picked no playback quality for is streamed lossless, uncompressed."""
+    player, _ = _make_player()
+
+    assert player.default_playback_quality is PlaybackQuality.LOSSLESS_UNCOMPRESSED
 
 
 def test_a_speaker_needs_no_content_length() -> None:

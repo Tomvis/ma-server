@@ -343,12 +343,16 @@ class CrossfadeHandover:
 class ItemStreamMarks(Protocol):
     """Takes the two points that divide the stream of a queue item with a fade at either end."""
 
-    def lead_in_ended(self, size: int, position_ms: int) -> None:
+    def lead_in_ended(
+        self, size: int, position_ms: int, normalization: VolumeNormalizationMode | None
+    ) -> None:
         """
         Take the point where the fade into the item ends and its own audio goes on.
 
         :param size: The bytes the stream has yielded up to this point.
         :param position_ms: The position in the item its own audio goes on from.
+        :param normalization: The volume normalization the fade pins the item's own audio
+            to, if it pins one.
         """
 
     def source_read_out(self, size: int) -> None:
@@ -2377,6 +2381,7 @@ class StreamsAudio:
         consumer_connected: Callable[[], bool] | None = None,
         start_ms: int | None = None,
         marks: ItemStreamMarks | None = None,
+        player_id: str | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Return one queue item with a crossfade into the next item.
@@ -2397,6 +2402,9 @@ class StreamsAudio:
             item, reports none and stores no duration.
         :param marks: Takes the points where the fade into the item ends and where the
             held tail of the item starts.
+        :param player_id: The id the stream was asked for under. The fade into the next item
+            is made for the player that renders under that id by then, such as the new
+            leader of a group.
         """
         queue = self.mass.player_queues.get(queue_item.queue_id)
         if not queue:
@@ -2556,7 +2564,9 @@ class StreamsAudio:
         elif marks is not None:
             # the position the buffer cuts the item's own audio at
             marks.lead_in_ended(
-                bytes_written, read_position_ms(int(discard_position * 1000), exact_buffer_seek)
+                bytes_written,
+                read_position_ms(int(discard_position * 1000), exact_buffer_seek),
+                norm_override,
             )
         # a repeat of this item loads its details again while this pass still streams
         start_position = streamdetails.seek_position
@@ -2631,12 +2641,9 @@ class StreamsAudio:
                         raise InvalidDataError(
                             f"No streamdetails for next queue item {next_queue_item.queue_item_id}"
                         )
-                    queue.index_in_buffer = self.mass.player_queues.index_by_id(
+                    self.mass.player_queues.fading_into(
                         queue.queue_id, next_queue_item.queue_item_id
                     )
-                    # no audio is asked for when the next item's is in hand already, so
-                    # what left the queue's scope with this move is released here
-                    self.mass.player_queues.release_unneeded_audio(queue.queue_id)
                 except QueueEmpty:
                     # end of queue reached, no next item
                     next_queue_item = None
@@ -2691,15 +2698,19 @@ class StreamsAudio:
                 fade_in_playback_speed = cast(
                     "float", next_queue_item.extra_attributes.get("playback_speed", 1.0)
                 )
+                # the next item plays on the player that renders by now
+                renderer = (
+                    self.mass.players.get_output_protocol(player_id) if player_id else None
+                ) or player
                 next_pcm = await self.select_pcm_format(
-                    player=player,
+                    player=renderer,
                     streamdetails=next_queue_item.streamdetails,
                     crossfade_enabled=True,
                 )
                 crossfade_allowed = self.crossfade_allowed(
                     queue_item,
                     crossfade_mode=crossfade_mode,
-                    protocol_id=player.protocol_id,
+                    protocol_id=renderer.protocol_id,
                     flow_mode=False,
                     next_queue_item=next_queue_item,
                     sample_rate=pcm_format.sample_rate,
@@ -3913,6 +3924,10 @@ class StreamsAudio:
             return True
         pending = self._crossfade_pending.get(queue_id)
         return pending is not None and pending[0] == queue_item_id
+
+    def fade_pending(self, queue_id: str) -> bool:
+        """Return whether an item of the queue has mixed, or is mixing, a fade into the next one."""
+        return queue_id in self._crossfade_handover or queue_id in self._crossfade_pending
 
     def clear_crossfade_handover(self, queue_id: str) -> None:
         """

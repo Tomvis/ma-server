@@ -135,13 +135,17 @@ class _Household:
         player._config.name = None
         player.connected = True
         player.cloud_queue_id = None
+        player.group_queue_id = None
         player._flow_queue_id = None
+        player._flow_media = None
         player.cloud_queue_item_generation = 1
         player._window_item_ids = {}
         player._served_bindings = {}
         player._evicted_cloud_queue = None
         player._queue_session_id = "session1"
         player._hand_over_tasks = set()
+        player._stepping_out = False
+        player._taken_over_item_id = None
         player.client = MagicMock()
         player.client.subscribe.side_effect = subscribe
         group = player.client.player.group
@@ -419,8 +423,10 @@ async def test_a_new_coordinator_given_a_play_in_the_meantime_is_left_alone() ->
 async def test_a_moved_group_of_a_group_players_queue_stops_playback() -> None:
     """Only a player's own queue is handed over; a group player's stops, as core dissolves it."""
     home = _Household()
-    home.office.cloud_queue_id = SYNC_GROUP
+    home.office.cloud_queue_id = home.office.group_queue_id = SYNC_GROUP
     home.serve(f"mass:{SYNC_GROUP}")
+    # no track the speaker that took over plays on by itself: it is not served as a file
+    home.mass.streams.serves_as_file.return_value = False
     # the group player's queue does not follow this player's report
     home.queue.state = PlaybackState.PLAYING
 

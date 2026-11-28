@@ -50,7 +50,9 @@ and quoting pitfalls:
 The daemon is supervised: restarts on exit, a fatal event after repeated failures — on which
 the provider gives up this one daemon (stopping it and keeping the other players' daemons
 running). A self-healing WebSocket listener reconnects across daemon restarts and translates
-`/events` messages into normalized `BackendEvent`s.
+`/events` messages into normalized `BackendEvent`s. A `playback_error` is reported as an
+error, except with stage `session`: the daemon then gave up reconnecting to Spotify and logs
+in again by itself without an `inactive` event, so it is reported as a lost connection.
 
 ## Audio transport
 
@@ -69,10 +71,11 @@ the last track the player plays out what it buffered. The next `playing` event r
 
 ## Volume
 
-With `external_volume` set the daemon starts its Connect device state at 100% and ignores
-`initial_volume`; the provider pushes the target player's live volume when a session
-becomes active and when the source is claimed, so the Spotify app's slider adopts the
-player's actual volume instead of snapping it to a value computed from 100%. A group holds
+With `external_volume` set the daemon starts a new session at the last volume it was given
+(kept in its `state.json`, 100% on a fresh install), which need not be the player's. The
+provider pushes the target player's live volume when a session becomes active and when the
+source is claimed, so the Spotify app's slider adopts the player's actual volume instead of
+snapping it to a value computed from a stale level. A group holds
 no level of its own, so its group volume is pushed instead. That is the level its own volume
 commands interpolate the members from.
 

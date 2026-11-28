@@ -285,7 +285,9 @@ When `SET_MEMBERS` is called on a dynamic group:
 
 1. Remove from the internal member list (static members cannot be removed)
 2. If removing the **sync leader** while playing:
-   - If the active protocol supports dynamic leader switching (provider domain is in `PROVIDERS_WITH_DYNAMIC_LEADER_SWITCH` — currently AirPlay, Snapcast, Sendspin), perform a **seamless handoff** at the protocol level: pick a new leader from the live session, then call `set_members(player_ids_to_remove=[old_session_protocol_id])` on the protocol that carries the session and `set_members(player_ids_to_add=[remaining_protocol_ids])` on the new leader's protocol of the same domain. Remaining members keep playing.
+   - If the protocol that carries the session can hand it over (`can_hand_over_session` on the protocol — currently AirPlay, Snapcast and Sendspin, and Sonos while the leader plays a track that is served to it as a file), perform a **seamless handoff** at the protocol level: pick a new leader from the live session, then call `set_members(player_ids_to_remove=[old_session_protocol_id])` on the protocol that carries the session and `set_members(player_ids_to_add=[remaining_protocol_ids])` on the new leader's protocol of the same domain. Remaining members keep playing.
+     A provider may hand its session to another member than the one picked: Sonos chooses the member that coordinates the group itself. Once the old leader stepped out, the group follows the member whose protocol of the session lists the picked member in its group, and the second call goes to that member. Until then the group keeps reporting what it played: the member that was picked does not report for the session, and it gets the output back that it had.
+     The protocol of the session becomes the active output of the new leader, as a play on it would have made it: a member that followed its leader on its own protocol has none, and a pause of the group would stop it instead.
      Other members removed in the same command are released by the old leader first, as the handoff only takes the leader itself out of the session.
      Members the old leader holds outside that session (e.g. a Sonos speaker that follows it natively) are released before its stream ends. Those that can be reached on the session's protocol join it once the new leader has taken over, the others leave the group.
    - If no remaining member is part of the live session (e.g. only freshly-added players are left), or the protocol doesn't support handoff: fall back to **dissolve + re-form** (brief audio gap)
@@ -295,11 +297,19 @@ When `SET_MEMBERS` is called on a dynamic group:
 
 A leader whose stream died is not removed from the group: its provider reports the loss through `on_session_leader_lost`, for static and dynamic groups alike.
 
-1. While the group plays and the protocol supports dynamic leader switching, the session is handed over with the same seamless handoff as above, to the members it still feeds once the lost leader is out of it
+1. While the group plays and the protocol can hand the session over, the session is handed over with the same seamless handoff as above, to the members it still feeds once the lost leader is out of it
 2. The lost leader stays in the internal member list, so it is part of the group again once it re-joins and the next time the group forms. It is last in line to lead a dynamic group; a static group goes by its configured order
 3. Without a member that is still fed, the group is left to the caller, which ends the session
 
 A leader whose receiver another sender took over is ungrouped instead, as if the user took it out: a dynamic group plays on without it, a static group ends.
+
+### A Leader That Leaves by Itself
+
+A leader can leave the live session outside Music Assistant while the session plays on, held by one of its members: a Sonos speaker that is taken out of its group in the Sonos app. Its provider reports this through `on_session_moved` and names the member that holds the session. Sonos does so while the group plays a track that is served to the leader as a file, and only for a member of the group; a group in any other state is stopped.
+
+1. The group follows that member: it becomes the sync leader and takes over the members that remain. The leader that left is not asked to step out, and it reports for itself again only once the group follows the member
+2. A dynamic group drops the leader that left
+3. A static group keeps it as a member and plays on without it. It is added again as any configured member the leader is not holding, after the debounce
 
 ### Removing Last Member
 

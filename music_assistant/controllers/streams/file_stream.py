@@ -219,8 +219,15 @@ class FileStream:
         # the sizes the file had before its audio ended short of them
         self._earlier_sizes: list[int] = []
         self._head_start = HEAD_START_PER_FILE
-        # the request an encode of this file runs for
-        self.request: web.Request | None = None
+        # the head start the running encode of each address took and has not handed out yet
+        self._head_start_held: dict[str | None, int] = {}
+        # the request an encode of this file runs for, by the address it comes from
+        self.readers: dict[str | None, web.Request] = {}
+        # the offsets the file has sent in one go since a request last took it over: from
+        # where that request started up to the furthest byte handed to a player since
+        self._sent: range | None = None
+        # what it had sent when that request took it over
+        self._sent_before: range | None = None
         # the stream the file is cut from, for a track that is mixed with its neighbours
         self.mix: MixedTrack | None = None
 
@@ -250,11 +257,79 @@ class FileStream:
         if offset == len(self._head) < HEAD_SIZE:
             self._head += data[: HEAD_SIZE - offset]
 
-    def take_head_start(self) -> int:
-        """Return the seconds of head start a new encode gets, out of what the file has left."""
+    def add_reader(self, request: web.Request, offset: int) -> None:
+        """
+        Let an encode of the file run for a request, which ends the one of its address.
+
+        A request from another address is another player. It reads beside the encodes that
+        run when its part starts in what the file has sent since a request last took it
+        over: it gets audio that left before, and then runs along. A request for any other
+        part takes the file over, which ends every encode that runs. When that part starts
+        in what the file had sent before the last take-over, it goes on from that.
+
+        :param request: The request the encode runs for.
+        :param offset: Offset in the file of the first byte the encode delivers.
+        """
+        # audio that was not sent yet only leaves through the encodes that read on from what
+        # was, at playback pace: no two addresses read different parts of a track at once.
+        # See the usage policy
+        takes_over = self._sent is None or offset not in self._sent
+        if takes_over and self._sent_before is not None and offset in self._sent_before:
+            # a player that a take-over ended asks again for where it was. One of the two
+            # counts as sent at a time, so the pace holds
+            self._sent, self._sent_before = self._sent_before, self._sent
+        elif takes_over:
+            self._sent, self._sent_before = range(offset, offset + 1), self._sent
+        # a player that asks for another part has left the one it was reading. Aborted
+        # rather than closed, as a graceful close waits for the very send buffer the player
+        # stopped reading
+        for address, running in self.readers.items():
+            if (takes_over or address == request.remote) and running.transport is not None:
+                running.transport.abort()
+        self.readers[request.remote] = request
+
+    def sent_up_to(self, offset: int) -> None:
+        """
+        Take note of how far an encode that runs has got.
+
+        :param offset: Offset in the file up to where its bytes were handed to its player.
+        """
+        assert self._sent is not None
+        # a player asks again for the byte after the last one it got
+        self._sent = range(self._sent.start, max(self._sent.stop, offset + 1))
+
+    def remove_reader(self, request: web.Request) -> None:
+        """
+        Let go of a request whose encode ended, with the head start it did not hand out.
+
+        :param request: The request the encode ran for.
+        """
+        if self.readers.get(request.remote) is request:
+            del self.readers[request.remote]
+            self._return_head_start(request.remote)
+
+    def take_head_start(self, address: str | None) -> int:
+        """
+        Return the seconds of head start a new encode gets, out of what the file has left.
+
+        The head start of the encode it replaces goes back to the file when that one handed
+        no audio to its player.
+
+        :param address: The address the request of the encode comes from.
+        """
+        self._return_head_start(address)
         seconds = min(HEAD_START_PER_ENCODE, self._head_start)
         self._head_start -= seconds
+        self._head_start_held[address] = seconds
         return seconds
+
+    def head_start_handed_out(self, address: str | None) -> None:
+        """
+        Mark that the encode of an address handed audio to its player, so it keeps its head start.
+
+        :param address: The address the request of the encode comes from.
+        """
+        self._head_start_held.pop(address, None)
 
     def encode_start(self, offset: int) -> tuple[int, int]:
         """
@@ -319,6 +394,14 @@ class FileStream:
         if self.mix is not None:
             self.mix.close()
 
+    def _return_head_start(self, address: str | None) -> None:
+        """
+        Give the head start of the encode of an address back, as it handed no audio out.
+
+        :param address: The address the request of the encode comes from.
+        """
+        self._head_start += self._head_start_held.pop(address, 0)
+
     def _size_of(self, frames: int) -> int:
         """
         Return the size of the file for an amount of audio.
@@ -351,7 +434,7 @@ class FileStreams:
         """
         Return the file a player fetches a track as, if it exists.
 
-        :param player_id: The player that fetches the file.
+        :param player_id: The id the player fetches the file under.
         :param key: The track and the playback it belongs to.
         """
         files = self._files.get(player_id, {})
@@ -371,13 +454,13 @@ class FileStreams:
         """
         Add the file a player fetches a track as, in place of the oldest it has too many.
 
-        :param player_id: The player that fetches the file.
+        :param player_id: The id the player fetches the file under.
         :param key: The track and the playback it belongs to.
         :param file: The file.
         """
         files = self._files.setdefault(player_id, {})
         # the track that plays has a request open, and keeps its file
-        unread = [known for known, other in files.items() if other.request is None]
+        unread = [known for known, other in files.items() if not other.readers]
         files[key] = file
         for known in unread[: max(len(files) - MAX_FILES_PER_PLAYER, 0)]:
             files.pop(known).close()

@@ -80,6 +80,7 @@ from music_assistant_models.config_entries import (
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
 from music_assistant_models.enums import (
     ConfigEntryType,
+    ContentType,
     EventType,
     IdentifierType,
     MediaType,
@@ -98,6 +99,7 @@ from music_assistant.constants import (
     CONF_ALLOW_AUDIO_ANALYSIS,
     CONF_ENTRY_CROSSFADE_DIFFERENT_SAMPLE_RATES,
     CONF_ENTRY_FLOW_MODE_SAMPLE_RATE,
+    PlaybackQuality,
 )
 from music_assistant.controllers.streams.audio_analysis import SMART_FADES_ANALYSIS_DOMAIN
 from music_assistant.helpers.util import is_valid_mac_address
@@ -556,6 +558,16 @@ class SendspinBasePlayer(PlayerProtocol):
         self._attr_session_only = False
 
     @property
+    def can_hand_over_session(self) -> bool:
+        """Return True: the Sendspin group plays on for its members when its leader leaves."""
+        return True
+
+    @property
+    def playback_quality_codecs(self) -> dict[PlaybackQuality, ContentType]:
+        """Return no playback quality levels: Sendspin picks its format with its own settings."""
+        return {}
+
+    @property
     def needs_setup(self) -> bool:
         """
         Whether the device is encrypted but not yet usable for playback.
@@ -580,6 +592,16 @@ class SendspinBasePlayer(PlayerProtocol):
         # Deliberately also while the device already plays: the audio input cannot be
         # split out of the setup state, so the one-time input choice is prompted for here.
         return not self.api.active_roles or self._source_input_pending
+
+    @property
+    def replaces_enqueued_media(self) -> bool:
+        """Return if the player can replace its next item, which every audio role must cut."""
+        return self._attr_replaces_enqueued_media and all(
+            role.supports_timestamped_clear()
+            for client in self.api.group.clients
+            for role in client.active_roles
+            if role.get_audio_requirements() is not None
+        )
 
     @property
     def setup_reason(self) -> str | None:
@@ -1608,6 +1630,7 @@ class SendspinPlayer(SendspinBasePlayer):
                 PlayerFeature.ENQUEUE,
                 PlayerFeature.GAPLESS_PLAYBACK,
             }
+            self._attr_replaces_enqueued_media = True
         self._metadata_generation = 0
         self._content_takeover_pending = False
         self._metadata_lock = asyncio.Lock()
@@ -1950,6 +1973,8 @@ class SendspinPlayer(SendspinBasePlayer):
     async def enqueue_next_media(self, media: PlayerMedia) -> None:
         """Handle enqueuing of the next queue item on the player."""
         if self.playback_session.set_next_media(media):
+            return
+        if await self.playback_session.replace_next_media(media):
             return
         if not media.source_id or (queue := self.mass.player_queues.get(media.source_id)) is None:
             return

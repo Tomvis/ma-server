@@ -57,7 +57,6 @@ from music_assistant.constants import (
     CONF_ENTRY_LOG_LEVEL,
     CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
     CONF_LOG_LEVEL,
-    CONF_OUTPUT_CODEC,
     CONF_PLAYER_QUEUES,
     CONF_PREFER_WAV_FOR_LIVE_SOURCES,
     CONF_PUBLISH_IP,
@@ -161,7 +160,7 @@ from music_assistant.models.media_capabilities import AudioSourceMixin, AudioSou
 from music_assistant.models.music_provider import MusicProvider, ProviderStreamLimitError
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Coroutine
+    from collections.abc import Awaitable, Callable, Coroutine, Iterator
 
     from music_assistant_models.config_entries import CoreConfig
     from music_assistant_models.player import PlayerMedia
@@ -649,6 +648,7 @@ class StreamsController(CoreController):
                 default_value=DEFAULT_VOLUME_NORMALIZATION_MODE,
                 options=_volume_normalization_preference_options(),
                 category="volume_normalization",
+                advanced=True,
             ),
             ConfigEntry(
                 key=CONF_VOLUME_NORMALIZATION_TRACKS,
@@ -656,6 +656,7 @@ class StreamsController(CoreController):
                 default_value=DEFAULT_VOLUME_NORMALIZATION_MODE,
                 options=_volume_normalization_preference_options(),
                 category="volume_normalization",
+                advanced=True,
             ),
             ConfigEntry(
                 key=CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO,
@@ -663,6 +664,7 @@ class StreamsController(CoreController):
                 range=(-20, 10),
                 default_value=-6,
                 category="volume_normalization",
+                advanced=True,
             ),
             ConfigEntry(
                 key=CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS,
@@ -670,6 +672,7 @@ class StreamsController(CoreController):
                 range=(-20, 10),
                 default_value=-6,
                 category="volume_normalization",
+                advanced=True,
             ),
             CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
             ConfigEntry(
@@ -677,6 +680,7 @@ class StreamsController(CoreController):
                 type=ConfigEntryType.BOOLEAN,
                 default_value=False,
                 category="crossfade",
+                advanced=True,
             ),
             ConfigEntry(
                 key=CONF_STREAM_SOURCE_MODE,
@@ -870,12 +874,6 @@ class StreamsController(CoreController):
         if media.media_type in (MediaType.ANNOUNCEMENT, MediaType.FLOW_STREAM):
             return media.uri
         protocol_player = self.mass.players.get_output_protocol(player_id)
-        conf_output_codec = cast(
-            "str",
-            protocol_player.config.get_value(CONF_OUTPUT_CODEC, default="flac")
-            if protocol_player
-            else "flac",
-        )
         prefer_wav_for_live_sources = (
             media.media_type == MediaType.AUDIO_SOURCE
             and protocol_player is not None
@@ -884,11 +882,12 @@ class StreamsController(CoreController):
                 protocol_player.config.get_value(CONF_PREFER_WAV_FOR_LIVE_SOURCES, default=False),
             )
         )
-        output_codec = (
-            ContentType.WAV
-            if prefer_wav_for_live_sources
-            else ContentType.try_parse(conf_output_codec)
-        )
+        if prefer_wav_for_live_sources:
+            output_codec = ContentType.WAV
+        elif protocol_player is not None:
+            output_codec = protocol_player.output_codec
+        else:
+            output_codec = ContentType.FLAC
         fmt = output_codec.value
         # handle raw pcm without exact format specifiers
         if output_codec.is_pcm() and ";" not in fmt:
@@ -1277,8 +1276,16 @@ class StreamsController(CoreController):
                 if queue_item.media_type != MediaType.TRACK
                 else DLNA_CONTENT_FEATURES
             )
+            # a radio or live item carries its titles in the stream for a player that shows them
+            icy = (
+                self._icy_framing(request, lambda: queue_item, full=False)
+                if player.shows_stream_titles
+                and queue_item.media_type in (MediaType.RADIO, MediaType.AUDIO_SOURCE)
+                else None
+            )
             headers = {
                 **DEFAULT_STREAM_HEADERS,
+                **(icy.headers if icy else {}),
                 "icy-name": sanitize_http_header_value(queue_item.name),
                 "contentFeatures.dlna.org": dlna_features,
                 "Content-Type": get_mime_type(output_format.output_format_str),
@@ -1346,6 +1353,7 @@ class StreamsController(CoreController):
                     standard_crossfade_duration=standard_crossfade_duration,
                     session_id=session_id,
                     consumer_connected=_player_connected,
+                    player_id=player_id,
                 )
             else:
                 # no crossfade, just a regular single item stream
@@ -1430,7 +1438,8 @@ class StreamsController(CoreController):
                             )
                             break
                         try:
-                            await resp.write(chunk)
+                            for part in icy.frame(chunk) if icy else (chunk,):
+                                await resp.write(part)
                             bytes_sent += len(chunk)
                             if not first_chunk_received:
                                 first_chunk_received = True
@@ -1765,9 +1774,13 @@ class StreamsController(CoreController):
             CONF_ENTRY_ENABLE_ICY_METADATA.key,
             CONF_ENTRY_ENABLE_ICY_METADATA.default_value,
         )
-        enable_icy = request.headers.get("Icy-MetaData", "") == "1" and icy_preference != "disabled"
-        icy_meta_interval = 256000 if icy_preference == "full" else 16384
-        icy_bytes_until_meta = icy_meta_interval
+        # use current item here and not buffered item, otherwise
+        # the icy metadata will be too much ahead
+        icy = (
+            self._icy_framing(request, lambda: queue.current_item, full=icy_preference == "full")
+            if icy_preference != "disabled"
+            else None
+        )
 
         # prepare request, add some DLNA/UPNP compatible headers.
         # icy-name (in DEFAULT_STREAM_HEADERS) is always present so players have a
@@ -1776,12 +1789,10 @@ class StreamsController(CoreController):
         # than on every flow response.
         headers = {
             **DEFAULT_STREAM_HEADERS,
-            **(ICY_HEADERS if enable_icy else {}),
+            **(icy.headers if icy else {}),
             "contentFeatures.dlna.org": DLNA_CONTENT_FEATURES_REALTIME,
             "Content-Type": get_mime_type(output_format.output_format_str),
         }
-        if enable_icy:
-            headers["icy-metaint"] = str(icy_meta_interval)
 
         resp = web.StreamResponse(status=200, reason="OK", headers=headers)
         if player.requires_content_length:
@@ -1843,7 +1854,7 @@ class StreamsController(CoreController):
             # without ICY framing, pass on whatever ffmpeg has encoded: an exact 1s read
             # holds back FLAC on quiet passages until the player gives up waiting.
             # with ICY framing the write loop counts bytes towards the metadata interval
-            chunk_size=ICY_WRITE_SIZE if enable_icy else None,
+            chunk_size=ICY_WRITE_SIZE if icy else None,
         )
         bytes_sent = 0
 
@@ -1873,24 +1884,8 @@ class StreamsController(CoreController):
             async with aclosing(audio_bytes):
                 async for chunk in audio_bytes:
                     try:
-                        if not enable_icy:
-                            await write(chunk)
-                            continue
-                        pending = chunk
-                        while pending:
-                            head, pending = (
-                                pending[:icy_bytes_until_meta],
-                                pending[icy_bytes_until_meta:],
-                            )
-                            await write(head)
-                            icy_bytes_until_meta -= len(head)
-                            if icy_bytes_until_meta == 0:
-                                await write(
-                                    _icy_metadata_block(
-                                        self.audio_analysis, queue, full=icy_preference == "full"
-                                    )
-                                )
-                                icy_bytes_until_meta = icy_meta_interval
+                        for part in icy.frame(chunk) if icy else (chunk,):
+                            await write(part)
                     except (BrokenPipeError, ConnectionResetError, ConnectionError) as err:
                         # a superseded response is aborted under us and this is
                         # its normal end
@@ -2130,12 +2125,12 @@ class StreamsController(CoreController):
                 overlay_enabled=mix_overlay,
                 session_id=queue_session_id,
             )
+            # the item before may have mixed (or be mixing) a fade into this one,
+            # which only the smart fade stream plays
+            fade_in_pending = self.audio.fade_into_pending(queue_id, queue_item.queue_item_id)
             inner_stream: AsyncGenerator[bytes]
             if protocol_player is not None and (
-                crossfade_mode != CrossfadeMode.DISABLED
-                # the item before may have mixed (or be mixing) a fade into this one,
-                # which only the smart fade stream plays
-                or self.audio.fade_into_pending(queue_id, queue_item.queue_item_id)
+                crossfade_mode != CrossfadeMode.DISABLED or fade_in_pending
             ):
                 inner_stream = self.audio.get_queue_item_stream_with_smartfade(
                     player=protocol_player,
@@ -2146,6 +2141,7 @@ class StreamsController(CoreController):
                         CONF_PLAYER_QUEUES, CONF_CROSSFADE_DURATION, 8
                     ),
                     session_id=queue_session_id,
+                    player_id=player_id,
                 )
             else:
                 inner_stream = self.audio.get_queue_item_stream(
@@ -2184,6 +2180,7 @@ class StreamsController(CoreController):
                 queue_session_id,
                 loads_next=protocol_player is not None
                 and protocol_player.supports_feature(PlayerFeature.ENQUEUE),
+                faded_in=fade_in_pending,
             )
             return self._count_as_output_stream(inner_stream)
         # assume url or some other direct path
@@ -2682,6 +2679,7 @@ class StreamsController(CoreController):
         session_id: str | None,
         *,
         loads_next: bool,
+        faded_in: bool,
     ) -> AsyncGenerator[bytes]:
         """
         Forward a single-item stream, reporting its first chunk to the queue.
@@ -2693,6 +2691,7 @@ class StreamsController(CoreController):
             its session is no longer current.
         :param loads_next: Report the item as loaded in the player's buffer, so the queue hands
             the player the item after it.
+        :param faded_in: The item before mixed a fade into this item.
         """
         queue_data = self.mass.player_queues.queue_data_or_none(queue_item.queue_id)
         served = False
@@ -2714,7 +2713,7 @@ class StreamsController(CoreController):
                     if queue_data is not None:
                         if loads_next:
                             self.mass.player_queues.track_loaded_in_buffer(
-                                queue_item.queue_id, queue_item.queue_item_id
+                                queue_item.queue_id, queue_item.queue_item_id, faded_in=faded_in
                             )
                         else:
                             self.mass.player_queues.mark_item_served(
@@ -2740,7 +2739,7 @@ class StreamsController(CoreController):
         :param request: The request of the player.
         :param queue: The queue the item plays on.
         :param queue_item: The queue item, with its stream details resolved.
-        :param player: The player that fetches the file.
+        :param player: The protocol that renders the file for the player that fetches it.
         :param pcm_format: PCM format a new file reads its audio in.
         :param output_format: Format of a new file.
         :param headers: The headers of a stream response for this item.
@@ -2753,7 +2752,9 @@ class StreamsController(CoreController):
         session_id = request.match_info["session_id"]
         start_position = int(queue_item.streamdetails.seek_position)
         key = FileKey(session_id, queue.queue_id, queue_item.queue_item_id, start_position)
-        file = self._file_streams.get(player.protocol_id, key)
+        # kept under the id the url names: the protocol that renders it can change in between
+        url_player_id = request.match_info["player_id"]
+        file = self._file_streams.get(url_player_id, key)
         requested_again = file is not None
         if file is None:
             frames = declared_frames(queue_item, output_format.sample_rate)
@@ -2778,6 +2779,7 @@ class StreamsController(CoreController):
                         crossfade_mode=mix_mode,
                         standard_crossfade_duration=standard_crossfade_duration,
                         session_id=session_id,
+                        player_id=url_player_id,
                     ),
                     partial(
                         self.audio.get_queue_item_stream,
@@ -2786,7 +2788,7 @@ class StreamsController(CoreController):
                         session_id=session_id,
                     ),
                 )
-            self._file_streams.add(player.protocol_id, key, file)
+            self._file_streams.add(url_player_id, key, file)
         if file.mix is not None and (max_size := file.mix.max_size) is not None:
             # what the mixes left of the track is known before a request reaches its end
             file.end_at(file.offset_of(max_size))
@@ -2856,6 +2858,7 @@ class StreamsController(CoreController):
         assert queue_item.streamdetails is not None
         session_id = request.match_info["session_id"]
         pq_data = self.mass.player_queues.queue_data(queue_item.queue_id)
+        address = request.remote
         offset = part.start
         if memory := file.head(part):
             try:
@@ -2869,16 +2872,14 @@ class StreamsController(CoreController):
                 # a player asks for the start of a file again before it resumes or seeks,
                 # and leaves that request for the part it really wants. An encode is only
                 # worth starting for a player that stays and reads on
-                running = file.request
-                if await player_hangs_up(request) or file.request not in (running, None):
+                running = file.readers.get(address)
+                if await player_hangs_up(request) or file.readers.get(address) not in (
+                    running,
+                    None,
+                ):
                     return offset
 
-        # one encode at a time per file: a player that asks for another part has left the
-        # one it was reading. Aborted rather than closed, as a graceful close waits for
-        # the very send buffer the player stopped reading
-        if (running := file.request) is not None and (transport := running.transport) is not None:
-            transport.abort()
-        file.request = request
+        file.add_reader(request, offset)
         self.logger.debug(
             "Serving %s as a file to %s from byte %s of %s",
             queue_item.name,
@@ -2903,6 +2904,11 @@ class StreamsController(CoreController):
                         break
                     # more audio than the file declared is cut off
                     data = chunk[: part.stop - offset]
+                    if file.readers.get(address) is request and is_connected(request):
+                        # audio handed to a connection that is still open may reach the
+                        # player, also when the write fails
+                        file.head_start_handed_out(address)
+                        file.sent_up_to(offset + len(data))
                     try:
                         await resp.write(data)
                     except ConnectionError:
@@ -2925,8 +2931,7 @@ class StreamsController(CoreController):
             stream_failure = err
         finally:
             self._active_output_streams -= 1
-            if file.request is request:
-                file.request = None
+            file.remove_reader(request)
         if stream_failure is not None or queue_item.streamdetails.stream_error:
             self.logger.error(
                 "Error streaming QueueItem %s (%s) to %s: %s",
@@ -2981,7 +2986,7 @@ class StreamsController(CoreController):
             queue_item_id=queue_item.queue_item_id,
         )
         # the audio that is dropped comes on top of the head start, so it costs the player none
-        burst = file.take_head_start() + run_in / file.byte_rate
+        burst = file.take_head_start(request.remote) + run_in / file.byte_rate
         position = offset - run_in
         async with aclosing(
             get_ffmpeg_stream(
@@ -3159,6 +3164,24 @@ class StreamsController(CoreController):
         if announce_player is None:
             return False
         return announce_player.requires_content_length
+
+    def _icy_framing(
+        self,
+        request: web.Request,
+        current_item: Callable[[], QueueItem | None],
+        *,
+        full: bool,
+    ) -> _IcyFraming | None:
+        """
+        Return the ICY framing of a stream, None when the player does not ask for metadata.
+
+        :param request: The stream request.
+        :param current_item: Returns the item the stream plays at the moment it is called.
+        :param full: Whether to add the image of the item.
+        """
+        if request.headers.get("Icy-MetaData", "") != "1":
+            return None
+        return _IcyFraming(self.audio_analysis, current_item, full=full)
 
     def _get_flow_start_item(self, queue: PlayerQueue, queue_item_id: str) -> QueueItem | None:
         """
@@ -3528,19 +3551,61 @@ class StreamsController(CoreController):
             del owners[queue_id]
 
 
+class _IcyFraming:
+    """Frames the titles of what a stream plays into its audio, as ICY metadata."""
+
+    def __init__(
+        self,
+        audio_analysis: AudioAnalysisController,
+        current_item: Callable[[], QueueItem | None],
+        *,
+        full: bool,
+    ) -> None:
+        """
+        Initialize the framing of one stream.
+
+        :param audio_analysis: The controller that tells the metadata shown for a stream.
+        :param current_item: Returns the item the stream plays at the moment it is called.
+        :param full: Whether to add the image of the item.
+        """
+        self._audio_analysis = audio_analysis
+        self._current_item = current_item
+        self._full = full
+        self._interval = 256000 if full else 16384
+        self._bytes_until_meta = self._interval
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Return the response headers that announce the metadata to the player."""
+        return {**ICY_HEADERS, "icy-metaint": str(self._interval)}
+
+    def frame(self, chunk: bytes) -> Iterator[bytes]:
+        """
+        Yield a chunk of audio in the parts to write, a metadata block at every interval.
+
+        :param chunk: The next audio of the stream.
+        """
+        while chunk:
+            head, chunk = chunk[: self._bytes_until_meta], chunk[self._bytes_until_meta :]
+            yield head
+            self._bytes_until_meta -= len(head)
+            if self._bytes_until_meta == 0:
+                yield _icy_metadata_block(
+                    self._audio_analysis, self._current_item(), full=self._full
+                )
+                self._bytes_until_meta = self._interval
+
+
 def _icy_metadata_block(
-    audio_analysis: AudioAnalysisController, queue: PlayerQueue, *, full: bool
+    audio_analysis: AudioAnalysisController, current_item: QueueItem | None, *, full: bool
 ) -> bytes:
     """
-    Return the length-prefixed ICY metadata block for the queue's current item.
+    Return the length-prefixed ICY metadata block for the item a stream plays.
 
     :param audio_analysis: The controller that tells the metadata shown for a stream.
-    :param queue: The queue.
+    :param current_item: The item the stream plays, if any.
     :param full: Whether to add the image of the item.
     """
-    # use current item here and not buffered item, otherwise
-    # the icy metadata will be too much ahead
-    current_item = queue.current_item
     stream_metadata = (
         audio_analysis.shown_stream_metadata(current_item.streamdetails)
         if current_item and current_item.streamdetails

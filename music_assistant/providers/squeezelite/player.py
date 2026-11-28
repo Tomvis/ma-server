@@ -26,6 +26,7 @@ from music_assistant.constants import (
     CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES_DEFAULT_ENABLED,
     CONF_ENTRY_SYNC_ADJUST,
     VERBOSE_LOG_LEVEL,
+    PlaybackQuality,
 )
 from music_assistant.helpers.audio import get_mime_type
 from music_assistant.models.player import DeviceInfo, PlayerMedia
@@ -120,6 +121,11 @@ class SqueezelitePlayer(PlayerProtocol):
             if sr <= max_sr
             for bd in (16, 24)
         ]
+
+    @property
+    def default_playback_quality(self) -> PlaybackQuality:
+        """Return the playback quality level to use when the user picked none."""
+        return PlaybackQuality.LOSSLESS_UNCOMPRESSED
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
@@ -378,14 +384,18 @@ class SqueezelitePlayer(PlayerProtocol):
             },
         )
         queue = self.mass.player_queues.get(media.source_id) if media.source_id else None
-        # live streams and announcements start on a smaller buffer (KB, tenths of a second) to cut
-        # latency; a short announcement would never fill the default 2 second output buffer
+        # live streams and announcements start on a smaller output buffer (tenths of a second)
+        # to cut latency; a short announcement would never fill the default 2 second one
         low_latency_stream = media.media_type in (
             MediaType.AUDIO_SOURCE,
             MediaType.RADIO,
             MediaType.ANNOUNCEMENT,
         )
-        stream_threshold, output_threshold = (64, 1) if low_latency_stream else (200, 20)
+        output_threshold = 1 if low_latency_stream else 20
+        # the stream buffer (KB) has to fill from the audio a stream hands over at once when
+        # it starts (REALTIME_BURST), also for a quiet passage in FLAC, or the player only
+        # starts seconds later
+        stream_threshold = 64
         await self.client.play_url(
             url=url,
             mime_type=mime_type,

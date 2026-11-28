@@ -554,10 +554,11 @@ class SpotifyConnectProvider(PluginProvider):
         if daemon.active_session_id == stream_session_id:
             daemon.streamed_playback_session_id = playback_session_id
 
-        # The backend reports 100% volume until told otherwise; push the player's
+        # The backend reports its own volume until told otherwise; push the player's
         # volume so the Spotify app's absolute volume commands start from the
-        # real level.
-        await self._sync_player_volume_to_spotify(daemon, active_player_id)
+        # real level. Not awaited: go-librespot can only answer once something
+        # reads its audio, and that reader is the stream this call holds up.
+        self.mass.create_task(self._sync_player_volume_to_spotify(daemon, active_player_id))
 
     async def on_source_unselected(
         self, source_id: str, owner_player_id: str, stream_session_id: str
@@ -614,7 +615,13 @@ class SpotifyConnectProvider(PluginProvider):
         if daemon is None:
             return
         if not daemon.playing and not daemon.spotify_session_active:
-            raise self._not_active_error(daemon)
+            if action != SourceControl.PLAY or not daemon.last_context_uri:
+                raise self._not_active_error(daemon)
+            # The session ended while the player kept this source (a backend restart or a lost
+            # connection): take playback back; the 'playing' event that follows restarts the stream.
+            self.logger.info("Taking Spotify playback back to Music Assistant")
+            await daemon.backend.play(daemon.last_context_uri, skip_to_uri=daemon.last_track_uri)
+            return
         try:
             if action == SourceControl.PLAY:
                 await daemon.backend.resume()
@@ -1222,7 +1229,7 @@ class SpotifyConnectProvider(PluginProvider):
             # session. Reconcile afterwards because 'playing' may arrive first.
             self._cancel_pending_play_media(daemon)
             self.logger.info("Spotify Connect session active for %s", daemon.publish_name)
-            # A new session starts at the backend's 100% volume default; push the
+            # A new session starts at the backend's own volume, not the player's; push the
             # target player's volume so the Spotify app's slider is correct from
             # device selection, before any playback starts. (In the soloist
             # player_only mode the backend pins 100% and ignores the pushed
@@ -1418,7 +1425,7 @@ class SpotifyConnectProvider(PluginProvider):
         volume = max(0, min(100, volume_level))
         # No dedupe against last_volume_sent here: it holds the last value
         # exchanged with the backend, not the backend's current volume, which
-        # resets to its 100% default on a new session or backend restart.
+        # starts over at its own default on a new session or backend restart.
         try:
             await self._push_volume_to_backend(daemon, volume)
         except Exception as err:  # noqa: BLE001 - volume sync is best effort

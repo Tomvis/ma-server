@@ -68,11 +68,8 @@ class SonosCloudQueue:
         path_parts = request.path.strip("/").split("/")
         if len(path_parts) != 4 or path_parts[0] != "sonos_queue":
             return web.Response(status=404)
-        protocol_id = path_parts[1]
-        if not (sonos_player := self.provider.get_protocol(protocol_id)):
+        if not (sonos_player := self._speaker_for(path_parts[1])):
             return web.Response(status=501)
-        if TYPE_CHECKING:
-            assert isinstance(sonos_player, SonosPlayer)
         endpoint = path_parts[3]
         if endpoint == "itemWindow":
             return await self._handle_sonos_queue_itemwindow(sonos_player, request)
@@ -100,6 +97,7 @@ class SonosCloudQueue:
         queue_version = player.cloud_queue_version
         wire_generation = player.cloud_queue_item_generation
         wire_center = request.query.get("itemId")
+        player.on_cloud_queue_read(request.query.get("reason"), wire_center)
         # built from the queue as it is right now: the speaker fetches on its own schedule and
         # plays out of what it cached, so only a live answer keeps a track added mid-playback
         # from being played over. The beginning/end flags must be honest - signalling
@@ -242,8 +240,12 @@ class SonosCloudQueue:
                 continue
             # only a report on the playing item from the current load may update the
             # position: a report from before a same-track reload carries the old
-            # generation and its position, which the reload just seeked away from
-            if player.reports_current_item(item["id"]):
+            # generation and its position, which the reload just seeked away from.
+            # Neither does one that counts from where the speaker took the item over: the
+            # playback status of the speaker has its position
+            if player.reports_current_item(item["id"]) and not player.counts_from_take_over(
+                item["id"]
+            ):
                 player.update_elapsed_time(item["positionMillis"] / 1000)
             break
         return web.Response(status=204)
@@ -280,6 +282,23 @@ class SonosCloudQueue:
         if player.is_served_as_file(media.queue_item_id):
             item["policies"] = {"canSeek": True}
         return item
+
+    def _speaker_for(self, path_id: str) -> SonosPlayer | None:
+        """
+        Return the speaker a cloud queue path is served for.
+
+        :param path_id: The id the path names: a speaker, or a group whose queue a speaker
+            has loaded.
+        """
+        return next(
+            (
+                speaker
+                for speaker in self.provider.protocols
+                if isinstance(speaker, SonosPlayer)
+                and path_id in (speaker.protocol_id, speaker.group_queue_id)
+            ),
+            None,
+        )
 
     def _handle_reported_playback_error(
         self, player: SonosPlayer, item: dict[str, Any], error: dict[str, Any]
